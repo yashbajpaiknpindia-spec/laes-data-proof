@@ -964,9 +964,25 @@ def create_paper_trade(obs: PositionObservation, trader_name: str | None, mark: 
         return
     source_key = f"{obs.trader_id}|{obs.position_key}"
     with SessionLocal() as db:
+        # Re-entry is allowed only against a fresh, visible Kopyon snapshot containing
+        # this exact leader position. Hidden/empty/stale snapshots never authorize entry.
+        latest_snapshot = db.scalar(select(PositionSnapshot).where(
+            PositionSnapshot.trader_id == obs.trader_id
+        ).order_by(desc(PositionSnapshot.id)).limit(1))
+        if latest_snapshot is None or latest_snapshot.hidden or latest_snapshot.id != obs.snapshot_id:
+            return
         existing = db.scalar(select(PaperTrade.id).where(PaperTrade.source_key == source_key, PaperTrade.status == "OPEN").limit(1))
         if existing:
             return
+        prior = db.scalars(select(PaperTrade).where(PaperTrade.source_key == source_key).order_by(desc(PaperTrade.opened_at))).all()
+        if len(prior) >= 5:
+            return
+        if prior:
+            previous_raw = parse_json(prior[0].raw_json)
+            if previous_raw.get("leader_snapshot_id") == obs.snapshot_id:
+                return
+            if prior[0].closed_at and (now() - prior[0].closed_at).total_seconds() < 180:
+                return
         opened_trades = db.scalars(select(PaperTrade).where(PaperTrade.status == "OPEN")).all()
         used_margin = sum(t.margin_used for t in opened_trades)
         realized = db.scalar(select(func.coalesce(func.sum(PaperTrade.net_pnl), 0)).where(PaperTrade.status == "CLOSED")) or 0
@@ -1001,7 +1017,7 @@ def create_paper_trade(obs: PositionObservation, trader_name: str | None, mark: 
             symbol=obs.symbol, side=obs.side, status="OPEN",
             entry_price=mark, mark_price=mark, quantity=quantity, notional=notional,
             margin_used=margin, leverage=leverage, stop_price=stop, target_price=target,
-            raw_json=json.dumps({"leader_entry": obs.entry_price, "leader_mark": obs.mark_price, "adverse_pct": ((obs.entry_price-mark)/obs.entry_price*100 if obs.side=="LONG" else (mark-obs.entry_price)/obs.entry_price*100), "funding_rate_at_entry": market.get("funding_rate"), "next_funding_time": market.get("next_funding_time")}, default=str)
+            raw_json=json.dumps({"leader_entry": obs.entry_price, "leader_mark": obs.mark_price, "adverse_pct": ((obs.entry_price-mark)/obs.entry_price*100 if obs.side=="LONG" else (mark-obs.entry_price)/obs.entry_price*100), "funding_rate_at_entry": market.get("funding_rate"), "next_funding_time": market.get("next_funding_time"), "leader_snapshot_id": obs.snapshot_id}, default=str)
         ))
         db.commit()
 
