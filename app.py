@@ -1214,7 +1214,7 @@ async def api_paper():
         "free_capital": round(max(0, equity - deployed_margin), 4),
         "open_count": len(open_trades), "closed_count": len(closed_trades),
         "trades": [{
-            "id": t.id, "trader_id": t.trader_id, "trader_name": t.trader_name, "symbol": t.symbol, "side": t.side,
+            "id": t.id, "trader_id": t.trader_id, "trader_name": t.trader_name, "leader_position_key": (t.source_key.split("|", 1)[1] if "|" in t.source_key else t.source_key), "symbol": t.symbol, "side": t.side,
             "status": t.status, "entry_price": t.entry_price, "mark_price": t.mark_price, "exit_price": t.exit_price,
             "quantity": t.quantity, "notional": t.notional, "margin_used": t.margin_used, "leverage": t.leverage,
             "stop_price": t.stop_price, "target_price": t.target_price, "gross_pnl": t.gross_pnl,
@@ -1265,7 +1265,7 @@ async def api_paper_trade_detail(trade_id: int):
             pnl = ((p-trade.entry_price)*trade.quantity) if trade.side=="LONG" else ((trade.entry_price-p)*trade.quantity)
             ladder.append({"leader_gain_from_entry_pct":extra,"price":p,"gross_pnl_usdt":pnl})
     return {
-        "trade": {"id":trade.id,"status":trade.status,"symbol":trade.symbol,"side":trade.side,"entry_price":trade.entry_price,
+        "trade": {"id":trade.id,"status":trade.status,"trader_id":trade.trader_id,"leader_position_key":(trade.source_key.split("|",1)[1] if "|" in trade.source_key else trade.source_key),"status":trade.status,"symbol":trade.symbol,"side":trade.side,"entry_price":trade.entry_price,
                   "mark_price":trade.mark_price,"net_pnl":trade.net_pnl,"margin_used":trade.margin_used,"leverage":trade.leverage,
                   "opened_at":trade.opened_at.isoformat(),"closed_at":trade.closed_at.isoformat() if trade.closed_at else None,
                   "mfe_net_pnl":raw.get("mfe_net_pnl",trade.net_pnl),"mae_net_pnl":raw.get("mae_net_pnl",trade.net_pnl),
