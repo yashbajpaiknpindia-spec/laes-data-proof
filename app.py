@@ -821,7 +821,7 @@ async def market_features(symbol: str, refresh: bool = False) -> dict:
             cached = parse_json(cache.raw_json)
             cached_closes = cached.get("closes_1h") if isinstance(cached, dict) else None
             # Re-fetch older cache rows created before list-valued Binance klines were parsed correctly.
-            if isinstance(cached_closes, list) and len(cached_closes) >= 25:
+            if isinstance(cached_closes, list) and len(cached_closes) >= 25 and cached.get("quote_volume_24h_usdt") is not None and cached.get("spread_pct") is not None:
                 return cached
     premium, _ = await binance_get("/fapi/v1/premiumIndex", {"symbol": symbol})
     ticker24, _ = await binance_get("/fapi/v1/ticker/24hr", {"symbol": symbol})
