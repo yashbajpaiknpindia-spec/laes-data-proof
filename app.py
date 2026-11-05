@@ -387,6 +387,37 @@ def record_position_snapshot(trader_id: str, payload: dict) -> tuple[int, bool]:
                     raw_json=json.dumps(position, separators=(",", ":"), default=str)
                 ))
                 saved += 1
+            # A visible snapshot that omits an exact leader position is evidence of
+            # possible closure. Require two consecutive visible omissions; hidden data
+            # is never interpreted as a close.
+            observed_keys = {
+                (f"{str(p.get('positionId'))}|{str(p.get('symbol') or 'UNKNOWN').upper()}|{str(p.get('side') or 'UNKNOWN').upper()}"
+                 if p.get("positionId") else f"{str(p.get('symbol') or 'UNKNOWN').upper()}|{str(p.get('side') or 'UNKNOWN').upper()}")
+                for p in positions
+            }
+            for paper in db.scalars(select(PaperTrade).where(
+                PaperTrade.trader_id == trader_id, PaperTrade.status == "OPEN"
+            )).all():
+                exact_key = paper.source_key.split("|", 1)[1] if "|" in paper.source_key else ""
+                raw_trade = parse_json(paper.raw_json)
+                if exact_key in observed_keys:
+                    raw_trade["leader_missing_visible_snapshots"] = 0
+                    raw_trade["leader_status"] = "OPEN_OBSERVED"
+                else:
+                    missing = int(raw_trade.get("leader_missing_visible_snapshots", 0)) + 1
+                    raw_trade["leader_missing_visible_snapshots"] = missing
+                    raw_trade["leader_status"] = "MISSING_FROM_VISIBLE_SNAPSHOT"
+                    if missing >= 2:
+                        paper.status = "CLOSED"
+                        paper.exit_price = paper.mark_price
+                        paper.exit_reason = "LEADER_POSITION_CLOSED"
+                        paper.closed_at = now()
+                        db.add(PaperTradeEvent(
+                            paper_trade_id=paper.id, event_type="LEADER_EXIT",
+                            observed_at=paper.closed_at, value=paper.net_pnl,
+                            detail="Exact leader position absent from two consecutive visible Kopyon snapshots"
+                        ))
+                paper.raw_json = json.dumps(raw_trade, separators=(",", ":"), default=str)
         db.commit()
     # A hidden or empty response is not evidence of a close; old observations remain intact.
     return saved, hidden
