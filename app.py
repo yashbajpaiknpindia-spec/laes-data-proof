@@ -657,7 +657,7 @@ async def api_positions(limit: int = 500):
     limit = max(1, min(limit, 1000))
     with SessionLocal() as db:
         observations = db.scalars(select(PositionObservation).order_by(desc(PositionObservation.id)).limit(limit * 3)).all()
-        snapshots = {s.id: s for s in db.scalars(select(PositionSnapshot).where(PositionSnapshot.id.in_([o.snapshot_id for o in observations])).all())} if observations else {}
+        snapshots = {s.id: s for s in db.scalars(select(PositionSnapshot).where(PositionSnapshot.id.in_([o.snapshot_id for o in observations]))).all()} if observations else {}
     latest = {}
     for obs in observations:
         key = f"{obs.trader_id}|{obs.position_key}"
@@ -959,7 +959,7 @@ async def api_opportunities(limit: int = 100):
     with SessionLocal() as db:
         observations = db.scalars(select(PositionObservation).order_by(desc(PositionObservation.id)).limit(500)).all()
         traders = {t.trader_id: t.name for t in db.scalars(select(Trader)).all()}
-        snapshots = {s.id: s for s in db.scalars(select(PositionSnapshot).where(PositionSnapshot.id.in_([o.snapshot_id for o in observations])).all())} if observations else {}
+        snapshots = {s.id: s for s in db.scalars(select(PositionSnapshot).where(PositionSnapshot.id.in_([o.snapshot_id for o in observations]))).all()} if observations else {}
     latest = {}
     for obs in observations:
         key = f"{obs.trader_id}|{obs.position_key}"
