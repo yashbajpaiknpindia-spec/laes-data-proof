@@ -17,7 +17,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import (
-    create_engine, String, DateTime, Boolean, Integer, Float, Text,
+    create_engine, String, DateTime, Boolean, Integer, BigInteger, Float, Text,
     ForeignKey, UniqueConstraint, select, desc, func, text
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
@@ -123,8 +123,8 @@ class HistoryPosition(Base):
     symbol: Mapped[str] = mapped_column(String(80), index=True)
     side: Mapped[str] = mapped_column(String(12))
     status: Mapped[str | None] = mapped_column(String(40))
-    opened_at_ms: Mapped[int | None] = mapped_column(Integer)
-    closed_at_ms: Mapped[int | None] = mapped_column(Integer)
+    opened_at_ms: Mapped[int | None] = mapped_column(BigInteger)
+    closed_at_ms: Mapped[int | None] = mapped_column(BigInteger)
     entry_price: Mapped[float | None] = mapped_column(Float)
     close_price: Mapped[float | None] = mapped_column(Float)
     roi: Mapped[float | None] = mapped_column(Float)
@@ -165,6 +165,12 @@ class PaperTrade(Base):
     raw_json: Mapped[str] = mapped_column(Text, default="{}")
 
 Base.metadata.create_all(engine)
+
+# Provider timestamps are Unix milliseconds (13 digits); migrate legacy 32-bit columns.
+if engine.dialect.name == "postgresql":
+    with engine.begin() as migration:
+        migration.execute(text("ALTER TABLE history_positions ALTER COLUMN opened_at_ms TYPE BIGINT"))
+        migration.execute(text("ALTER TABLE history_positions ALTER COLUMN closed_at_ms TYPE BIGINT"))
 
 last_scan: dict[str, Any] = {"state": "starting", "started_at": None, "finished_at": None, "last_error": None, "traders_found": 0, "positions_checked": 0, "observations_saved": 0}
 worker_alive = False
