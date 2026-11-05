@@ -1270,7 +1270,7 @@ async def evaluate_open_paper_trades(prices: dict[str,float] | None = None, sour
             next_funding_due = bool(next_funding_ms and ts.timestamp() * 1000 >= next_funding_ms)
             check_due = (
                 (next_funding_due and (seconds_since_funding_check is None or seconds_since_funding_check >= 60))
-                or (net > 0 and (not funding_verified) and (seconds_since_funding_check is None or seconds_since_funding_check >= 60))
+                or ((net > 0 or hit_stop or hit_target) and (not funding_verified) and (seconds_since_funding_check is None or seconds_since_funding_check >= 60))
                 or (net > 0 and funding_verified and seconds_since_funding_check is not None and seconds_since_funding_check >= 300)
             )
             if check_due:
@@ -1299,9 +1299,9 @@ async def evaluate_open_paper_trades(prices: dict[str,float] | None = None, sour
                     db.add(PaperTradeEvent(paper_trade_id=trade.id,event_type="FUNDING_CHECK_PENDING",observed_at=ts,value=net,detail="Actual Binance funding history unavailable; positive-profit exit deferred"))
             if net > 0 and funding_verified:
                 exit_reason = "PROFIT_HARVEST_NET_POSITIVE"
-            elif net <= 0 and not gap_guard and hit_stop:
+            elif net <= 0 and funding_verified and not gap_guard and hit_stop:
                 exit_reason = "STOP_LOSS"
-            elif net <= 0 and not gap_guard and hit_target:
+            elif net <= 0 and funding_verified and not gap_guard and hit_target:
                 exit_reason = "PREFERRED_TARGET"
             # Keep the persisted last path point and ledger aligned with the funding-
             # verified net amount used by the actual simulated exit decision.
