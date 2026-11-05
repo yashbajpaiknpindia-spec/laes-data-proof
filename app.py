@@ -1151,6 +1151,27 @@ def _paper_pnl(trade: PaperTrade, mark: float, cfg: dict, raw: dict | None = Non
     pct = (net / max(trade.margin_used, 0.000001)) * 100
     return gross, costs, net, pct
 
+async def _actual_funding_cost(trade: PaperTrade, at: datetime) -> tuple[float, int]:
+    start = trade.opened_at
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    rows, _ = await binance_get("/fapi/v1/fundingRate", {
+        "symbol": trade.symbol,
+        "startTime": int(start.timestamp() * 1000),
+        "endTime": int(at.timestamp() * 1000),
+        "limit": 1000
+    })
+    if not isinstance(rows, list):
+        raise RuntimeError("Binance funding history did not return a list")
+    direction = 1 if trade.side == "LONG" else -1
+    total = 0.0
+    for item in rows:
+        rate = safe_float(item.get("fundingRate")) or 0.0
+        mark = safe_float(item.get("markPrice")) or trade.entry_price
+        total += trade.quantity * mark * rate * direction
+    return total, len(rows)
+
+
 async def evaluate_open_paper_trades(prices: dict[str,float] | None = None, source: str = "BINANCE_REST") -> None:
     with SessionLocal() as db:
         open_trades = db.scalars(select(PaperTrade).where(PaperTrade.status == "OPEN").limit(500)).all()
@@ -1234,8 +1255,42 @@ async def evaluate_open_paper_trades(prices: dict[str,float] | None = None, sour
             hit_stop = mark <= trade.stop_price if trade.side == "LONG" else mark >= trade.stop_price
             hit_target = mark >= trade.target_price if trade.side == "LONG" else mark <= trade.target_price
             exit_reason = None
+            funding_verified = bool(raw.get("funding_history_verified"))
             if net > 0:
-                exit_reason = "PROFIT_HARVEST_NET_POSITIVE"
+                next_funding_ms = safe_float(raw.get("next_funding_time"))
+                funding_check_at = None
+                if raw.get("funding_history_checked_at"):
+                    try:
+                        funding_check_at = datetime.fromisoformat(raw["funding_history_checked_at"].replace("Z", "+00:00"))
+                    except Exception:
+                        funding_check_at = None
+                next_funding_due = bool(next_funding_ms and ts.timestamp() * 1000 >= next_funding_ms)
+                check_due = (not funding_verified) or next_funding_due or funding_check_at is None or (ts - funding_check_at).total_seconds() >= 300
+                if check_due:
+                    try:
+                        actual_funding, funding_rows = await _actual_funding_cost(trade, ts)
+                        raw["funding_cost_actual"] = actual_funding
+                        raw["funding_history_rows"] = funding_rows
+                        raw["funding_history_checked_at"] = ts.isoformat()
+                        raw["funding_history_verified"] = True
+                        raw["funding_source"] = "BINANCE_FUNDING_HISTORY"
+                        fee_and_slippage = trade.notional * (float(cfg["taker_fee_pct"]) / 100 + float(cfg["slippage_pct"]) / 100) * 2
+                        costs = fee_and_slippage + actual_funding
+                        net = gross - costs
+                        pnl_pct = (net / max(trade.margin_used, 0.000001)) * 100
+                        trade.estimated_costs, trade.net_pnl = costs, net
+                        funding_verified = True
+                        if next_funding_ms:
+                            while next_funding_ms <= ts.timestamp() * 1000:
+                                next_funding_ms += 28800000
+                            raw["next_funding_time"] = next_funding_ms
+                    except Exception as funding_exc:
+                        funding_verified = False
+                        raw["funding_history_verified"] = False
+                        raw["funding_verification_error"] = str(funding_exc)[:180]
+                        db.add(PaperTradeEvent(paper_trade_id=trade.id,event_type="FUNDING_CHECK_PENDING",observed_at=ts,value=net,detail="Positive mark observed but actual funding history could not be verified; profit exit deferred"))
+                if net > 0 and funding_verified:
+                    exit_reason = "PROFIT_HARVEST_NET_POSITIVE"
             elif not gap_guard and hit_stop:
                 exit_reason = "STOP_LOSS"
             elif not gap_guard and hit_target:
