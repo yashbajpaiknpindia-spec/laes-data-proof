@@ -822,7 +822,7 @@ async def market_features(symbol: str, refresh: bool = False) -> dict:
             cached = parse_json(cache.raw_json)
             cached_closes = cached.get("closes_1h") if isinstance(cached, dict) else None
             # Re-fetch older cache rows created before list-valued Binance klines were parsed correctly.
-            if isinstance(cached_closes, list) and len(cached_closes) >= 25 and cached.get("quote_volume_24h_usdt") is not None and cached.get("spread_pct") is not None:
+            if isinstance(cached_closes, list) and len(cached_closes) >= 25 and cached.get("quote_volume_24h_usdt") is not None and cached.get("spread_pct") is not None and cached.get("min_depth_within_1pct_usdt") is not None:
                 return cached
     premium, _ = await binance_get("/fapi/v1/premiumIndex", {"symbol": symbol})
     ticker24, _ = await binance_get("/fapi/v1/ticker/24hr", {"symbol": symbol})
@@ -983,6 +983,9 @@ async def build_opportunity(obs: PositionObservation, snapshot_time: str | None,
         dead_market_reasons.append("24h quote volume below $5M or unavailable")
     if spread_pct is None or spread_pct > 0.10:
         dead_market_reasons.append("spread above 0.10% or unavailable")
+    depth_usdt = safe_float(market.get("min_depth_within_1pct_usdt"))
+    if depth_usdt is None or depth_usdt < 10000:
+        dead_market_reasons.append("top-20 order-book depth within 1% below $10K or unavailable")
     if atr_quality is None or atr_quality < 0.02 or atr_quality > 8.0:
         dead_market_reasons.append("volatility too low or disorderly")
     if funding_rate is not None and ((obs.side == "LONG" and funding_rate > 0.0005) or (obs.side == "SHORT" and funding_rate < -0.0005)):
