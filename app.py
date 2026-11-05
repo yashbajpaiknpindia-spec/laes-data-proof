@@ -1475,14 +1475,37 @@ async def api_paper_trade_detail(trade_id: int):
             "our_recovery_profit_usdt": recovery_profit_usdt, "status": ("CLOSED_BY_LEADER" if trade.exit_reason == "LEADER_POSITION_CLOSED" else ("STILL_OPEN_LAST_OBSERVED" if trade.status == "CLOSED" else "OPEN_OBSERVED"))
         }
         recovery = recovery_statistics(trade.trader_id, trade.source_key.split("|",1)[1] if "|" in trade.source_key else "", trade.symbol, trade.side, lentry)
-    # Potential ladder is derived from the leader's entry/recovery anchor, not a promise.
+    # Intermediate swing targets are independent of leader recovery; the leader's
+    # entry remains a separate anchor. Net estimates subtract known round-trip costs
+    # and funding accrued to the latest mark, but cannot predict future funding.
     ladder = []
+    directional = 1 if trade.side == "LONG" else -1
+    known_costs = safe_float(trade.estimated_costs) or 0.0
+    if trade.entry_price and trade.mark_price:
+        for swing in (0.10,0.20,0.30,0.50,0.70,1.00):
+            p = trade.mark_price * (1 + directional * swing / 100)
+            gross = directional * (p - trade.entry_price) * trade.quantity
+            ladder.append({
+                "target_type": "INTERMEDIATE_SWING_FROM_LATEST_MARK",
+                "target_pct_from_reference": swing,
+                "reference_price": trade.mark_price,
+                "price": p,
+                "gross_pnl_usdt": gross,
+                "estimated_net_pnl_usdt": gross - known_costs
+            })
     if leader and leader.get("recovery_price") and trade.entry_price:
         anchor = leader["recovery_price"]
         for extra in (0.0,0.3,0.5,0.7,1.0):
             p = anchor*(1+extra/100) if trade.side=="LONG" else anchor*(1-extra/100)
-            pnl = ((p-trade.entry_price)*trade.quantity) if trade.side=="LONG" else ((trade.entry_price-p)*trade.quantity)
-            ladder.append({"leader_gain_from_entry_pct":extra,"price":p,"gross_pnl_usdt":pnl})
+            gross = directional * (p-trade.entry_price) * trade.quantity
+            ladder.append({
+                "target_type": "LEADER_RECOVERY_AND_CONTINUATION",
+                "target_pct_from_reference": extra,
+                "reference_price": anchor,
+                "price": p,
+                "gross_pnl_usdt": gross,
+                "estimated_net_pnl_usdt": gross - known_costs
+            })
     return {
         "trade": {"id":trade.id,"status":trade.status,"trader_id":trade.trader_id,"leader_position_key":(trade.source_key.split("|",1)[1] if "|" in trade.source_key else trade.source_key),"symbol":trade.symbol,"side":trade.side,"entry_price":trade.entry_price,
                   "mark_price":trade.mark_price,"exit_price":trade.exit_price,"exit_reason":trade.exit_reason,"gross_pnl":trade.gross_pnl,"estimated_costs":trade.estimated_costs,"net_pnl":trade.net_pnl,"funding_cost_actual":raw.get("funding_cost_actual"),"funding_verified":bool(raw.get("funding_history_verified")),"funding_source":raw.get("funding_source"),"margin_used":trade.margin_used,"leverage":trade.leverage,
