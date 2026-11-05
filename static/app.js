@@ -101,7 +101,7 @@ async function openPaperTrade(id){
   const paperPts=paperLine(path.map(p=>p.paper_price),100,100,mn,mx),leaderPts=paperLine(path.map(p=>Number.isFinite(p.leader_mark)?p.leader_mark:null),100,100,mn,mx);
   const latestGap=Number(t.data_gap_seconds||0);
   let html='<div class="profile-grid">'+[
-   ['Our entry',fmt(t.entry_price,8)],['Current price',fmt(t.mark_price,8)],['Current net PnL',money(t.net_pnl)],
+   ['Leader ID',t.trader_id||d.trader?.id||'—'],['Leader position key',t.leader_position_key||'—'],['Our entry',fmt(t.entry_price,8)],['Current price',fmt(t.mark_price,8)],['Current net PnL',money(t.net_pnl)],
    ['MFE',money(t.mfe_net_pnl)+' · '+pct(t.mfe_pct)],['MAE',money(t.mae_net_pnl)+' · '+pct(t.mae_pct)],
    ['Last Binance check',date(t.last_binance_price_at)],['Last leader check',date(t.last_leader_check_at)],
    ['Data quality',latestGap>15?'INTERRUPTED':'LIVE / CONTINUOUS']
@@ -114,7 +114,8 @@ async function openPaperTrade(id){
    '<div class="analysis-line"><span>Our gross profit if leader reaches entry</span><b>'+money(l.our_recovery_profit_usdt)+' · '+pct(l.our_recovery_profit_pct)+'</b></div>'+
    '<div class="analysis-line"><span>Historic comparable recovery</span><b>'+fmt(r.probability,1)+'% · '+fmt(r.sample_size,0)+' samples</b></div>'+
    '</div>';
-  html+='<div class="analysis-box"><h4>PRICE PATH · OUR ENTRY VS LEADER</h4><div class="sparkline"><svg viewBox="0 0 100 100" preserveAspectRatio="none">'+(paperPts?'<polyline points="'+paperPts+'" fill="none" stroke="#a995f3" stroke-width="2" vector-effect="non-scaling-stroke"/>':'')+(leaderPts?'<polyline points="'+leaderPts+'" fill="none" stroke="#61d7b0" stroke-width="1.5" vector-effect="non-scaling-stroke"/>':'')+'</svg></div><div class="muted-note">Purple = our paper price · green = leader mark · stored every ~5s, live row refreshed every 1s.</div></div>';
+  const yLevel=v=>95-(v-mn)/(mx-mn||1)*85;const ourEntryY=yLevel(t.entry_price);const leaderEntryY=l.entry_price?yLevel(l.entry_price):null;
+  html+='<div class="analysis-box"><h4>PRICE PATH · OUR ENTRY VS LEADER</h4><div class="sparkline"><svg viewBox="0 0 100 100" preserveAspectRatio="none">'+(paperPts?'<polyline points="'+paperPts+'" fill="none" stroke="#a995f3" stroke-width="2" vector-effect="non-scaling-stroke"/>':'')+(leaderPts?'<polyline points="'+leaderPts+'" fill="none" stroke="#61d7b0" stroke-width="1.5" vector-effect="non-scaling-stroke"/>':'')+'<line x1="0" y1="'+ourEntryY+'" x2="100" y2="'+ourEntryY+'" stroke="#a995f3" stroke-dasharray="3 2" stroke-width="1"/>'+(leaderEntryY!==null?'<line x1="0" y1="'+leaderEntryY+'" x2="100" y2="'+leaderEntryY+'" stroke="#61d7b0" stroke-dasharray="3 2" stroke-width="1"/>':'')+'</svg></div><div class="muted-note">Purple = our sampled price path and entry line · green = leader mark path and leader entry/recovery line. Missing leader observations retain shared timestamps.</div></div>';
   html+='<div class="analysis-box"><h4>RECOVERY PROFIT LADDER</h4><div class="profile-history"><table><thead><tr><th>LEADER MOVE</th><th>LEADER PRICE</th><th>OUR GROSS PNL</th></tr></thead><tbody>'+ (lad.length?lad.map(x=>'<tr><td>+'+fmt(x.leader_gain_from_entry_pct,2)+'%</td><td>'+fmt(x.price,8)+'</td><td class="'+(x.gross_pnl_usdt>=0?'positive':'negative')+'">'+money(x.gross_pnl_usdt)+'</td></tr>').join(''):'<tr><td colspan="3">No recovery ladder available.</td></tr>')+'</tbody></table></div></div>';
   const events=(d.events||[]).map(e=>'<div class="analysis-line"><span>'+date(e.at)+' · '+esc(e.type)+'</span><b>'+money(e.value)+' · '+esc(e.detail)+'</b></div>').join('');
   html+='<div class="analysis-box"><h4>MEANINGFUL PROFIT EVENTS</h4>'+ (events||'<div class="muted-note">No threshold event recorded yet.</div>')+'</div>';
