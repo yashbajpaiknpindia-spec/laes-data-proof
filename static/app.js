@@ -92,7 +92,7 @@ async function loadPaper(){
  $("paperTrades").innerHTML=d.trades.map(t=>'<tr class="clickable-row" onclick="openPaperTrade('+t.id+')"><td><span class="status-tag '+(t.status==="OPEN"?"qualified":"neutral")+'">'+esc(t.status)+'</span></td><td>'+esc(t.trader_name||t.trader_id)+'</td><td><b>'+esc(t.symbol)+'</b></td><td class="'+(t.side==="LONG"?"side-long":"side-short")+'">'+esc(t.side)+'</td><td>'+fmt(t.entry_price,5)+' / '+fmt(t.mark_price,5)+'</td><td>'+money(t.notional)+'</td><td>'+money(t.margin_used)+' · '+fmt(t.leverage,1)+'×</td><td class="'+(t.net_pnl>=0?"positive":"negative")+'">'+money(t.net_pnl)+'<br><small>MFE '+money(t.mfe_net_pnl)+' · MAE '+money(t.mae_net_pnl)+'</small></td><td>'+fmt(t.stop_price,5)+' / '+fmt(t.target_price,5)+'</td><td>'+date(t.opened_at)+'</td></tr>').join("");
  }catch(e){notice("Paper ledger: "+e.message,"error");}
 }
-function paperLine(points,w,h,min,max){if(!points||points.length<2)return'';const span=max-min||1;return points.map((v,i)=>((i/(points.length-1))*100)+','+(95-(v-min)/span*85)).join(' ');}
+function paperLine(points,w,h,min,max){if(!points||points.length<2)return'';const span=max-min||1;return points.map((v,i)=>v===null||v===undefined?null:((i/(points.length-1))*100)+','+(95-(v-min)/span*85)).filter(Boolean).join(' ');}
 async function openPaperTrade(id){
  const modal=$("traderDialog");$("dialogName").textContent="Paper trade #"+id;$("dialogSub").textContent="Leader-linked recovery forensic view";$("dialogBody").innerHTML='<div class="empty-state">Loading persisted 1-second price-monitor state and leader path…</div>';modal.showModal();
  try{
