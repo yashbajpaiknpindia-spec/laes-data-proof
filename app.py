@@ -965,8 +965,22 @@ async def build_opportunity(obs: PositionObservation, snapshot_time: str | None,
     momentum = safe_float(market.get("momentum_5m_pct"))
     confirmation = momentum is not None and ((momentum > 0) if obs.side == "LONG" else (momentum < 0))
     min_adverse = float(cfg["min_adverse_pct"])
-    qualified = bool(underwater and adverse is not None and adverse >= min_adverse and confirmation)
-    status = "QUALIFIED" if qualified else ("UNDERWATER WATCH" if underwater else "NOT UNDERWATER")
+    quote_volume = safe_float(market.get("quote_volume_24h_usdt"))
+    spread_pct = safe_float(market.get("spread_pct"))
+    funding_rate = safe_float(market.get("funding_rate"))
+    atr_quality = safe_float(market.get("atr_24h_pct"))
+    dead_market_reasons = []
+    if quote_volume is None or quote_volume < 5_000_000:
+        dead_market_reasons.append("24h quote volume below $5M or unavailable")
+    if spread_pct is None or spread_pct > 0.10:
+        dead_market_reasons.append("spread above 0.10% or unavailable")
+    if atr_quality is None or atr_quality < 0.02 or atr_quality > 8.0:
+        dead_market_reasons.append("volatility too low or disorderly")
+    if funding_rate is not None and ((obs.side == "LONG" and funding_rate > 0.0005) or (obs.side == "SHORT" and funding_rate < -0.0005)):
+        dead_market_reasons.append("funding cost is unusually adverse for this side")
+    market_quality_ok = not dead_market_reasons
+    qualified = bool(underwater and adverse is not None and adverse >= min_adverse and confirmation and market_quality_ok)
+    status = "QUALIFIED" if qualified else ("DEAD / COSTLY MARKET" if underwater and not market_quality_ok else ("UNDERWATER WATCH" if underwater else "NOT UNDERWATER"))
     causes = []
     week = safe_float(market.get("seven_day_return_pct"))
     day = safe_float(market.get("twenty_four_hour_return_pct"))
@@ -993,6 +1007,7 @@ async def build_opportunity(obs: PositionObservation, snapshot_time: str | None,
         "margin_mode": obs.margin_mode, "liquidation_price": obs.liquidation_price,
         "observed_at": snapshot_time, "underwater": underwater, "qualified": qualified,
         "status": status, "momentum_5m_pct": momentum, "market": market,
+        "market_quality_ok": market_quality_ok, "dead_market_reasons": dead_market_reasons,
         "recovery": recovery, "holding": hold, "likely_causes": causes,
         "news_context_count": len(matched_news),
         "recovery_warning": "Market trend/news are contextual risk factors, not a deterministic cause or guarantee of recovery."
