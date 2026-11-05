@@ -1124,13 +1124,37 @@ async def evaluate_open_paper_trades(prices: dict[str,float] | None = None, sour
                     db.add(PaperTradeEvent(paper_trade_id=trade.id,event_type=f"PROFIT_{key}PCT",observed_at=ts,value=net,detail=f"First observed net-margin profit >= {step}%"))
             raw["mfe_net_pnl"], raw["mae_net_pnl"] = max(float(raw["mfe_net_pnl"]), net), min(float(raw["mae_net_pnl"]), net)
             trade.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
+            # A long data gap must not be mistaken for a continuously observed stop-out.
+            # If the first resumed mark is losing, wait for three consecutive fresh samples.
+            if gap > 15 and net <= 0:
+                raw["post_gap_confirmations"] = 0
+                raw["data_quality_status"] = "DATA_INTERRUPTED_REVIEW"
+                db.add(PaperTradeEvent(paper_trade_id=trade.id,event_type="DATA_GAP",observed_at=ts,value=net,detail=f"Price feed gap {gap:.1f}s; losing exit deferred"))
+            elif raw.get("data_quality_status") == "DATA_INTERRUPTED_REVIEW" and net <= 0:
+                raw["post_gap_confirmations"] = int(raw.get("post_gap_confirmations", 0)) + 1
+                if raw["post_gap_confirmations"] >= 3:
+                    raw["data_quality_status"] = "CONTINUOUS_AGAIN"
+            # Capture every sampled positive net amount. No minimum threshold: even
+            # +0.0014 USDT is a realized paper exit once round-trip costs and funding are covered.
+            gap_guard = raw.get("data_quality_status") == "DATA_INTERRUPTED_REVIEW" and net <= 0
             hit_stop = mark <= trade.stop_price if trade.side == "LONG" else mark >= trade.stop_price
             hit_target = mark >= trade.target_price if trade.side == "LONG" else mark <= trade.target_price
-            if hit_stop or hit_target:
-                trade.status = "CLOSED"; trade.exit_price = mark
-                trade.exit_reason = "STOP_LOSS" if hit_stop else "PREFERRED_TARGET"
+            exit_reason = None
+            if net > 0:
+                exit_reason = "PROFIT_HARVEST_NET_POSITIVE"
+            elif not gap_guard and hit_stop:
+                exit_reason = "STOP_LOSS"
+            elif not gap_guard and hit_target:
+                exit_reason = "PREFERRED_TARGET"
+            if exit_reason:
+                trade.status = "CLOSED"
+                trade.exit_price = mark
+                trade.exit_reason = exit_reason
                 trade.closed_at = ts
-                db.add(PaperTradeEvent(paper_trade_id=trade.id,event_type="EXIT",observed_at=ts,value=net,detail=trade.exit_reason))
+                raw["realized_net_pnl"] = net
+                raw["realized_exit_price"] = mark
+                raw["realized_exit_at"] = ts.isoformat()
+                db.add(PaperTradeEvent(paper_trade_id=trade.id,event_type="REALIZED_EXIT",observed_at=ts,value=net,detail=exit_reason))
         db.commit()
 
 async def paper_price_worker() -> None:
