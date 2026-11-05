@@ -101,7 +101,7 @@ async function openPaperTrade(id){
   const paperPts=paperLine(path.map(p=>p.paper_price),100,100,mn,mx),leaderPts=paperLine(path.map(p=>Number.isFinite(p.leader_mark)?p.leader_mark:null),100,100,mn,mx);
   const latestGap=Number(t.data_gap_seconds||0);
   let html='<div class="profile-grid">'+[
-   ['Leader ID',t.trader_id||d.trader?.id||'—'],['Leader position key',t.leader_position_key||'—'],['Our entry',fmt(t.entry_price,8)],['Current price',fmt(t.mark_price,8)],['Current net PnL',money(t.net_pnl)],
+   ['Leader ID',t.trader_id||d.trader?.id||'—'],['Leader position key',t.leader_position_key||'—'],['Our entry',fmt(t.entry_price,8)],['Current price',fmt(t.mark_price,8)],['Gross PnL',money(t.gross_pnl)],['Costs incl. estimated funding',money(t.estimated_costs)],['Current net PnL',money(t.net_pnl)],['Exit reason',t.exit_reason||'—'],['Exit price',fmt(t.exit_price,8)],
    ['MFE',money(t.mfe_net_pnl)+' · '+pct(t.mfe_pct)],['MAE',money(t.mae_net_pnl)+' · '+pct(t.mae_pct)],
    ['Last Binance check',date(t.last_binance_price_at)],['Last leader check',date(t.last_leader_check_at)],
    ['Data quality',latestGap>15?'INTERRUPTED':'LIVE / CONTINUOUS']
