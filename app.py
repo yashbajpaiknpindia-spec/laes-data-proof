@@ -1472,7 +1472,7 @@ async def api_paper_trade_detail(trade_id: int):
             "leverage": leader_obs.leverage, "margin_mode": leader_obs.margin_mode,
             "observed_at": leader_obs.raw_json and leader_obs.snapshot_id,
             "recovery_price": lentry, "our_recovery_profit_pct": recovery_profit_pct,
-            "our_recovery_profit_usdt": recovery_profit_usdt, "status": "LIVE_OBSERVED"
+            "our_recovery_profit_usdt": recovery_profit_usdt, "status": ("CLOSED_BY_LEADER" if trade.exit_reason == "LEADER_POSITION_CLOSED" else ("STILL_OPEN_LAST_OBSERVED" if trade.status == "CLOSED" else "OPEN_OBSERVED"))
         }
         recovery = recovery_statistics(trade.trader_id, trade.source_key.split("|",1)[1] if "|" in trade.source_key else "", trade.symbol, trade.side, lentry)
     # Potential ladder is derived from the leader's entry/recovery anchor, not a promise.
