@@ -1295,6 +1295,12 @@ async def evaluate_open_paper_trades(prices: dict[str,float] | None = None, sour
                 exit_reason = "STOP_LOSS"
             elif not gap_guard and hit_target:
                 exit_reason = "PREFERRED_TARGET"
+            # Keep the persisted last path point and ledger aligned with the funding-
+            # verified net amount used by the actual simulated exit decision.
+            path_row.net_pnl = net
+            path_row.pnl_pct = pnl_pct
+            trade.estimated_costs = costs
+            trade.net_pnl = net
             if exit_reason:
                 trade.status = "CLOSED"
                 trade.exit_price = mark
