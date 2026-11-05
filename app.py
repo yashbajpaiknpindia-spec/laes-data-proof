@@ -1301,6 +1301,15 @@ async def api_paper_trade_detail(trade_id: int):
         leader_obs = _leader_for_trade(db, trade)
         path = db.scalars(select(PaperTradePath).where(PaperTradePath.paper_trade_id==trade.id).order_by(PaperTradePath.observed_at)).all()
         events = db.scalars(select(PaperTradeEvent).where(PaperTradeEvent.paper_trade_id==trade.id).order_by(PaperTradeEvent.observed_at)).all()
+        campaign_rows = db.scalars(select(PaperTrade).where(PaperTrade.source_key == trade.source_key).order_by(PaperTrade.opened_at)).all()
+    campaign = {
+        "trade_count": len(campaign_rows),
+        "reentry_count": max(0, len(campaign_rows) - 1),
+        "open_count": sum(1 for item in campaign_rows if item.status == "OPEN"),
+        "realized_net_pnl": round(sum(item.net_pnl or 0 for item in campaign_rows if item.status == "CLOSED"), 8),
+        "total_net_pnl": round(sum(item.net_pnl or 0 for item in campaign_rows), 8),
+        "trade_ids": [item.id for item in campaign_rows]
+    }
     leader = None
     recovery = None
     if leader_obs:
@@ -1338,6 +1347,7 @@ async def api_paper_trade_detail(trade_id: int):
                   "last_leader_check_at":raw.get("last_leader_check_at"),"data_gap_seconds":raw.get("data_gap_seconds",0),
                   "meaningful_profit_hits":raw.get("meaningful_profit_hits",{})},
         "trader": {"id":trade.trader_id,"name":trader.name if trader else trade.trader_name},
+        "campaign": campaign,
         "leader": leader, "recovery": recovery, "potential_ladder": ladder,
         "path": [{"at":p.observed_at.isoformat(),"paper_price":p.paper_price,"leader_mark":p.leader_mark,"leader_pnl":p.leader_unrealized_pnl,
                   "leader_adverse_pct":p.leader_adverse_pct,"net_pnl":p.net_pnl,"pnl_pct":p.pnl_pct,"source":p.source,"gap":p.data_gap_seconds} for p in path],
