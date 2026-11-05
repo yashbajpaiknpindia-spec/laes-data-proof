@@ -265,7 +265,7 @@ def paper_config() -> dict:
         "max_total_margin_pct": 100.0,
         "research_unconstrained": True,
         "path_sample_seconds": 5.0,
-        "meaningful_profit_steps": [0.10, 0.20, 0.30, 0.50, 0.70, 1.00]
+        "meaningful_profit_steps": [0.10, 0.20, 0.30, 0.50, 0.70, 1.00],
         "target_pct": 0.70,
         "stop_pct": 0.45,
         "taker_fee_pct": 0.05,
