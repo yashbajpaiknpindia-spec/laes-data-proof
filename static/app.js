@@ -1,7 +1,7 @@
 const $=id=>document.getElementById(id);
 const state={page:"overview"};
 const fmt=(v,d=2)=>v===null||v===undefined||v===""||Number.isNaN(Number(v))?"—":Number(v).toLocaleString(undefined,{maximumFractionDigits:d});
-const money=v=>v===null||v===undefined?"—":fmt(v,2)+" USDT";
+const money=v=>v===null||v===undefined?"—":fmt(v,Math.abs(Number(v))<0.01?8:4)+" USDT";
 const pct=v=>v===null||v===undefined?"—":fmt(v,2)+"%";
 const date=v=>{if(!v)return"—";const d=new Date(v);return Number.isNaN(d.getTime())?"—":d.toLocaleString();};
 const duration=h=>h===null||h===undefined?"Unavailable":h<1?Math.round(h*60)+"m":h<24?h.toFixed(1)+"h":(h/24).toFixed(1)+"d";
@@ -98,7 +98,7 @@ async function openPaperTrade(id){
  try{
   const d=await api('/api/paper/'+id),t=d.trade||{},l=d.leader||{},r=d.recovery||{},path=d.path||[],lad=d.potential_ladder||[];
   const vals=path.flatMap(p=>[p.paper_price,p.leader_mark]).filter(Number.isFinite),mn=vals.length?Math.min(...vals):0,mx=vals.length?Math.max(...vals):1;
-  const paperPts=paperLine(path.map(p=>p.paper_price),100,100,mn,mx),leaderPts=paperLine(path.map(p=>p.leader_mark).filter(Number.isFinite),100,100,mn,mx);
+  const paperPts=paperLine(path.map(p=>p.paper_price),100,100,mn,mx),leaderPts=paperLine(path.map(p=>Number.isFinite(p.leader_mark)?p.leader_mark:null),100,100,mn,mx);
   const latestGap=Number(t.data_gap_seconds||0);
   let html='<div class="profile-grid">'+[
    ['Our entry',fmt(t.entry_price,8)],['Current price',fmt(t.mark_price,8)],['Current net PnL',money(t.net_pnl)],
