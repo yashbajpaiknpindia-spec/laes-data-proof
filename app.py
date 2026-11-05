@@ -1471,7 +1471,7 @@ async def api_paper_trade_detail(trade_id: int):
             ladder.append({"leader_gain_from_entry_pct":extra,"price":p,"gross_pnl_usdt":pnl})
     return {
         "trade": {"id":trade.id,"status":trade.status,"trader_id":trade.trader_id,"leader_position_key":(trade.source_key.split("|",1)[1] if "|" in trade.source_key else trade.source_key),"symbol":trade.symbol,"side":trade.side,"entry_price":trade.entry_price,
-                  "mark_price":trade.mark_price,"exit_price":trade.exit_price,"exit_reason":trade.exit_reason,"gross_pnl":trade.gross_pnl,"estimated_costs":trade.estimated_costs,"net_pnl":trade.net_pnl,"margin_used":trade.margin_used,"leverage":trade.leverage,
+                  "mark_price":trade.mark_price,"exit_price":trade.exit_price,"exit_reason":trade.exit_reason,"gross_pnl":trade.gross_pnl,"estimated_costs":trade.estimated_costs,"net_pnl":trade.net_pnl,"funding_cost_actual":raw.get("funding_cost_actual"),"funding_verified":bool(raw.get("funding_history_verified")),"funding_source":raw.get("funding_source"),"margin_used":trade.margin_used,"leverage":trade.leverage,
                   "opened_at":trade.opened_at.isoformat(),"closed_at":trade.closed_at.isoformat() if trade.closed_at else None,
                   "mfe_net_pnl":raw.get("mfe_net_pnl",trade.net_pnl),"mae_net_pnl":raw.get("mae_net_pnl",trade.net_pnl),
                   "mfe_pct":raw.get("mfe_pct",0),"mae_pct":raw.get("mae_pct",0),"last_binance_price_at":raw.get("last_binance_price_at"),
