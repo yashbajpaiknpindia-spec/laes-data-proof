@@ -107,6 +107,8 @@ async function openPaperTrade(id){
    ['Data quality',latestGap>15?'INTERRUPTED':'LIVE / CONTINUOUS']
   ].map(x=>'<div class="profile-metric"><small>'+esc(x[0])+'</small><b>'+esc(x[1])+'</b></div>').join('')+'</div>';
   html+='<div class="analysis-box"><h4>LEADER POSITION YOU ARE ANCHORED TO</h4>'+
+   '<div class="analysis-line"><span>Leader position status</span><b>'+esc(l.status||'UNKNOWN')+'</b></div>'+
+   '<div class="analysis-line"><span>Leader leverage / margin mode</span><b>'+fmt(l.leverage,2)+'× / '+esc(l.margin_mode||'Not reported')+'</b></div>'+
    '<div class="analysis-line"><span>Leader entry / recovery price</span><b>'+fmt(l.entry_price,8)+'</b></div>'+
    '<div class="analysis-line"><span>Leader current mark</span><b>'+fmt(l.mark_price,8)+'</b></div>'+
    '<div class="analysis-line"><span>Leader current loss</span><b>'+money(l.unrealized_pnl)+'</b></div>'+
