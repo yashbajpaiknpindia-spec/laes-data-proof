@@ -347,6 +347,7 @@ def persist_traders(rows: list[dict]) -> int:
 def record_position_snapshot(trader_id: str, payload: dict) -> tuple[int, bool]:
     data = unwrap_data(payload)
     positions = data.get("positions") or []
+    positions_complete = isinstance(data.get("positions"), list)
     hidden = bool(data.get("hidden", False))
     fetched_at = data.get("fetchedAt") or data.get("fetched_at")
     saved = 0
@@ -396,9 +397,9 @@ def record_position_snapshot(trader_id: str, payload: dict) -> tuple[int, bool]:
                  if p.get("positionId") else f"{str(p.get('symbol') or 'UNKNOWN').upper()}|{str(p.get('side') or 'UNKNOWN').upper()}")
                 for p in positions
             }
-            for paper in db.scalars(select(PaperTrade).where(
+            for paper in (db.scalars(select(PaperTrade).where(
                 PaperTrade.trader_id == trader_id, PaperTrade.status == "OPEN"
-            )).all():
+            )).all() if positions_complete else []):
                 exact_key = paper.source_key.split("|", 1)[1] if "|" in paper.source_key else ""
                 raw_trade = parse_json(paper.raw_json)
                 if exact_key in observed_keys:
