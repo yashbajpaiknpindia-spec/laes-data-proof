@@ -822,7 +822,7 @@ async def market_features(symbol: str, refresh: bool = False) -> dict:
             cached = parse_json(cache.raw_json)
             cached_closes = cached.get("closes_1h") if isinstance(cached, dict) else None
             # Re-fetch older cache rows created before list-valued Binance klines were parsed correctly.
-            if isinstance(cached_closes, list) and len(cached_closes) >= 25 and cached.get("quote_volume_24h_usdt") is not None and cached.get("spread_pct") is not None and cached.get("min_depth_within_1pct_usdt") is not None:
+            if isinstance(cached_closes, list) and len(cached_closes) >= 25 and cached.get("quote_volume_24h_usdt") is not None and cached.get("spread_pct") is not None and cached.get("min_depth_within_1pct_usdt") is not None and cached.get("volume_ratio_recent_6h_vs_prior_24h") is not None:
                 return cached
     premium, _ = await binance_get("/fapi/v1/premiumIndex", {"symbol": symbol})
     ticker24, _ = await binance_get("/fapi/v1/ticker/24hr", {"symbol": symbol})
@@ -837,6 +837,10 @@ async def market_features(symbol: str, refresh: bool = False) -> dict:
     closes = [float(k[4]) for k in klines if isinstance(k, (list, tuple)) and len(k) > 4]
     highs = [float(k[2]) for k in klines if isinstance(k, (list, tuple)) and len(k) > 4]
     lows = [float(k[3]) for k in klines if isinstance(k, (list, tuple)) and len(k) > 4]
+    hourly_volumes = [float(k[5]) for k in klines if isinstance(k, (list, tuple)) and len(k) > 5]
+    recent_6h_volume = sum(hourly_volumes[-6:]) if len(hourly_volumes) >= 6 else None
+    prior_24h_avg_hour = statistics.mean(hourly_volumes[-30:-6]) if len(hourly_volumes) >= 30 else None
+    volume_ratio_6h = (recent_6h_volume / (prior_24h_avg_hour * 6)) if recent_6h_volume is not None and prior_24h_avg_hour and prior_24h_avg_hour > 0 else None
     last = closes[-1] if closes else safe_float(premium.get("markPrice"))
     seven_return = (closes[-1] / closes[0] - 1) * 100 if len(closes) >= 2 and closes[0] else None
     day_return = (closes[-1] / closes[-25] - 1) * 100 if len(closes) >= 25 and closes[-25] else None
@@ -857,6 +861,7 @@ async def market_features(symbol: str, refresh: bool = False) -> dict:
         "funding_rate": safe_float(premium.get("lastFundingRate")),
         "next_funding_time": premium.get("nextFundingTime"),
         "quote_volume_24h_usdt": safe_float(ticker24.get("quoteVolume")) if isinstance(ticker24, dict) else None,
+        "volume_ratio_recent_6h_vs_prior_24h": volume_ratio_6h,
         "base_volume_24h": safe_float(ticker24.get("volume")) if isinstance(ticker24, dict) else None,
         "best_bid": safe_float(book.get("bidPrice")) if isinstance(book, dict) else None,
         "best_ask": safe_float(book.get("askPrice")) if isinstance(book, dict) else None,
@@ -986,6 +991,9 @@ async def build_opportunity(obs: PositionObservation, snapshot_time: str | None,
     depth_usdt = safe_float(market.get("min_depth_within_1pct_usdt"))
     if depth_usdt is None or depth_usdt < 10000:
         dead_market_reasons.append("top-20 order-book depth within 1% below $10K or unavailable")
+    volume_ratio = safe_float(market.get("volume_ratio_recent_6h_vs_prior_24h"))
+    if volume_ratio is None or volume_ratio < 0.30:
+        dead_market_reasons.append("recent 6h volume below 30% of prior 24h hourly baseline or unavailable")
     if atr_quality is None or atr_quality < 0.02 or atr_quality > 8.0:
         dead_market_reasons.append("volatility too low or disorderly")
     if funding_rate is not None and ((obs.side == "LONG" and funding_rate > 0.0005) or (obs.side == "SHORT" and funding_rate < -0.0005)):
