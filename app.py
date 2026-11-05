@@ -1001,7 +1001,7 @@ def create_paper_trade(obs: PositionObservation, trader_name: str | None, mark: 
             symbol=obs.symbol, side=obs.side, status="OPEN",
             entry_price=mark, mark_price=mark, quantity=quantity, notional=notional,
             margin_used=margin, leverage=leverage, stop_price=stop, target_price=target,
-            raw_json=json.dumps({"leader_entry": obs.entry_price, "leader_mark": obs.mark_price, "adverse_pct": ((obs.entry_price-mark)/obs.entry_price*100 if obs.side=="LONG" else (mark-obs.entry_price)/obs.entry_price*100), "funding_rate_at_entry": market.get("funding_rate")}, default=str)
+            raw_json=json.dumps({"leader_entry": obs.entry_price, "leader_mark": obs.mark_price, "adverse_pct": ((obs.entry_price-mark)/obs.entry_price*100 if obs.side=="LONG" else (mark-obs.entry_price)/obs.entry_price*100), "funding_rate_at_entry": market.get("funding_rate"), "next_funding_time": market.get("next_funding_time")}, default=str)
         ))
         db.commit()
 
@@ -1036,12 +1036,23 @@ def _leader_for_trade(db, trade: PaperTrade) -> PositionObservation | None:
         PositionObservation.position_key == position_key
     ).order_by(desc(PositionObservation.id)).limit(1))
 
-def _paper_pnl(trade: PaperTrade, mark: float, cfg: dict) -> tuple[float,float,float]:
+def _paper_pnl(trade: PaperTrade, mark: float, cfg: dict, raw: dict | None = None, at: datetime | None = None) -> tuple[float,float,float,float]:
     directional = 1 if trade.side == "LONG" else -1
     gross = directional * (mark - trade.entry_price) * trade.quantity
     fee_cost = trade.notional * (float(cfg["taker_fee_pct"]) / 100) * 2
     slip_cost = trade.notional * (float(cfg["slippage_pct"]) / 100) * 2
-    costs = fee_cost + slip_cost
+    # Estimate funding from the rate captured at entry; positive funding charges longs
+    # and credits shorts. Funding is applied at each 8-hour funding timestamp.
+    raw = raw or {}
+    funding_rate = safe_float(raw.get("funding_rate_at_entry")) or 0.0
+    next_funding_ms = safe_float(raw.get("next_funding_time"))
+    funding_events = 0
+    if at and next_funding_ms and funding_rate:
+        elapsed_ms = at.timestamp() * 1000 - next_funding_ms
+        if elapsed_ms >= 0:
+            funding_events = 1 + int(elapsed_ms // 28800000)
+    funding_cost = trade.notional * funding_rate * funding_events * directional
+    costs = fee_cost + slip_cost + funding_cost
     net = gross - costs
     pct = (net / max(trade.margin_used, 0.000001)) * 100
     return gross, costs, net, pct
@@ -1065,7 +1076,7 @@ async def evaluate_open_paper_trades(prices: dict[str,float] | None = None, sour
                 try: prev_check = datetime.fromisoformat(raw["last_binance_price_at"].replace("Z","+00:00"))
                 except Exception: prev_check = None
             gap = max(0.0, (ts-prev_check).total_seconds()) if prev_check else 0.0
-            gross, costs, net, pnl_pct = _paper_pnl(trade, mark, cfg)
+            gross, costs, net, pnl_pct = _paper_pnl(trade, mark, cfg, raw, ts)
             raw["last_binance_price_at"] = ts.isoformat()
             raw["last_paper_check_at"] = ts.isoformat()
             raw["last_price_source"] = source
