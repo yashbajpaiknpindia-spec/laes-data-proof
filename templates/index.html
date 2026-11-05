@@ -110,7 +110,7 @@
       <div class="page-intro"><div><div class="section-kicker">SIMULATED EXECUTION · NO REAL ORDERS</div><h2>Paper trading desk</h2><p>Separate simulated portfolio, deployed margin, open trades, realized and unrealized PnL.</p></div><span class="paper-state">● PAPER ENGINE ACTIVE</span></div>
       <div class="paper-metrics">
         <article class="metric-card"><div class="metric-label">DEPLOYED CAPITAL</div><div class="metric-value" id="paperCapital">—</div><div class="metric-foot">Configured paper portfolio capital · USDT</div></article>
-        <article class="metric-card"><div class="metric-label">MARGIN IN USE</div><div class="metric-value violet" id="paperMargin">—</div><div class="metric-foot">Current open paper positions</div></article>
+        <article class="metric-card"><div class="metric-label">MARGIN IN USE</div><div class="metric-value violet" id="paperMargin">—</div><div class="metric-foot" id="paperMarginFoot">Current open paper positions</div></article>
         <article class="metric-card"><div class="metric-label">REALIZED NET PNL</div><div class="metric-value" id="paperRealized">—</div><div class="metric-foot">After estimated fees and slippage</div></article>
         <article class="metric-card"><div class="metric-label">UNREALIZED NET PNL</div><div class="metric-value" id="paperUnrealized">—</div><div class="metric-foot">Marked to Binance public mark price</div></article>
         <article class="metric-card"><div class="metric-label">FREE CAPITAL</div><div class="metric-value" id="paperFree">—</div><div class="metric-foot">Capital available for new simulations</div></article>
@@ -124,6 +124,7 @@
             <div class="form-grid">
               <label>Risk per trade <span>% equity</span><input name="risk_pct" type="number" min="0.01" max="5" step="0.05" value="0.5"></label>
               <label>Max margin per trade <span>% equity</span><input name="max_margin_pct" type="number" min="1" max="100" step="1" value="10"></label>
+              <label>Total portfolio margin cap <span>% of paper capital</span><input name="max_total_margin_pct" type="number" min="5" max="100" step="5" value="40"></label>
               <label>Target <span>% from entry</span><input name="target_pct" type="number" min="0.05" step="0.05" value="0.7"></label>
               <label>Stop loss <span>% from entry</span><input name="stop_pct" type="number" min="0.05" step="0.05" value="0.45"></label>
               <label>Taker fee <span>% per side</span><input name="taker_fee_pct" type="number" min="0" step="0.005" value="0.05"></label>

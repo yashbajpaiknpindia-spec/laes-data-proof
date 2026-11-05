@@ -18,7 +18,7 @@ Kopyon documents the Binance copy-trading source at https://kopyon.com/docs/bina
 - Loads profile, performance, and closed position history when a trader forensic profile is opened.
 - Computes leader adverse excursion, current hold time, 7-day market return, 24-hour return, ATR, RSI, 5-minute momentum and relevant headline context.
 - Calculates a recovery percentage only after at least ten comparable paths have been observed underwater by LAES and later matched to closed results. Otherwise it explicitly reports insufficient sample size.
-- Runs a separate paper-only desk with adjustable paper capital, allocation, stops, targets, leverage cap, fees and slippage. It never submits orders.
+- Runs a separate paper-only desk with adjustable paper capital, allocation, per-trade and total-portfolio margin caps, stops, targets, leverage cap, fees and slippage. It never submits orders.
 - Reports actual database size and row/table counts where the database engine exposes them.
 
 ## Important evidence rules

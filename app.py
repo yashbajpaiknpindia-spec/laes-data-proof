@@ -238,6 +238,7 @@ def paper_config() -> dict:
         "auto_enabled": True,
         "risk_pct": 0.50,
         "max_margin_pct": 10.0,
+        "max_total_margin_pct": 40.0,
         "target_pct": 0.70,
         "stop_pct": 0.45,
         "taker_fee_pct": 0.05,
@@ -712,9 +713,13 @@ async def api_positions(limit: int = 500):
 async def fetch_news_items() -> list[dict]:
     if time.time() - news_cache["fetched_at"] < 1800:
         return news_cache["items"]
-    feeds = ["https://www.coindesk.com/arc/outboundfeeds/rss/"]
+    feeds = [
+        ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/"),
+        ("Cointelegraph", "https://cointelegraph.com/rss"),
+        ("The Block", "https://www.theblock.co/rss.xml")
+    ]
     items = []
-    for url in feeds:
+    for source_name, url in feeds:
         try:
             async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
                 response = await client.get(url)
@@ -724,9 +729,10 @@ async def fetch_news_items() -> list[dict]:
                 title = item.findtext("title") or ""
                 link = item.findtext("link") or ""
                 pub = item.findtext("pubDate") or ""
-                items.append({"title": title, "url": link, "published_at": pub, "source": "CoinDesk RSS"})
+                if title and link:
+                    items.append({"title": title, "url": link, "published_at": pub, "source": source_name})
         except Exception as exc:
-            news_cache["error"] = str(exc)[:180]
+            news_cache["error"] = f"{source_name}: {str(exc)[:150]}"
     news_cache.update({"fetched_at": time.time(), "items": items, "error": news_cache.get("error")})
     return items
 
@@ -800,19 +806,17 @@ def recovery_statistics(trader_id: str, position_key: str, symbol: str, side: st
             HistoryPosition.symbol == symbol,
             HistoryPosition.side == side
         )).all()
-        observed = []
-        if position_id:
-            observed = db.scalars(select(PositionObservation).where(
-                PositionObservation.trader_id == trader_id,
-                PositionObservation.position_key.like(position_id + "|%")
-            )).all()
+        observed = db.scalars(select(PositionObservation).where(
+            PositionObservation.trader_id == trader_id,
+            PositionObservation.symbol == symbol,
+            PositionObservation.side == side
+        )).all()
     recovered = []
     for h in history:
-        had_adverse = False
-        if h.position_id:
-            had_adverse = any((o.unrealized_pnl is not None and o.unrealized_pnl < 0) for o in observed if o.position_key.startswith(h.position_id + "|"))
-        if not had_adverse and h.position_id == position_id:
-            had_adverse = any((o.unrealized_pnl is not None and o.unrealized_pnl < 0) for o in observed)
+        # Match each closed historical position to its own LAES-observed path ID.
+        # Current-position observations alone must never be applied to unrelated history rows.
+        matching_path = [o for o in observed if h.position_id and o.position_key.startswith(h.position_id + "|")]
+        had_adverse = any(o.unrealized_pnl is not None and o.unrealized_pnl < 0 for o in matching_path)
         if had_adverse:
             profitable = h.net_pnl > 0 if h.net_pnl is not None else (
                 (h.close_price > h.entry_price) if side == "LONG" and h.close_price and h.entry_price else
@@ -864,7 +868,7 @@ def holding_time(trader_id: str, position_key: str, raw: dict, observed_at: str 
 
 def find_news_for_symbol(symbol: str, items: list[dict]) -> list[dict]:
     base = symbol.upper().replace("USDT", "").replace("USDC", "").replace("BUSD", "")
-    aliases = {"BTC": ["bitcoin", "btc"], "ETH": ["ethereum", "ether", "eth"], "SOL": ["solana", "sol"], "BNB": ["binance coin", "bnb"], "XRP": ["ripple", "xrp"], "DOGE": ["dogecoin", "doge"]}
+    aliases = {"BTC": ["bitcoin", "btc"], "ETH": ["ethereum", "ether", "eth"], "SOL": ["solana", "sol"], "BNB": ["binance coin", "bnb"], "XRP": ["ripple", "xrp"], "DOGE": ["dogecoin", "doge"], "CRCL": ["circle", "usdc", "crcl"], "XAU": ["gold", "bullion"], "MSTR": ["microstrategy", "strategy"], "ZEC": ["zcash", "zec"], "AAVE": ["aave"], "HYPE": ["hyperliquid"], "UNI": ["uniswap"], "SNDK": ["sandisk"], "SKHYNIX": ["sk hynix", "sk hynix memory"]}
     terms = aliases.get(base, [base.lower()])
     matches = []
     for item in items:
@@ -936,7 +940,12 @@ def create_paper_trade(obs: PositionObservation, trader_name: str | None, mark: 
         capital = max(0.0, float(cfg["capital_usdt"]) + float(realized))
         free_capital = max(0.0, capital - used_margin)
         max_margin = capital * float(cfg["max_margin_pct"]) / 100
-        margin = min(capital * float(cfg["risk_pct"]) / 100 / max(float(cfg["stop_pct"]) / 100, 0.0001), max_margin, free_capital)
+        max_total_margin = capital * float(cfg["max_total_margin_pct"]) / 100
+        remaining_portfolio_margin = max(0.0, max_total_margin - used_margin)
+        margin = min(
+            capital * float(cfg["risk_pct"]) / 100 / max(float(cfg["stop_pct"]) / 100, 0.0001),
+            max_margin, free_capital, remaining_portfolio_margin
+        )
         leverage = max(1.0, min(float(cfg["max_leverage"]), float(obs.leverage or 1.0)))
         notional = margin * leverage
         notional = min(notional, capital * 0.25)
@@ -1026,10 +1035,15 @@ async def api_paper():
     realized = sum(t.net_pnl for t in closed_trades)
     unrealized = sum(t.net_pnl for t in open_trades)
     deployed_margin = sum(t.margin_used for t in open_trades)
+    equity = float(cfg["capital_usdt"]) + realized + unrealized
+    margin_cap = float(cfg["capital_usdt"]) * float(cfg["max_total_margin_pct"]) / 100
     return {
         "config": cfg, "capital": cfg["capital_usdt"], "realized_pnl": round(realized, 4),
-        "unrealized_pnl": round(unrealized, 4), "equity": round(float(cfg["capital_usdt"]) + realized + unrealized, 4),
-        "deployed_margin": round(deployed_margin, 4), "free_capital": round(max(0, float(cfg["capital_usdt"]) + realized - deployed_margin), 4),
+        "unrealized_pnl": round(unrealized, 4), "equity": round(equity, 4),
+        "deployed_margin": round(deployed_margin, 4), "margin_cap": round(margin_cap, 4),
+        "margin_utilization_pct": round(deployed_margin / max(float(cfg["capital_usdt"]), 0.01) * 100, 2),
+        "margin_cap_exceeded": deployed_margin > margin_cap,
+        "free_capital": round(max(0, equity - deployed_margin), 4),
         "open_count": len(open_trades), "closed_count": len(closed_trades),
         "trades": [{
             "id": t.id, "trader_id": t.trader_id, "trader_name": t.trader_name, "symbol": t.symbol, "side": t.side,
@@ -1045,7 +1059,7 @@ async def api_paper():
 async def update_paper_settings(request: Request):
     body = await request.json()
     cfg = paper_config()
-    for key in ["capital_usdt", "risk_pct", "max_margin_pct", "target_pct", "stop_pct", "taker_fee_pct", "slippage_pct", "max_leverage", "min_adverse_pct"]:
+    for key in ["capital_usdt", "risk_pct", "max_margin_pct", "max_total_margin_pct", "target_pct", "stop_pct", "taker_fee_pct", "slippage_pct", "max_leverage", "min_adverse_pct"]:
         if key in body:
             val = safe_float(body[key])
             if val is None or val < 0:
@@ -1056,6 +1070,7 @@ async def update_paper_settings(request: Request):
     cfg["capital_usdt"] = max(0.0, min(float(cfg["capital_usdt"]), 100000000))
     cfg["risk_pct"] = min(float(cfg["risk_pct"]), 5.0)
     cfg["max_margin_pct"] = min(float(cfg["max_margin_pct"]), 100.0)
+    cfg["max_total_margin_pct"] = min(max(float(cfg["max_total_margin_pct"]), 5.0), 100.0)
     cfg["target_pct"] = min(float(cfg["target_pct"]), 20.0)
     cfg["stop_pct"] = min(max(float(cfg["stop_pct"]), 0.05), 20.0)
     cfg["taker_fee_pct"] = min(float(cfg["taker_fee_pct"]), 2.0)
