@@ -26,4 +26,4 @@ services:
       - key: LAES_DISCOVERY_INTERVAL_SECONDS
         value: "1800"
       - key: LAES_POSITION_BATCH
-        value: "5"
+        value: "20"

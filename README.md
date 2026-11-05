@@ -45,7 +45,7 @@ Recommended:
 - \`BINANCE_BASE_URL=https://fapi.binance.com\`
 - \`LAES_MODE=paper\`
 - \`LAES_DISCOVERY_INTERVAL_SECONDS=1800\`
-- \`LAES_POSITION_BATCH=5\`
+- \`LAES_POSITION_BATCH=20\`
 
 There is no browser admin-token prompt. Source credentials remain server-side.
 

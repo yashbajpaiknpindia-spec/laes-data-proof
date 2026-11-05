@@ -29,7 +29,7 @@ if not KOPYON_ROOT.endswith("/binance-copy-trading"):
     KOPYON_ROOT += "/binance-copy-trading"
 BINANCE_ROOT = os.getenv("BINANCE_BASE_URL", "https://fapi.binance.com").rstrip("/")
 DISCOVERY_INTERVAL = max(900, int(os.getenv("LAES_DISCOVERY_INTERVAL_SECONDS", "1800")))
-POSITION_BATCH = max(1, min(5, int(os.getenv("LAES_POSITION_BATCH", "5"))))
+POSITION_BATCH = max(1, min(20, int(os.getenv("LAES_POSITION_BATCH", "20"))))
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./laes_local.db").strip()
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
@@ -193,14 +193,23 @@ def unwrap_data(payload: Any) -> dict:
         return payload["data"]
     return payload if isinstance(payload, dict) else {}
 
-def ms_datetime(value: Any) -> datetime | None:
-    try:
-        if value is None:
-            return None
-        v = int(value)
-        return datetime.fromtimestamp(v / 1000, tz=timezone.utc)
-    except Exception:
+def timestamp_ms(value: Any) -> int | None:
+    if value is None:
         return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return int(parsed.timestamp() * 1000)
+        except Exception:
+            return None
+
+def ms_datetime(value: Any) -> datetime | None:
+    millis = timestamp_ms(value)
+    return datetime.fromtimestamp(millis / 1000, tz=timezone.utc) if millis is not None else None
 
 def setting(key: str, default: Any) -> Any:
     with SessionLocal() as db:
@@ -241,7 +250,7 @@ def log_check(source: str, ok: bool, status: int | None = None, latency: int | N
     except Exception:
         pass
 
-async def request_json(url: str, params: dict | None = None, headers: dict | None = None, timeout: float = 20) -> tuple[dict, int]:
+async def request_json(url: str, params: dict | None = None, headers: dict | None = None, timeout: float = 20) -> tuple[Any, int]:
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.get(url, params=params or {}, headers=headers or {})
     if response.status_code >= 400:
@@ -251,7 +260,8 @@ async def request_json(url: str, params: dict | None = None, headers: dict | Non
         payload = response.json()
     except Exception as exc:
         raise RuntimeError("Provider returned a non-JSON response") from exc
-    return payload if isinstance(payload, dict) else {"data": payload}, response.status_code
+    # Preserve JSON arrays: Binance /klines returns a list, not an object.
+    return payload, response.status_code
 
 async def kopyon_get(route: str, params: dict | None = None) -> tuple[dict, int]:
     if not KOPYON_KEY:
@@ -285,7 +295,7 @@ def persist_traders(rows: list[dict]) -> int:
                 db.add(trader)
             trader.name = item.get("name") or item.get("nickname") or trader.name
             trader.avatar_url = item.get("avatarUrl") or trader.avatar_url
-            trader.portfolio_type = item.get("type") or item.get("portfolioType") or trader.portfolio_type
+            trader.portfolio_type = item.get("type") or item.get("portfolioType") or trader.portfolio_type or "PUBLIC"
             trader.roi = safe_float(item.get("roi"))
             trader.pnl = safe_float(item.get("pnl"))
             trader.aum = safe_float(item.get("aum"))
@@ -368,6 +378,15 @@ async def sync_one_trader_positions(trader_id: str) -> tuple[int, bool]:
     payload, _ = await kopyon_get("openPositions", {"traderId": trader_id})
     return record_position_snapshot(trader_id, payload)
 
+async def sync_trader_profile_if_stale(trader_id: str, max_age_hours: int = 24) -> bool:
+    with SessionLocal() as db:
+        cache = db.get(TraderProfileCache, trader_id)
+        stale = cache is None or (now() - cache.fetched_at).total_seconds() >= max_age_hours * 3600
+    if not stale:
+        return False
+    await load_trader_intelligence(trader_id)
+    return True
+
 async def run_monitor_cycle(force: bool = False) -> dict:
     global last_manual_sync
     async with scan_lock:
@@ -389,6 +408,7 @@ async def run_monitor_cycle(force: bool = False) -> dict:
                     selected = discovered_ids[:POSITION_BATCH]
             checked = 0
             saved = 0
+            profiles_loaded = 0
             for trader_id in selected:
                 try:
                     count, hidden = await sync_one_trader_positions(trader_id)
@@ -397,6 +417,12 @@ async def run_monitor_cycle(force: bool = False) -> dict:
                     log_check("position_snapshot", True, 200, None, f"{trader_id}: hidden={hidden}, observed={count}")
                 except Exception as exc:
                     log_check("position_snapshot", False, None, None, f"{trader_id}: {str(exc)[:700]}")
+                try:
+                    if await sync_trader_profile_if_stale(trader_id, max_age_hours=24):
+                        profiles_loaded += 1
+                        log_check("trader_profile", True, 200, None, f"{trader_id}: profile/performance/history refreshed")
+                except Exception as exc:
+                    log_check("trader_profile", False, None, None, f"{trader_id}: {str(exc)[:700]}")
             try:
                 await api_opportunities(limit=100)
             except Exception as analysis_exc:
@@ -409,6 +435,7 @@ async def run_monitor_cycle(force: bool = False) -> dict:
                 "traders_found": trader_count,
                 "positions_checked": checked,
                 "observations_saved": saved,
+                "profiles_loaded": profiles_loaded,
                 "selected_trader_ids": selected
             })
             last_manual_sync = time.time()
@@ -526,7 +553,7 @@ async def api_overview():
         "database": db,
         "kopyon": {"configured": bool(KOPYON_KEY), "base": KOPYON_ROOT, "last_status": next(({"ok": c.ok, "detail": c.detail, "at": c.checked_at.isoformat()} for c in checks if c.source == "kopyon"), None)},
         "binance": {"base": BINANCE_ROOT, "role": "Public USDⓈ-M Futures candles and mark/funding data; not individual leader positions."},
-        "monitor": {**last_scan, "worker_alive": worker_alive, "interval_seconds": DISCOVERY_INTERVAL, "position_batch_per_cycle": POSITION_BATCH, "quota_design": "One 20-trader leaderboard request plus up to five open-position requests per 30-minute cycle; market-data calls are separate."},
+        "monitor": {**last_scan, "worker_alive": worker_alive, "interval_seconds": DISCOVERY_INTERVAL, "position_batch_per_cycle": POSITION_BATCH, "quota_design": "One 20-trader leaderboard request plus up to twenty open-position requests per 30-minute cycle; profile/performance/history refreshes are limited to once per trader per 24 hours; market-data calls are separate."},
         "paper": paper_config(),
         "execution_enabled": False,
         "runtime_note": "On Render Free, the web service can spin down after 15 minutes without inbound traffic. The in-process monitor runs only while the instance is awake."
@@ -615,7 +642,7 @@ async def load_trader_intelligence(trader_id: str):
         profile = unwrap_data(profile_payload)
         performance = unwrap_data(performance_payload)
         history_data = unwrap_data(history_payload)
-        history_rows = history_data.get("positions") or []
+        history_rows = history_data.get("positions") or history_data.get("rows") or history_data.get("items") or []
         with SessionLocal() as db:
             cache = db.get(TraderProfileCache, trader_id)
             if cache is None:
@@ -625,7 +652,7 @@ async def load_trader_intelligence(trader_id: str):
             cache.raw_profile = json.dumps(profile_payload, separators=(",", ":"), default=str)
             cache.raw_performance = json.dumps(performance_payload, separators=(",", ":"), default=str)
             for item in history_rows:
-                pid = str(item.get("positionId") or "")
+                pid = str(item.get("positionId") or item.get("id") or "")
                 exists = db.scalar(select(HistoryPosition.id).where(
                     HistoryPosition.trader_id == trader_id,
                     HistoryPosition.position_id == (pid or None)
@@ -637,8 +664,8 @@ async def load_trader_intelligence(trader_id: str):
                     symbol=str(item.get("symbol") or "UNKNOWN").upper(),
                     side=str(item.get("side") or "UNKNOWN").upper(),
                     status=item.get("status"),
-                    opened_at_ms=int(item["openedAt"]) if item.get("openedAt") else None,
-                    closed_at_ms=int(item["closedAt"]) if item.get("closedAt") else None,
+                    opened_at_ms=timestamp_ms(item.get("openedAt") or item.get("openTime")),
+                    closed_at_ms=timestamp_ms(item.get("closedAt") or item.get("closeTime")),
                     entry_price=safe_float(item.get("entryPrice")),
                     close_price=safe_float(item.get("closePrice")),
                     roi=safe_float(item.get("roi")),
@@ -714,13 +741,21 @@ async def market_features(symbol: str, refresh: bool = False) -> dict:
     with SessionLocal() as db:
         cache = db.get(MarketInsight, symbol)
         if cache and not refresh and (now() - cache.fetched_at).total_seconds() < 1800:
-            return parse_json(cache.raw_json)
+            cached = parse_json(cache.raw_json)
+            cached_closes = cached.get("closes_1h") if isinstance(cached, dict) else None
+            # Re-fetch older cache rows created before list-valued Binance klines were parsed correctly.
+            if isinstance(cached_closes, list) and len(cached_closes) >= 25:
+                return cached
     premium, _ = await binance_get("/fapi/v1/premiumIndex", {"symbol": symbol})
     klines, _ = await binance_get("/fapi/v1/klines", {"symbol": symbol, "interval": "1h", "limit": 168})
     micro, _ = await binance_get("/fapi/v1/klines", {"symbol": symbol, "interval": "5m", "limit": 3})
-    closes = [float(k[4]) for k in klines if len(k) > 4]
-    highs = [float(k[2]) for k in klines if len(k) > 4]
-    lows = [float(k[3]) for k in klines if len(k) > 4]
+    if not isinstance(klines, list):
+        raise RuntimeError("Binance hourly klines response was not a list")
+    if not isinstance(micro, list):
+        raise RuntimeError("Binance 5-minute klines response was not a list")
+    closes = [float(k[4]) for k in klines if isinstance(k, (list, tuple)) and len(k) > 4]
+    highs = [float(k[2]) for k in klines if isinstance(k, (list, tuple)) and len(k) > 4]
+    lows = [float(k[3]) for k in klines if isinstance(k, (list, tuple)) and len(k) > 4]
     last = closes[-1] if closes else safe_float(premium.get("markPrice"))
     seven_return = (closes[-1] / closes[0] - 1) * 100 if len(closes) >= 2 and closes[0] else None
     day_return = (closes[-1] / closes[-25] - 1) * 100 if len(closes) >= 25 and closes[-25] else None
@@ -728,7 +763,7 @@ async def market_features(symbol: str, refresh: bool = False) -> dict:
     for i in range(1, len(closes)):
         tr.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
     atr_pct = (statistics.mean(tr[-24:]) / last * 100) if tr and last else None
-    micro_closes = [float(k[4]) for k in micro if len(k) > 4]
+    micro_closes = [float(k[4]) for k in micro if isinstance(k, (list, tuple)) and len(k) > 4]
     mom5 = ((micro_closes[-1] / micro_closes[-2]) - 1) * 100 if len(micro_closes) >= 2 and micro_closes[-2] else None
     data = {
         "symbol": symbol, "fetched_at": now().isoformat(),
