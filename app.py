@@ -824,6 +824,8 @@ async def market_features(symbol: str, refresh: bool = False) -> dict:
             if isinstance(cached_closes, list) and len(cached_closes) >= 25:
                 return cached
     premium, _ = await binance_get("/fapi/v1/premiumIndex", {"symbol": symbol})
+    ticker24, _ = await binance_get("/fapi/v1/ticker/24hr", {"symbol": symbol})
+    book, _ = await binance_get("/fapi/v1/ticker/bookTicker", {"symbol": symbol})
     klines, _ = await binance_get("/fapi/v1/klines", {"symbol": symbol, "interval": "1h", "limit": 168})
     micro, _ = await binance_get("/fapi/v1/klines", {"symbol": symbol, "interval": "5m", "limit": 3})
     if not isinstance(klines, list):
@@ -848,6 +850,11 @@ async def market_features(symbol: str, refresh: bool = False) -> dict:
         "index_price": safe_float(premium.get("indexPrice")),
         "funding_rate": safe_float(premium.get("lastFundingRate")),
         "next_funding_time": premium.get("nextFundingTime"),
+        "quote_volume_24h_usdt": safe_float(ticker24.get("quoteVolume")) if isinstance(ticker24, dict) else None,
+        "base_volume_24h": safe_float(ticker24.get("volume")) if isinstance(ticker24, dict) else None,
+        "best_bid": safe_float(book.get("bidPrice")) if isinstance(book, dict) else None,
+        "best_ask": safe_float(book.get("askPrice")) if isinstance(book, dict) else None,
+        "spread_pct": (((safe_float(book.get("askPrice")) or 0) - (safe_float(book.get("bidPrice")) or 0)) / max(safe_float(premium.get("markPrice")) or 1, 1e-12) * 100) if isinstance(book, dict) else None,
         "seven_day_return_pct": seven_return, "twenty_four_hour_return_pct": day_return,
         "atr_24h_pct": atr_pct, "rsi_1h": rsi_value(closes),
         "momentum_5m_pct": mom5, "closes_1h": closes[-30:],
