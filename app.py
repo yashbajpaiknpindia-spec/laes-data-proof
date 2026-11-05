@@ -138,6 +138,30 @@ class MarketInsight(Base):
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     raw_json: Mapped[str] = mapped_column(Text, default="{}")
 
+class PaperTradePath(Base):
+    __tablename__ = "paper_trade_paths"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    paper_trade_id: Mapped[int] = mapped_column(ForeignKey("paper_trades.id"), index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    paper_price: Mapped[float] = mapped_column(Float)
+    leader_mark: Mapped[float | None] = mapped_column(Float)
+    leader_unrealized_pnl: Mapped[float | None] = mapped_column(Float)
+    leader_adverse_pct: Mapped[float | None] = mapped_column(Float)
+    gross_pnl: Mapped[float] = mapped_column(Float, default=0)
+    net_pnl: Mapped[float] = mapped_column(Float, default=0)
+    pnl_pct: Mapped[float] = mapped_column(Float, default=0)
+    source: Mapped[str] = mapped_column(String(40), default="BINANCE_REST")
+    data_gap_seconds: Mapped[float] = mapped_column(Float, default=0)
+
+class PaperTradeEvent(Base):
+    __tablename__ = "paper_trade_events"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    paper_trade_id: Mapped[int] = mapped_column(ForeignKey("paper_trades.id"), index=True)
+    event_type: Mapped[str] = mapped_column(String(60), index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    value: Mapped[float | None] = mapped_column(Float)
+    detail: Mapped[str] = mapped_column(Text, default="")
+
 class PaperTrade(Base):
     __tablename__ = "paper_trades"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -238,7 +262,10 @@ def paper_config() -> dict:
         "auto_enabled": True,
         "risk_pct": 0.50,
         "max_margin_pct": 10.0,
-        "max_total_margin_pct": 40.0,
+        "max_total_margin_pct": 100.0,
+        "research_unconstrained": True,
+        "path_sample_seconds": 5.0,
+        "meaningful_profit_steps": [0.10, 0.20, 0.30, 0.50, 0.70, 1.00]
         "target_pct": 0.70,
         "stop_pct": 0.45,
         "taker_fee_pct": 0.05,
@@ -469,11 +496,16 @@ async def monitor_worker() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(monitor_worker())
+    price_task = asyncio.create_task(paper_price_worker())
     app.state.monitor_task = task
+    app.state.paper_price_task = price_task
     yield
     task.cancel()
+    price_task.cancel()
     with suppress(asyncio.CancelledError):
         await task
+    with suppress(asyncio.CancelledError):
+        await price_task
 
 app = FastAPI(title=APP_NAME, version="1.0.0", lifespan=lifespan, docs_url="/api/docs")
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -562,6 +594,7 @@ async def api_overview():
         "binance": {"base": BINANCE_ROOT, "role": "Public USDⓈ-M Futures candles and mark/funding data; not individual leader positions."},
         "monitor": {**last_scan, "worker_alive": worker_alive, "interval_seconds": DISCOVERY_INTERVAL, "position_batch_per_cycle": POSITION_BATCH, "quota_design": "One 20-trader leaderboard request plus up to twenty open-position requests per 30-minute cycle; profile/performance/history refreshes are limited to once per trader per 24 hours; market-data calls are separate."},
         "paper": paper_config(),
+        "paper_fast_price_monitor": True,
         "execution_enabled": False,
         "runtime_note": "On Render Free, the web service can spin down after 15 minutes without inbound traffic. The in-process monitor runs only while the instance is awake."
     }
@@ -942,10 +975,13 @@ def create_paper_trade(obs: PositionObservation, trader_name: str | None, mark: 
         max_margin = capital * float(cfg["max_margin_pct"]) / 100
         max_total_margin = capital * float(cfg["max_total_margin_pct"]) / 100
         remaining_portfolio_margin = max(0.0, max_total_margin - used_margin)
-        margin = min(
-            capital * float(cfg["risk_pct"]) / 100 / max(float(cfg["stop_pct"]) / 100, 0.0001),
-            max_margin, free_capital, remaining_portfolio_margin
-        )
+        base_margin = capital * float(cfg["risk_pct"]) / 100 / max(float(cfg["stop_pct"]) / 100, 0.0001)
+        # Research mode intentionally takes every qualifying opportunity. It does not
+        # silently discard signals because earlier paper trades consumed the wallet.
+        # The margin/notional of each individual simulation remains bounded.
+        margin = min(base_margin, max_margin)
+        if not bool(cfg.get("research_unconstrained", True)):
+            margin = min(margin, free_capital, remaining_portfolio_margin)
         leverage = max(1.0, min(float(cfg["max_leverage"]), float(obs.leverage or 1.0)))
         notional = margin * leverage
         notional = min(notional, capital * 0.25)
@@ -969,39 +1005,137 @@ def create_paper_trade(obs: PositionObservation, trader_name: str | None, mark: 
         ))
         db.commit()
 
-async def evaluate_open_paper_trades() -> None:
-    with SessionLocal() as db:
-        trades = db.scalars(select(PaperTrade).where(PaperTrade.status == "OPEN").limit(200)).all()
-        symbols = sorted({t.symbol for t in trades})
-    prices = {}
+async def _mark_prices(symbols: list[str]) -> dict[str, float]:
+    if not symbols:
+        return {}
+    try:
+        payload, _ = await binance_get("/fapi/v1/premiumIndex")
+        if isinstance(payload, list):
+            wanted = {s.upper() for s in symbols}
+            return {str(x.get("symbol","")).upper(): safe_float(x.get("markPrice")) for x in payload
+                    if isinstance(x, dict) and str(x.get("symbol","")).upper() in wanted and safe_float(x.get("markPrice"))}
+    except Exception:
+        pass
+    out = {}
     for symbol in symbols:
         try:
             premium, _ = await binance_get("/fapi/v1/premiumIndex", {"symbol": symbol})
-            prices[symbol] = safe_float(premium.get("markPrice"))
+            price = safe_float(premium.get("markPrice"))
+            if price: out[symbol] = price
         except Exception as exc:
-            log_check("paper_mark_price", False, None, None, f"{symbol}: {str(exc)[:200]}")
+            log_check("paper_mark_price", False, None, None, f"{symbol}: {str(exc)[:180]}")
+    return out
+
+def _leader_for_trade(db, trade: PaperTrade) -> PositionObservation | None:
+    prefix = trade.source_key
+    if "|" not in prefix:
+        return None
+    trader_id, position_key = prefix.split("|", 1)
+    return db.scalar(select(PositionObservation).where(
+        PositionObservation.trader_id == trader_id,
+        PositionObservation.position_key == position_key
+    ).order_by(desc(PositionObservation.id)).limit(1))
+
+def _paper_pnl(trade: PaperTrade, mark: float, cfg: dict) -> tuple[float,float,float]:
+    directional = 1 if trade.side == "LONG" else -1
+    gross = directional * (mark - trade.entry_price) * trade.quantity
+    fee_cost = trade.notional * (float(cfg["taker_fee_pct"]) / 100) * 2
+    slip_cost = trade.notional * (float(cfg["slippage_pct"]) / 100) * 2
+    costs = fee_cost + slip_cost
+    net = gross - costs
+    pct = (net / max(trade.margin_used, 0.000001)) * 100
+    return gross, costs, net, pct
+
+async def evaluate_open_paper_trades(prices: dict[str,float] | None = None, source: str = "BINANCE_REST") -> None:
+    with SessionLocal() as db:
+        open_trades = db.scalars(select(PaperTrade).where(PaperTrade.status == "OPEN").limit(500)).all()
+        symbols = sorted({t.symbol for t in open_trades})
+    prices = prices or await _mark_prices(symbols)
     cfg = paper_config()
+    ts = now()
     with SessionLocal() as db:
         trades = db.scalars(select(PaperTrade).where(PaperTrade.status == "OPEN")).all()
         for trade in trades:
             mark = prices.get(trade.symbol)
             if mark is None or mark <= 0:
                 continue
-            trade.mark_price = mark
-            directional = 1 if trade.side == "LONG" else -1
-            trade.gross_pnl = directional * (mark - trade.entry_price) * trade.quantity
-            fee_cost = trade.notional * (float(cfg["taker_fee_pct"]) / 100) * 2
-            slip_cost = trade.notional * (float(cfg["slippage_pct"]) / 100) * 2
-            trade.estimated_costs = fee_cost + slip_cost
-            trade.net_pnl = trade.gross_pnl - trade.estimated_costs
+            prev_check = None
+            raw = parse_json(trade.raw_json)
+            if raw.get("last_binance_price_at"):
+                try: prev_check = datetime.fromisoformat(raw["last_binance_price_at"].replace("Z","+00:00"))
+                except Exception: prev_check = None
+            gap = max(0.0, (ts-prev_check).total_seconds()) if prev_check else 0.0
+            gross, costs, net, pnl_pct = _paper_pnl(trade, mark, cfg)
+            raw["last_binance_price_at"] = ts.isoformat()
+            raw["last_paper_check_at"] = ts.isoformat()
+            raw["last_price_source"] = source
+            raw["data_gap_seconds"] = gap
+            trade.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
+            trade.mark_price, trade.gross_pnl, trade.estimated_costs, trade.net_pnl = mark, gross, costs, net
+
+            path_row = PaperTradePath(
+                paper_trade_id=trade.id, observed_at=ts, paper_price=mark,
+                gross_pnl=gross, net_pnl=net, pnl_pct=pnl_pct,
+                source=source, data_gap_seconds=gap
+            )
+            leader = _leader_for_trade(db, trade)
+            if leader:
+                lentry, lmark = leader.entry_price, leader.mark_price
+                if lmark:
+                    ladverse = ((lentry-lmark)/lentry*100) if trade.side=="LONG" else ((lmark-lentry)/lentry*100) if lentry else None
+                    path_row.leader_mark = lmark
+                    path_row.leader_unrealized_pnl = leader.unrealized_pnl
+                    path_row.leader_adverse_pct = ladverse
+                    raw["last_leader_check_at"] = ts.isoformat()
+                    raw["leader_position_key"] = leader.position_key
+                    raw["leader_mark"] = lmark
+                    raw["leader_status"] = "OBSERVED"
+                else:
+                    raw["leader_status"] = "OBSERVED_NO_MARK"
+            else:
+                raw["leader_status"] = "STALE_OR_NOT_OBSERVED"
+            # Persist a compact 5-second path, while the live row itself is updated every second.
+            last_path = db.scalar(select(PaperTradePath).where(PaperTradePath.paper_trade_id==trade.id).order_by(desc(PaperTradePath.id)).limit(1))
+            should_sample = last_path is None or (ts-last_path.observed_at).total_seconds() >= float(cfg.get("path_sample_seconds",5))
+            if should_sample:
+                db.add(path_row)
+            raw.setdefault("mfe_net_pnl", net)
+            raw.setdefault("mae_net_pnl", net)
+            raw["mfe_net_pnl"] = max(float(raw["mfe_net_pnl"]), net)
+            raw["mae_net_pnl"] = min(float(raw["mae_net_pnl"]), net)
+            raw["mfe_pct"] = max(float(raw.get("mfe_pct",pnl_pct)), pnl_pct)
+            raw["mae_pct"] = min(float(raw.get("mae_pct",pnl_pct)), pnl_pct)
+            raw["meaningful_profit_hits"] = raw.get("meaningful_profit_hits", {})
+            for step in cfg.get("meaningful_profit_steps", [0.1,0.2,0.3,0.5,0.7,1.0]):
+                key = str(step)
+                if pnl_pct >= float(step) and key not in raw["meaningful_profit_hits"]:
+                    raw["meaningful_profit_hits"][key] = ts.isoformat()
+                    db.add(PaperTradeEvent(paper_trade_id=trade.id,event_type=f"PROFIT_{key}PCT",observed_at=ts,value=net,detail=f"First observed net-margin profit >= {step}%"))
+            raw["mfe_net_pnl"], raw["mae_net_pnl"] = max(float(raw["mfe_net_pnl"]), net), min(float(raw["mae_net_pnl"]), net)
+            trade.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
             hit_stop = mark <= trade.stop_price if trade.side == "LONG" else mark >= trade.stop_price
             hit_target = mark >= trade.target_price if trade.side == "LONG" else mark <= trade.target_price
             if hit_stop or hit_target:
-                trade.status = "CLOSED"
-                trade.exit_price = mark
-                trade.exit_reason = "STOP_LOSS" if hit_stop else "TARGET"
-                trade.closed_at = now()
+                trade.status = "CLOSED"; trade.exit_price = mark
+                trade.exit_reason = "STOP_LOSS" if hit_stop else "PREFERRED_TARGET"
+                trade.closed_at = ts
+                db.add(PaperTradeEvent(paper_trade_id=trade.id,event_type="EXIT",observed_at=ts,value=net,detail=trade.exit_reason))
         db.commit()
+
+async def paper_price_worker() -> None:
+    while True:
+        try:
+            with SessionLocal() as db:
+                symbols = sorted({t.symbol for t in db.scalars(select(PaperTrade).where(PaperTrade.status=="OPEN")).all()})
+            if symbols:
+                prices = await _mark_prices(symbols)
+                await evaluate_open_paper_trades(prices, "BINANCE_REST_1S")
+            await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log_check("paper_price_worker", False, None, None, str(exc)[:300])
+            await asyncio.sleep(2.0)
 
 @app.get("/api/opportunities")
 async def api_opportunities(limit: int = 100):
@@ -1026,7 +1160,6 @@ async def api_opportunities(limit: int = 100):
 
 @app.get("/api/paper")
 async def api_paper():
-    await evaluate_open_paper_trades()
     cfg = paper_config()
     with SessionLocal() as db:
         trades = db.scalars(select(PaperTrade).order_by(desc(PaperTrade.opened_at)).limit(300)).all()
@@ -1055,11 +1188,68 @@ async def api_paper():
         } for t in trades]
     }
 
+
+
+@app.get("/api/paper/{trade_id}")
+async def api_paper_trade_detail(trade_id: int):
+    with SessionLocal() as db:
+        trade = db.get(PaperTrade, trade_id)
+        if not trade:
+            raise HTTPException(404, "Paper trade not found")
+        raw = parse_json(trade.raw_json)
+        trader = db.get(Trader, trade.trader_id)
+        leader_obs = _leader_for_trade(db, trade)
+        path = db.scalars(select(PaperTradePath).where(PaperTradePath.paper_trade_id==trade.id).order_by(PaperTradePath.observed_at)).all()
+        events = db.scalars(select(PaperTradeEvent).where(PaperTradeEvent.paper_trade_id==trade.id).order_by(PaperTradeEvent.observed_at)).all()
+    leader = None
+    recovery = None
+    if leader_obs:
+        lentry = leader_obs.entry_price
+        lmark = leader_obs.mark_price
+        our = trade.entry_price
+        if lentry and our:
+            recovery_profit_pct = ((lentry-our)/our*100) if trade.side=="LONG" else ((our-lentry)/our*100)
+            recovery_profit_usdt = ((lentry-our)*trade.quantity) if trade.side=="LONG" else ((our-lentry)*trade.quantity)
+        else:
+            recovery_profit_pct = recovery_profit_usdt = None
+        leader = {
+            "symbol": leader_obs.symbol, "side": leader_obs.side, "entry_price": lentry, "mark_price": lmark,
+            "unrealized_pnl": leader_obs.unrealized_pnl, "adverse_pct": ((lentry-lmark)/lentry*100 if trade.side=="LONG" and lentry and lmark else (lmark-lentry)/lentry*100 if trade.side=="SHORT" and lentry and lmark else None),
+            "leverage": leader_obs.leverage, "margin_mode": leader_obs.margin_mode,
+            "observed_at": leader_obs.raw_json and leader_obs.snapshot_id,
+            "recovery_price": lentry, "our_recovery_profit_pct": recovery_profit_pct,
+            "our_recovery_profit_usdt": recovery_profit_usdt, "status": "LIVE_OBSERVED"
+        }
+        recovery = recovery_statistics(trade.trader_id, trade.source_key.split("|",1)[1] if "|" in trade.source_key else "", trade.symbol, trade.side, lentry)
+    # Potential ladder is derived from the leader's entry/recovery anchor, not a promise.
+    ladder = []
+    if leader and leader.get("recovery_price") and trade.entry_price:
+        anchor = leader["recovery_price"]
+        for extra in (0.0,0.3,0.5,0.7,1.0):
+            p = anchor*(1+extra/100) if trade.side=="LONG" else anchor*(1-extra/100)
+            pnl = ((p-trade.entry_price)*trade.quantity) if trade.side=="LONG" else ((trade.entry_price-p)*trade.quantity)
+            ladder.append({"leader_gain_from_entry_pct":extra,"price":p,"gross_pnl_usdt":pnl})
+    return {
+        "trade": {"id":trade.id,"status":trade.status,"symbol":trade.symbol,"side":trade.side,"entry_price":trade.entry_price,
+                  "mark_price":trade.mark_price,"net_pnl":trade.net_pnl,"margin_used":trade.margin_used,"leverage":trade.leverage,
+                  "opened_at":trade.opened_at.isoformat(),"closed_at":trade.closed_at.isoformat() if trade.closed_at else None,
+                  "mfe_net_pnl":raw.get("mfe_net_pnl",trade.net_pnl),"mae_net_pnl":raw.get("mae_net_pnl",trade.net_pnl),
+                  "mfe_pct":raw.get("mfe_pct",0),"mae_pct":raw.get("mae_pct",0),"last_binance_price_at":raw.get("last_binance_price_at"),
+                  "last_leader_check_at":raw.get("last_leader_check_at"),"data_gap_seconds":raw.get("data_gap_seconds",0),
+                  "meaningful_profit_hits":raw.get("meaningful_profit_hits",{})},
+        "trader": {"id":trade.trader_id,"name":trader.name if trader else trade.trader_name},
+        "leader": leader, "recovery": recovery, "potential_ladder": ladder,
+        "path": [{"at":p.observed_at.isoformat(),"paper_price":p.paper_price,"leader_mark":p.leader_mark,"leader_pnl":p.leader_unrealized_pnl,
+                  "leader_adverse_pct":p.leader_adverse_pct,"net_pnl":p.net_pnl,"pnl_pct":p.pnl_pct,"source":p.source,"gap":p.data_gap_seconds} for p in path],
+        "events": [{"at":e.observed_at.isoformat(),"type":e.event_type,"value":e.value,"detail":e.detail} for e in events],
+        "data_quality": {"status":"CONTINUOUS" if not any(p.gap>15 for p in path) else "INTERRUPTED","note":"A final loss after a monitor/data gap is not classified as a clean strategy failure."}
+    }
+
 @app.post("/api/paper/settings")
 async def update_paper_settings(request: Request):
     body = await request.json()
     cfg = paper_config()
-    for key in ["capital_usdt", "risk_pct", "max_margin_pct", "max_total_margin_pct", "target_pct", "stop_pct", "taker_fee_pct", "slippage_pct", "max_leverage", "min_adverse_pct"]:
+    for key in ["capital_usdt", "risk_pct", "max_margin_pct", "max_total_margin_pct", "research_unconstrained", "target_pct", "stop_pct", "taker_fee_pct", "slippage_pct", "max_leverage", "min_adverse_pct"]:
         if key in body:
             val = safe_float(body[key])
             if val is None or val < 0:
@@ -1088,7 +1278,7 @@ async def api_system():
         for table_name, model in [
             ("traders", Trader), ("position_snapshots", PositionSnapshot),
             ("position_observations", PositionObservation), ("history_positions", HistoryPosition),
-            ("paper_trades", PaperTrade), ("source_checks", SourceCheck)
+            ("paper_trades", PaperTrade), ("paper_trade_paths", PaperTradePath), ("paper_trade_events", PaperTradeEvent), ("source_checks", SourceCheck)
         ]:
             try:
                 counts[table_name] = db.scalar(select(func.count()).select_from(model)) or 0
