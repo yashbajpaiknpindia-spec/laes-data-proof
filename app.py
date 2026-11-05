@@ -1012,7 +1012,10 @@ def create_paper_trade(obs: PositionObservation, trader_name: str | None, mark: 
             previous_raw = parse_json(prior[0].raw_json)
             if previous_raw.get("leader_snapshot_id") == obs.snapshot_id:
                 return
-            if prior[0].closed_at and (now() - prior[0].closed_at).total_seconds() < 180:
+            previous_close = prior[0].closed_at
+            if previous_close and previous_close.tzinfo is None:
+                previous_close = previous_close.replace(tzinfo=timezone.utc)
+            if previous_close and (now() - previous_close).total_seconds() < 180:
                 return
         opened_trades = db.scalars(select(PaperTrade).where(PaperTrade.status == "OPEN")).all()
         used_margin = sum(t.margin_used for t in opened_trades)
