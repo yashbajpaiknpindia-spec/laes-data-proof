@@ -89,9 +89,40 @@ async function loadPaper(){
  try{const d=await api("/api/paper");$("paperCapital").textContent=money(d.capital);$("paperMargin").textContent=money(d.deployed_margin)+" / "+money(d.margin_cap);$("paperMarginFoot").textContent=d.margin_cap_exceeded?"PORTFOLIO MARGIN CAP EXCEEDED · new entries paused":fmt(d.margin_utilization_pct,1)+"% of capital deployed · cap "+fmt(d.config?.max_total_margin_pct,0)+"%";$("paperRealized").textContent=money(d.realized_pnl);$("paperUnrealized").textContent=money(d.unrealized_pnl);$("paperFree").textContent=money(d.free_capital);$("paperEquity").textContent=money(d.equity);
  const f=$("paperSettings");Object.entries(d.config||{}).forEach(([k,v])=>{const el=f.elements[k];if(el){if(el.type==="checkbox")el.checked=!!v;else el.value=v;}});
  if(!d.trades.length){$("paperTrades").innerHTML='<tr><td colspan="10" class="empty-cell">No real opportunity has qualified. No demo trades are generated.</td></tr>';return;}
- $("paperTrades").innerHTML=d.trades.map(t=>'<tr><td><span class="status-tag '+(t.status==="OPEN"?"qualified":"neutral")+'">'+esc(t.status)+'</span></td><td>'+esc(t.trader_name||t.trader_id)+'</td><td><b>'+esc(t.symbol)+'</b></td><td class="'+(t.side==="LONG"?"side-long":"side-short")+'">'+esc(t.side)+'</td><td>'+fmt(t.entry_price,5)+' / '+fmt(t.mark_price,5)+'</td><td>'+money(t.notional)+'</td><td>'+money(t.margin_used)+' · '+fmt(t.leverage,1)+'×</td><td class="'+(t.net_pnl>=0?"positive":"negative")+'">'+money(t.net_pnl)+'</td><td>'+fmt(t.stop_price,5)+' / '+fmt(t.target_price,5)+'</td><td>'+date(t.opened_at)+'</td></tr>').join("");
+ $("paperTrades").innerHTML=d.trades.map(t=>'<tr class="clickable-row" onclick="openPaperTrade('+t.id+')"><td><span class="status-tag '+(t.status==="OPEN"?"qualified":"neutral")+'">'+esc(t.status)+'</span></td><td>'+esc(t.trader_name||t.trader_id)+'</td><td><b>'+esc(t.symbol)+'</b></td><td class="'+(t.side==="LONG"?"side-long":"side-short")+'">'+esc(t.side)+'</td><td>'+fmt(t.entry_price,5)+' / '+fmt(t.mark_price,5)+'</td><td>'+money(t.notional)+'</td><td>'+money(t.margin_used)+' · '+fmt(t.leverage,1)+'×</td><td class="'+(t.net_pnl>=0?"positive":"negative")+'">'+money(t.net_pnl)+'<br><small>MFE '+money(t.mfe_net_pnl)+' · MAE '+money(t.mae_net_pnl)+'</small></td><td>'+fmt(t.stop_price,5)+' / '+fmt(t.target_price,5)+'</td><td>'+date(t.opened_at)+'</td></tr>').join("");
  }catch(e){notice("Paper ledger: "+e.message,"error");}
 }
+function paperLine(points,w,h,min,max){if(!points||points.length<2)return'';const span=max-min||1;return points.map((v,i)=>((i/(points.length-1))*100)+','+(95-(v-min)/span*85)).join(' ');}
+async function openPaperTrade(id){
+ const modal=$("traderDialog");$("dialogName").textContent="Paper trade #"+id;$("dialogSub").textContent="Leader-linked recovery forensic view";$("dialogBody").innerHTML='<div class="empty-state">Loading persisted 1-second price-monitor state and leader path…</div>';modal.showModal();
+ try{
+  const d=await api('/api/paper/'+id),t=d.trade||{},l=d.leader||{},r=d.recovery||{},path=d.path||[],lad=d.potential_ladder||[];
+  const vals=path.flatMap(p=>[p.paper_price,p.leader_mark]).filter(Number.isFinite),mn=vals.length?Math.min(...vals):0,mx=vals.length?Math.max(...vals):1;
+  const paperPts=paperLine(path.map(p=>p.paper_price),100,100,mn,mx),leaderPts=paperLine(path.map(p=>p.leader_mark).filter(Number.isFinite),100,100,mn,mx);
+  const latestGap=Number(t.data_gap_seconds||0);
+  let html='<div class="profile-grid">'+[
+   ['Our entry',fmt(t.entry_price,8)],['Current price',fmt(t.mark_price,8)],['Current net PnL',money(t.net_pnl)],
+   ['MFE',money(t.mfe_net_pnl)+' · '+pct(t.mfe_pct)],['MAE',money(t.mae_net_pnl)+' · '+pct(t.mae_pct)],
+   ['Last Binance check',date(t.last_binance_price_at)],['Last leader check',date(t.last_leader_check_at)],
+   ['Data quality',latestGap>15?'INTERRUPTED':'LIVE / CONTINUOUS']
+  ].map(x=>'<div class="profile-metric"><small>'+esc(x[0])+'</small><b>'+esc(x[1])+'</b></div>').join('')+'</div>';
+  html+='<div class="analysis-box"><h4>LEADER POSITION YOU ARE ANCHORED TO</h4>'+
+   '<div class="analysis-line"><span>Leader entry / recovery price</span><b>'+fmt(l.entry_price,8)+'</b></div>'+
+   '<div class="analysis-line"><span>Leader current mark</span><b>'+fmt(l.mark_price,8)+'</b></div>'+
+   '<div class="analysis-line"><span>Leader current loss</span><b>'+money(l.unrealized_pnl)+'</b></div>'+
+   '<div class="analysis-line"><span>Leader adverse from entry</span><b>'+pct(l.adverse_pct)+'</b></div>'+
+   '<div class="analysis-line"><span>Our gross profit if leader reaches entry</span><b>'+money(l.our_recovery_profit_usdt)+' · '+pct(l.our_recovery_profit_pct)+'</b></div>'+
+   '<div class="analysis-line"><span>Historic comparable recovery</span><b>'+fmt(r.probability,1)+'% · '+fmt(r.sample_size,0)+' samples</b></div>'+
+   '</div>';
+  html+='<div class="analysis-box"><h4>PRICE PATH · OUR ENTRY VS LEADER</h4><div class="sparkline"><svg viewBox="0 0 100 100" preserveAspectRatio="none">'+(paperPts?'<polyline points="'+paperPts+'" fill="none" stroke="#a995f3" stroke-width="2" vector-effect="non-scaling-stroke"/>':'')+(leaderPts?'<polyline points="'+leaderPts+'" fill="none" stroke="#61d7b0" stroke-width="1.5" vector-effect="non-scaling-stroke"/>':'')+'</svg></div><div class="muted-note">Purple = our paper price · green = leader mark · stored every ~5s, live row refreshed every 1s.</div></div>';
+  html+='<div class="analysis-box"><h4>RECOVERY PROFIT LADDER</h4><div class="profile-history"><table><thead><tr><th>LEADER MOVE</th><th>LEADER PRICE</th><th>OUR GROSS PNL</th></tr></thead><tbody>'+ (lad.length?lad.map(x=>'<tr><td>+'+fmt(x.leader_gain_from_entry_pct,2)+'%</td><td>'+fmt(x.price,8)+'</td><td class="'+(x.gross_pnl_usdt>=0?'positive':'negative')+'">'+money(x.gross_pnl_usdt)+'</td></tr>').join(''):'<tr><td colspan="3">No recovery ladder available.</td></tr>')+'</tbody></table></div></div>';
+  const events=(d.events||[]).map(e=>'<div class="analysis-line"><span>'+date(e.at)+' · '+esc(e.type)+'</span><b>'+money(e.value)+' · '+esc(e.detail)+'</b></div>').join('');
+  html+='<div class="analysis-box"><h4>MEANINGFUL PROFIT EVENTS</h4>'+ (events||'<div class="muted-note">No threshold event recorded yet.</div>')+'</div>';
+  html+='<div class="sample-warning">'+esc(r.note||'Recovery statistics are empirical and not a guarantee. A post-shutdown loss is not classified as a clean strategy failure when the persisted path contains a monitoring/data gap.')+'</div>';
+  $("dialogBody").innerHTML=html;
+ }catch(e){$("dialogBody").innerHTML='<div class="notice error">'+esc(e.message)+'</div>';}
+}
+window.openPaperTrade=openPaperTrade;
 $("reloadPaper").onclick=loadPaper;
 $("paperSettings").addEventListener("submit",async e=>{e.preventDefault();const f=new FormData(e.currentTarget),body={};for(const [k,v] of f.entries())body[k]=Number(v);body.auto_enabled=e.currentTarget.elements.auto_enabled.checked;try{await api("/api/paper/settings",{method:"POST",body:JSON.stringify(body)});$("paperSaveStatus").textContent="Saved · paper settings active";await loadPaper();}catch(err){$("paperSaveStatus").textContent=err.message;}});
 function spark(values){if(!values||values.length<2)return'<div class="empty-state">Candle series unavailable</div>';const min=Math.min(...values),max=Math.max(...values),span=max-min||1;const pts=values.map((v,i)=>(i/(values.length-1)*100)+","+(95-(v-min)/span*85)).join(" ");return'<svg viewBox="0 0 100 100" preserveAspectRatio="none"><polyline points="'+pts+'" fill="none" stroke="#a995f3" stroke-width="1.8" vector-effect="non-scaling-stroke"/><line x1="0" y1="95" x2="100" y2="95" stroke="#354454" stroke-width=".6"/></svg>';}
