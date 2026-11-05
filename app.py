@@ -981,6 +981,14 @@ async def build_opportunity(obs: PositionObservation, snapshot_time: str | None,
     market_quality_ok = not dead_market_reasons
     qualified = bool(underwater and adverse is not None and adverse >= min_adverse and confirmation and market_quality_ok)
     status = "QUALIFIED" if qualified else ("DEAD / COSTLY MARKET" if underwater and not market_quality_ok else ("UNDERWATER WATCH" if underwater else "NOT UNDERWATER"))
+    with SessionLocal() as db:
+        latest_leader_snapshot = db.scalar(select(PositionSnapshot).where(
+            PositionSnapshot.trader_id == obs.trader_id
+        ).order_by(desc(PositionSnapshot.id)).limit(1))
+    leader_snapshot_current = bool(latest_leader_snapshot and not latest_leader_snapshot.hidden and latest_leader_snapshot.id == obs.snapshot_id)
+    if not leader_snapshot_current:
+        qualified = False
+        status = "LEADER POSITIONS HIDDEN" if latest_leader_snapshot and latest_leader_snapshot.hidden else "POSITION NOT IN LATEST LEADER SNAPSHOT"
     causes = []
     week = safe_float(market.get("seven_day_return_pct"))
     day = safe_float(market.get("twenty_four_hour_return_pct"))
@@ -1008,6 +1016,7 @@ async def build_opportunity(obs: PositionObservation, snapshot_time: str | None,
         "observed_at": snapshot_time, "underwater": underwater, "qualified": qualified,
         "status": status, "momentum_5m_pct": momentum, "market": market,
         "market_quality_ok": market_quality_ok, "dead_market_reasons": dead_market_reasons,
+        "leader_snapshot_current": leader_snapshot_current,
         "recovery": recovery, "holding": hold, "likely_causes": causes,
         "news_context_count": len(matched_news),
         "recovery_warning": "Market trend/news are contextual risk factors, not a deterministic cause or guarantee of recovery."
