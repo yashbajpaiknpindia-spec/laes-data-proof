@@ -827,6 +827,7 @@ async def market_features(symbol: str, refresh: bool = False) -> dict:
     premium, _ = await binance_get("/fapi/v1/premiumIndex", {"symbol": symbol})
     ticker24, _ = await binance_get("/fapi/v1/ticker/24hr", {"symbol": symbol})
     book, _ = await binance_get("/fapi/v1/ticker/bookTicker", {"symbol": symbol})
+    depth, _ = await binance_get("/fapi/v1/depth", {"symbol": symbol, "limit": 20})
     klines, _ = await binance_get("/fapi/v1/klines", {"symbol": symbol, "interval": "1h", "limit": 168})
     micro, _ = await binance_get("/fapi/v1/klines", {"symbol": symbol, "interval": "5m", "limit": 3})
     if not isinstance(klines, list):
@@ -845,6 +846,10 @@ async def market_features(symbol: str, refresh: bool = False) -> dict:
     atr_pct = (statistics.mean(tr[-24:]) / last * 100) if tr and last else None
     micro_closes = [float(k[4]) for k in micro if isinstance(k, (list, tuple)) and len(k) > 4]
     mom5 = ((micro_closes[-1] / micro_closes[-2]) - 1) * 100 if len(micro_closes) >= 2 and micro_closes[-2] else None
+    depth_mark = safe_float(premium.get("markPrice")) or last or 0.0
+    bid_depth_1pct = sum((safe_float(level[0]) or 0) * (safe_float(level[1]) or 0) for level in (depth.get("bids") or []) if len(level) >= 2 and safe_float(level[0]) is not None and safe_float(level[0]) >= depth_mark * 0.99) if isinstance(depth, dict) else None
+    ask_depth_1pct = sum((safe_float(level[0]) or 0) * (safe_float(level[1]) or 0) for level in (depth.get("asks") or []) if len(level) >= 2 and safe_float(level[0]) is not None and safe_float(level[0]) <= depth_mark * 1.01) if isinstance(depth, dict) else None
+    min_depth_1pct = min(bid_depth_1pct or 0, ask_depth_1pct or 0) if bid_depth_1pct is not None and ask_depth_1pct is not None else None
     data = {
         "symbol": symbol, "fetched_at": now().isoformat(),
         "mark_price": safe_float(premium.get("markPrice")),
@@ -856,6 +861,9 @@ async def market_features(symbol: str, refresh: bool = False) -> dict:
         "best_bid": safe_float(book.get("bidPrice")) if isinstance(book, dict) else None,
         "best_ask": safe_float(book.get("askPrice")) if isinstance(book, dict) else None,
         "spread_pct": (((safe_float(book.get("askPrice")) or 0) - (safe_float(book.get("bidPrice")) or 0)) / max(safe_float(premium.get("markPrice")) or 1, 1e-12) * 100) if isinstance(book, dict) else None,
+        "bid_depth_within_1pct_usdt": bid_depth_1pct,
+        "ask_depth_within_1pct_usdt": ask_depth_1pct,
+        "min_depth_within_1pct_usdt": min_depth_1pct,
         "seven_day_return_pct": seven_return, "twenty_four_hour_return_pct": day_return,
         "atr_24h_pct": atr_pct, "rsi_1h": rsi_value(closes),
         "momentum_5m_pct": mom5, "closes_1h": closes[-30:],
