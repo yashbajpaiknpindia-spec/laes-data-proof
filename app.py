@@ -12,6 +12,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import httpx
+import websockets
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -1208,18 +1209,47 @@ async def evaluate_open_paper_trades(prices: dict[str,float] | None = None, sour
         db.commit()
 
 async def paper_price_worker() -> None:
+    # Binance public USD-M mark-price stream publishes markPriceUpdate once per second.
+    # Reconnect periodically so newly opened paper symbols are subscribed automatically.
     while True:
         try:
             with SessionLocal() as db:
-                symbols = sorted({t.symbol for t in db.scalars(select(PaperTrade).where(PaperTrade.status=="OPEN")).all()})
-            if symbols:
-                prices = await _mark_prices(symbols)
-                await evaluate_open_paper_trades(prices, "BINANCE_REST_1S")
-            await asyncio.sleep(1.0)
+                symbols = sorted({t.symbol for t in db.scalars(
+                    select(PaperTrade).where(PaperTrade.status == "OPEN")
+                ).all()})
+            if not symbols:
+                await asyncio.sleep(1.0)
+                continue
+            streams = "/".join(f"{symbol.lower()}@markPrice@1s" for symbol in symbols)
+            url = f"wss://fstream.binance.com/stream?streams={streams}"
+            async with websockets.connect(url, ping_interval=20, ping_timeout=20, close_timeout=5, max_size=1048576) as ws:
+                connected_at = time.monotonic()
+                while time.monotonic() - connected_at < 300:
+                    try:
+                        message = await asyncio.wait_for(ws.recv(), timeout=30)
+                    except asyncio.TimeoutError:
+                        break
+                    packet = json.loads(message)
+                    data = packet.get("data", packet) if isinstance(packet, dict) else {}
+                    symbol = str(data.get("s") or "").upper()
+                    price = safe_float(data.get("p"))
+                    if symbol and price and price > 0:
+                        await evaluate_open_paper_trades({symbol: price}, "BINANCE_WS_MARK_PRICE_1S")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log_check("paper_price_worker", False, None, None, str(exc)[:300])
+            log_check("paper_price_worker", False, None, None, f"WebSocket: {str(exc)[:250]}")
+            # Public REST fallback keeps the paper desk updating during WS reconnects.
+            try:
+                with SessionLocal() as db:
+                    symbols = sorted({t.symbol for t in db.scalars(
+                        select(PaperTrade).where(PaperTrade.status == "OPEN")
+                    ).all()})
+                prices = await _mark_prices(symbols)
+                if prices:
+                    await evaluate_open_paper_trades(prices, "BINANCE_REST_FALLBACK")
+            except Exception as fallback_exc:
+                log_check("paper_price_worker_fallback", False, None, None, str(fallback_exc)[:250])
             await asyncio.sleep(2.0)
 
 @app.get("/api/opportunities")
