@@ -1198,6 +1198,24 @@ async def api_paper():
     cfg = paper_config()
     with SessionLocal() as db:
         trades = db.scalars(select(PaperTrade).order_by(desc(PaperTrade.opened_at)).limit(300)).all()
+        # Legacy stop-outs that occurred on the first tick after a long feed outage
+        # are unresolved, not verified strategy losses. Reopen them for fresh tracking.
+        repaired = False
+        for t in trades:
+            raw = parse_json(t.raw_json)
+            gap = safe_float(raw.get("data_gap_seconds")) or 0.0
+            if t.status == "CLOSED" and (t.net_pnl or 0) < 0 and t.exit_reason == "STOP_LOSS" and gap > 15:
+                t.status = "OPEN"
+                t.exit_price = None
+                t.closed_at = None
+                t.exit_reason = None
+                raw["data_quality_status"] = "DATA_INTERRUPTED_REVIEW"
+                raw["post_gap_confirmations"] = 0
+                t.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
+                db.add(PaperTradeEvent(paper_trade_id=t.id,event_type="REOPENED_AFTER_DATA_GAP",observed_at=now(),value=t.net_pnl,detail=f"Legacy stop-out followed a {gap:.1f}s price-feed gap; outcome is uncertain"))
+                repaired = True
+        if repaired:
+            db.commit()
     open_trades = [t for t in trades if t.status == "OPEN"]
     closed_trades = [t for t in trades if t.status == "CLOSED"]
     realized = sum(t.net_pnl for t in closed_trades)
