@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: laes-data-proof
+    name: laes-data-proof-python
     runtime: python
     plan: free
     region: singapore
@@ -9,21 +9,21 @@ services:
     healthCheckPath: /healthz
     autoDeploy: true
     envVars:
-      - key: DATABASE_URL
-        fromDatabase:
-          name: laes-postgres
-          property: connectionString
       - key: KOPYON_API_KEY
         sync: false
-      - key: ADMIN_TOKEN
-        generateValue: true
+      - key: KOPYON_BASE_URL
+        value: https://api.kopyon.com/v5
+      - key: BINANCE_BASE_URL
+        value: https://fapi.binance.com
+      - key: DATABASE_URL
+        sync: false
       - key: PYTHON_VERSION
         value: 3.12.8
-
-databases:
-  - name: laes-postgres
-    databaseName: laes
-    user: laes_user
-    plan: free
-    region: singapore
-    postgresMajorVersion: 18
+      - key: APP_ENV
+        value: production
+      - key: LAES_MODE
+        value: paper
+      - key: LAES_DISCOVERY_INTERVAL_SECONDS
+        value: "1800"
+      - key: LAES_POSITION_BATCH
+        value: "5"

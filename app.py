@@ -1,32 +1,51 @@
 from __future__ import annotations
-import os, json, hmac, hashlib
-from datetime import datetime, timezone
+
+import asyncio
+import json
+import math
+import os
+import statistics
+import time
+import xml.etree.ElementTree as ET
+from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timezone, timedelta
 from typing import Any
-from urllib.parse import urlencode
 
 import httpx
-from fastapi import FastAPI, Request, HTTPException, Header
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import create_engine, String, DateTime, Boolean, Integer, Float, Text, ForeignKey, UniqueConstraint, select, desc, func
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker, relationship
+from sqlalchemy import (
+    create_engine, String, DateTime, Boolean, Integer, Float, Text,
+    ForeignKey, UniqueConstraint, select, desc, func, text
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-APP_NAME = "LAES Data Proof"
-KOPYON_BASE = "https://api.kopyon.com/v5/binance-copy-trading"
-BINANCE_BASE = "https://fapi.binance.com"
-KOPYON_API_KEY = os.getenv("KOPYON_API_KEY", "").strip()
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./laes_local.db")
+APP_NAME = "LAES · Leader-Anchored Adverse Excursion Scalping"
+KOPYON_KEY = os.getenv("KOPYON_API_KEY", "").strip()
+KOPYON_ROOT = os.getenv("KOPYON_BASE_URL", "https://api.kopyon.com/v5").rstrip("/")
+if not KOPYON_ROOT.endswith("/binance-copy-trading"):
+    KOPYON_ROOT += "/binance-copy-trading"
+BINANCE_ROOT = os.getenv("BINANCE_BASE_URL", "https://fapi.binance.com").rstrip("/")
+DISCOVERY_INTERVAL = max(900, int(os.getenv("LAES_DISCOVERY_INTERVAL_SECONDS", "1800")))
+POSITION_BATCH = max(1, min(5, int(os.getenv("LAES_POSITION_BATCH", "5"))))
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./laes_local.db").strip()
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
 elif DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
-
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+SQLITE = DATABASE_URL.startswith("sqlite")
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    future=True,
+    connect_args={"check_same_thread": False} if SQLITE else {}
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
-class Base(DeclarativeBase): pass
+class Base(DeclarativeBase):
+    pass
 
 class Trader(Base):
     __tablename__ = "traders"
@@ -84,199 +103,978 @@ class SourceCheck(Base):
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     detail: Mapped[str] = mapped_column(Text, default="")
 
+class AppSetting(Base):
+    __tablename__ = "app_settings"
+    key: Mapped[str] = mapped_column(String(120), primary_key=True)
+    value: Mapped[str] = mapped_column(Text)
+
+class TraderProfileCache(Base):
+    __tablename__ = "trader_profile_cache"
+    trader_id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    raw_profile: Mapped[str] = mapped_column(Text, default="{}")
+    raw_performance: Mapped[str] = mapped_column(Text, default="{}")
+
+class HistoryPosition(Base):
+    __tablename__ = "history_positions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trader_id: Mapped[str] = mapped_column(String(160), index=True)
+    position_id: Mapped[str | None] = mapped_column(String(180), index=True)
+    symbol: Mapped[str] = mapped_column(String(80), index=True)
+    side: Mapped[str] = mapped_column(String(12))
+    status: Mapped[str | None] = mapped_column(String(40))
+    opened_at_ms: Mapped[int | None] = mapped_column(Integer)
+    closed_at_ms: Mapped[int | None] = mapped_column(Integer)
+    entry_price: Mapped[float | None] = mapped_column(Float)
+    close_price: Mapped[float | None] = mapped_column(Float)
+    roi: Mapped[float | None] = mapped_column(Float)
+    gross_pnl: Mapped[float | None] = mapped_column(Float)
+    net_pnl: Mapped[float | None] = mapped_column(Float)
+    raw_json: Mapped[str] = mapped_column(Text, default="{}")
+
+class MarketInsight(Base):
+    __tablename__ = "market_insights"
+    symbol: Mapped[str] = mapped_column(String(80), primary_key=True)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    raw_json: Mapped[str] = mapped_column(Text, default="{}")
+
+class PaperTrade(Base):
+    __tablename__ = "paper_trades"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_key: Mapped[str] = mapped_column(String(420), index=True)
+    trader_id: Mapped[str] = mapped_column(String(160), index=True)
+    trader_name: Mapped[str | None] = mapped_column(String(240))
+    symbol: Mapped[str] = mapped_column(String(80), index=True)
+    side: Mapped[str] = mapped_column(String(12))
+    status: Mapped[str] = mapped_column(String(20), default="OPEN", index=True)
+    entry_price: Mapped[float] = mapped_column(Float)
+    mark_price: Mapped[float] = mapped_column(Float)
+    quantity: Mapped[float] = mapped_column(Float)
+    notional: Mapped[float] = mapped_column(Float)
+    margin_used: Mapped[float] = mapped_column(Float)
+    leverage: Mapped[float] = mapped_column(Float)
+    stop_price: Mapped[float] = mapped_column(Float)
+    target_price: Mapped[float] = mapped_column(Float)
+    gross_pnl: Mapped[float] = mapped_column(Float, default=0)
+    estimated_costs: Mapped[float] = mapped_column(Float, default=0)
+    net_pnl: Mapped[float] = mapped_column(Float, default=0)
+    exit_price: Mapped[float | None] = mapped_column(Float)
+    exit_reason: Mapped[str | None] = mapped_column(String(80))
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    raw_json: Mapped[str] = mapped_column(Text, default="{}")
+
 Base.metadata.create_all(engine)
-app = FastAPI(title=APP_NAME, version="0.1.0", docs_url="/api/docs")
-app.mount("/static", StaticFiles(directory="static"), name="static")
+
+last_scan: dict[str, Any] = {"state": "starting", "started_at": None, "finished_at": None, "last_error": None, "traders_found": 0, "positions_checked": 0, "observations_saved": 0}
+worker_alive = False
+scan_lock = asyncio.Lock()
+last_manual_sync = 0.0
+news_cache: dict[str, Any] = {"fetched_at": 0.0, "items": [], "error": None}
 templates = Jinja2Templates(directory="templates")
 
+def now() -> datetime:
+    return datetime.now(timezone.utc)
 
-def now(): return datetime.now(timezone.utc)
-def safe_float(v):
-    try: return None if v is None else float(v)
-    except (TypeError, ValueError): return None
+def safe_float(value: Any) -> float | None:
+    try:
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
 
-def require_admin(token: str | None):
-    if not ADMIN_TOKEN:
-        raise HTTPException(503, "ADMIN_TOKEN is not configured; sync actions are disabled")
-    if not token or not hmac.compare_digest(token, ADMIN_TOKEN):
-        raise HTTPException(401, "Invalid admin token")
+def parse_json(value: str | None, fallback: Any = None) -> Any:
+    try:
+        return json.loads(value or "")
+    except Exception:
+        return {} if fallback is None else fallback
 
 def unwrap_data(payload: Any) -> dict:
-    if isinstance(payload, dict) and isinstance(payload.get("data"), dict): return payload["data"]
+    if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+        return payload["data"]
     return payload if isinstance(payload, dict) else {}
 
-async def kopyon_get(route: str, params: dict | None = None):
-    if not KOPYON_API_KEY: raise HTTPException(503, "KOPYON_API_KEY is not configured")
-    headers = {"X-API-KEY": KOPYON_API_KEY}
-    async with httpx.AsyncClient(timeout=25) as client:
-        r = await client.get(f"{KOPYON_BASE}/{route}", params=params or {}, headers=headers)
-    if r.status_code >= 400:
-        body = r.text[:600]
-        raise HTTPException(502, f"Kopyon {route} returned HTTP {r.status_code}: {body}")
-    try: return r.json(), r.status_code
-    except Exception: raise HTTPException(502, f"Kopyon {route} returned non-JSON data")
+def ms_datetime(value: Any) -> datetime | None:
+    try:
+        if value is None:
+            return None
+        v = int(value)
+        return datetime.fromtimestamp(v / 1000, tz=timezone.utc)
+    except Exception:
+        return None
 
-async def binance_get(path: str, params: dict | None = None):
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(f"{BINANCE_BASE}{path}", params=params or {})
-    if r.status_code >= 400: raise HTTPException(502, f"Binance market-data endpoint returned HTTP {r.status_code}")
-    return r.json(), r.status_code
-
-def log_check(source, ok, status=None, latency=None, detail=""):
+def setting(key: str, default: Any) -> Any:
     with SessionLocal() as db:
-        db.add(SourceCheck(source=source, ok=ok, http_status=status, latency_ms=latency, detail=detail[:1000]))
+        row = db.get(AppSetting, key)
+        return parse_json(row.value, default) if row else default
+
+def set_setting(key: str, value: Any) -> None:
+    with SessionLocal() as db:
+        row = db.get(AppSetting, key)
+        if row is None:
+            row = AppSetting(key=key, value=json.dumps(value))
+            db.add(row)
+        else:
+            row.value = json.dumps(value)
         db.commit()
 
-def persist_traders(rows: list[dict]):
-    count = 0
+def paper_config() -> dict:
+    defaults = {
+        "capital_usdt": 1000.0,
+        "auto_enabled": True,
+        "risk_pct": 0.50,
+        "max_margin_pct": 10.0,
+        "target_pct": 0.70,
+        "stop_pct": 0.45,
+        "taker_fee_pct": 0.05,
+        "slippage_pct": 0.02,
+        "max_leverage": 3.0,
+        "min_adverse_pct": 0.30
+    }
+    saved = setting("paper_config", {})
+    return {**defaults, **(saved if isinstance(saved, dict) else {})}
+
+def log_check(source: str, ok: bool, status: int | None = None, latency: int | None = None, detail: str = "") -> None:
+    try:
+        with SessionLocal() as db:
+            db.add(SourceCheck(source=source, ok=ok, http_status=status, latency_ms=latency, detail=detail[:900]))
+            db.commit()
+    except Exception:
+        pass
+
+async def request_json(url: str, params: dict | None = None, headers: dict | None = None, timeout: float = 20) -> tuple[dict, int]:
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.get(url, params=params or {}, headers=headers or {})
+    if response.status_code >= 400:
+        message = response.text[:350].replace(KOPYON_KEY, "[redacted]") if KOPYON_KEY else response.text[:350]
+        raise RuntimeError(f"HTTP {response.status_code}: {message}")
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise RuntimeError("Provider returned a non-JSON response") from exc
+    return payload if isinstance(payload, dict) else {"data": payload}, response.status_code
+
+async def kopyon_get(route: str, params: dict | None = None) -> tuple[dict, int]:
+    if not KOPYON_KEY:
+        raise RuntimeError("KOPYON_API_KEY is not configured on this Render service")
+    started = time.perf_counter()
+    payload, status = await request_json(
+        f"{KOPYON_ROOT}/{route}",
+        params=params,
+        headers={"X-API-KEY": KOPYON_KEY},
+        timeout=25
+    )
+    log_check("kopyon", True, status, int((time.perf_counter() - started) * 1000), f"{route} responded")
+    return payload, status
+
+async def binance_get(path: str, params: dict | None = None) -> tuple[Any, int]:
+    started = time.perf_counter()
+    payload, status = await request_json(f"{BINANCE_ROOT}{path}", params=params, timeout=18)
+    log_check("binance_market_data", True, status, int((time.perf_counter() - started) * 1000), path)
+    return payload, status
+
+def persist_traders(rows: list[dict]) -> int:
+    saved = 0
     with SessionLocal() as db:
         for item in rows:
-            tid = str(item.get("traderId") or item.get("portfolioId") or item.get("id") or "").strip()
-            if not tid: continue
-            t = db.get(Trader, tid)
-            if t is None:
-                t = Trader(trader_id=tid)
-                db.add(t)
-            t.name = item.get("name") or item.get("nickname") or t.name
-            t.avatar_url = item.get("avatarUrl") or t.avatar_url
-            t.portfolio_type = item.get("type") or item.get("portfolioType") or t.portfolio_type
-            # Visibility here is portfolio classification, not proof that current positions are visible.
-            if str(t.portfolio_type or "").upper() == "PRIVATE": t.visibility = "private_portfolio"
-            elif str(t.portfolio_type or "").upper() == "PUBLIC": t.visibility = "public_portfolio"
-            t.roi = safe_float(item.get("roi")); t.pnl = safe_float(item.get("pnl")); t.aum = safe_float(item.get("aum"))
-            t.max_drawdown = safe_float(item.get("maxDrawdown")); t.win_rate = safe_float(item.get("winRate"))
-            t.copier_pnl = safe_float(item.get("copierPnl")); t.sharpe_ratio = safe_float(item.get("sharpeRatio"))
-            t.raw_json = json.dumps(item, separators=(",", ":"), default=str)
-            t.last_seen_at = now(); count += 1
+            trader_id = str(item.get("traderId") or item.get("portfolioId") or item.get("id") or "").strip()
+            if not trader_id:
+                continue
+            trader = db.get(Trader, trader_id)
+            if trader is None:
+                trader = Trader(trader_id=trader_id)
+                db.add(trader)
+            trader.name = item.get("name") or item.get("nickname") or trader.name
+            trader.avatar_url = item.get("avatarUrl") or trader.avatar_url
+            trader.portfolio_type = item.get("type") or item.get("portfolioType") or trader.portfolio_type
+            trader.roi = safe_float(item.get("roi"))
+            trader.pnl = safe_float(item.get("pnl"))
+            trader.aum = safe_float(item.get("aum"))
+            trader.max_drawdown = safe_float(item.get("maxDrawdown"))
+            trader.win_rate = safe_float(item.get("winRate"))
+            trader.copier_pnl = safe_float(item.get("copierPnl"))
+            trader.sharpe_ratio = safe_float(item.get("sharpeRatio"))
+            trader.raw_json = json.dumps(item, separators=(",", ":"), default=str)
+            trader.last_seen_at = now()
+            saved += 1
         db.commit()
-    return count
+    return saved
+
+def record_position_snapshot(trader_id: str, payload: dict) -> tuple[int, bool]:
+    data = unwrap_data(payload)
+    positions = data.get("positions") or []
+    hidden = bool(data.get("hidden", False))
+    fetched_at = data.get("fetchedAt") or data.get("fetched_at")
+    saved = 0
+    with SessionLocal() as db:
+        trader = db.get(Trader, trader_id)
+        if trader is None:
+            trader = Trader(trader_id=trader_id, name=trader_id)
+            db.add(trader)
+        trader.visibility = "hidden_positions" if hidden else ("public_positions" if positions else "visible_empty_or_unreported")
+        snapshot = PositionSnapshot(
+            trader_id=trader_id,
+            source_fetched_at=str(fetched_at) if fetched_at else None,
+            hidden=hidden,
+            position_count=len(positions),
+            raw_json=json.dumps(payload, separators=(",", ":"), default=str)
+        )
+        db.add(snapshot)
+        db.flush()
+        if not hidden:
+            for position in positions:
+                symbol = str(position.get("symbol") or "UNKNOWN").upper()
+                side = str(position.get("side") or "UNKNOWN").upper()
+                position_id = str(position.get("positionId") or "")
+                key = f"{position_id}|{symbol}|{side}" if position_id else f"{symbol}|{side}"
+                db.add(PositionObservation(
+                    snapshot_id=snapshot.id,
+                    trader_id=trader_id,
+                    position_key=key,
+                    symbol=symbol,
+                    side=side,
+                    size=safe_float(position.get("size")),
+                    entry_price=safe_float(position.get("entryPrice")),
+                    mark_price=safe_float(position.get("markPrice")),
+                    unrealized_pnl=safe_float(position.get("unrealizedPnl")),
+                    leverage=safe_float(position.get("leverage")),
+                    margin_mode=position.get("marginMode"),
+                    liquidation_price=safe_float(position.get("liquidationPrice")),
+                    roi=safe_float(position.get("roi")),
+                    raw_json=json.dumps(position, separators=(",", ":"), default=str)
+                ))
+                saved += 1
+        db.commit()
+    # A hidden or empty response is not evidence of a close; old observations remain intact.
+    return saved, hidden
+
+async def discover_traders() -> tuple[int, list[str]]:
+    payload, _ = await kopyon_get("traders", {
+        "period": "7D",
+        "sortBy": "copierPnl",
+        "order": "DESC",
+        "type": "PUBLIC",
+        "page": 1,
+        "rows": 20
+    })
+    data = unwrap_data(payload)
+    rows = data.get("traders") or data.get("rows") or data.get("items") or []
+    if not isinstance(rows, list):
+        rows = []
+    saved = persist_traders(rows)
+    ids = [str(row.get("traderId") or row.get("portfolioId") or row.get("id") or "") for row in rows]
+    return saved, [item for item in ids if item]
+
+async def sync_one_trader_positions(trader_id: str) -> tuple[int, bool]:
+    payload, _ = await kopyon_get("openPositions", {"traderId": trader_id})
+    return record_position_snapshot(trader_id, payload)
+
+async def run_monitor_cycle(force: bool = False) -> dict:
+    global last_manual_sync
+    async with scan_lock:
+        last_scan.update({"state": "running", "started_at": now().isoformat(), "last_error": None})
+        try:
+            if not KOPYON_KEY:
+                raise RuntimeError("KOPYON_API_KEY is missing from this service's environment")
+            trader_count, discovered_ids = await discover_traders()
+            with SessionLocal() as db:
+                traders = db.scalars(
+                    select(Trader).order_by(desc(Trader.copier_pnl), desc(Trader.last_seen_at)).limit(100)
+                ).all()
+                ids = [t.trader_id for t in traders]
+                cursor = int(setting("position_rotation_cursor", 0) or 0)
+                if ids:
+                    selected = [ids[(cursor + i) % len(ids)] for i in range(min(POSITION_BATCH, len(ids)))]
+                    set_setting("position_rotation_cursor", (cursor + len(selected)) % len(ids))
+                else:
+                    selected = discovered_ids[:POSITION_BATCH]
+            checked = 0
+            saved = 0
+            for trader_id in selected:
+                try:
+                    count, hidden = await sync_one_trader_positions(trader_id)
+                    checked += 1
+                    saved += count
+                    log_check("position_snapshot", True, 200, None, f"{trader_id}: hidden={hidden}, observed={count}")
+                except Exception as exc:
+                    log_check("position_snapshot", False, None, None, f"{trader_id}: {str(exc)[:700]}")
+            try:
+                await api_opportunities(limit=100)
+            except Exception as analysis_exc:
+                log_check("paper_analysis", False, None, None, str(analysis_exc))
+            await evaluate_open_paper_trades()
+            last_scan.update({
+                "state": "idle",
+                "finished_at": now().isoformat(),
+                "last_error": None,
+                "traders_found": trader_count,
+                "positions_checked": checked,
+                "observations_saved": saved,
+                "selected_trader_ids": selected
+            })
+            last_manual_sync = time.time()
+            return dict(last_scan)
+        except Exception as exc:
+            last_scan.update({"state": "error", "finished_at": now().isoformat(), "last_error": str(exc)[:900]})
+            log_check("monitor", False, None, None, str(exc))
+            return dict(last_scan)
+
+async def monitor_worker() -> None:
+    global worker_alive
+    worker_alive = True
+    try:
+        # First discovery starts automatically at process startup.
+        await run_monitor_cycle()
+        while True:
+            await asyncio.sleep(DISCOVERY_INTERVAL)
+            await run_monitor_cycle()
+    except asyncio.CancelledError:
+        raise
+    finally:
+        worker_alive = False
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(monitor_worker())
+    app.state.monitor_task = task
+    yield
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+
+app = FastAPI(title=APP_NAME, version="1.0.0", lifespan=lifespan, docs_url="/api/docs")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
     return templates.TemplateResponse("index.html", {"request": request, "app_name": APP_NAME})
 
-@app.get("/healthz")
-async def healthz():
-    db_ok = False
+def db_metrics() -> dict:
+    used = None
+    tables = []
+    connection = "connected"
     try:
-        with SessionLocal() as db: db.execute(select(func.count()).select_from(Trader)).scalar_one()
-        db_ok = True
-    except Exception: pass
-    return {"status": "ok" if db_ok else "degraded", "database": "connected" if db_ok else "unavailable", "kopyon_key_configured": bool(KOPYON_API_KEY), "admin_sync_enabled": bool(ADMIN_TOKEN), "trading_enabled": False, "timestamp": now().isoformat()}
+        with engine.connect() as conn:
+            if engine.dialect.name == "postgresql":
+                used = int(conn.execute(text("SELECT pg_database_size(current_database())")).scalar_one())
+                rows = conn.execute(text(
+                    "SELECT relname, pg_total_relation_size(relid) AS bytes "
+                    "FROM pg_catalog.pg_statio_user_tables ORDER BY bytes DESC"
+                )).all()
+                tables = [{"name": row[0], "bytes": int(row[1])} for row in rows]
+            else:
+                path = engine.url.database
+                if path and os.path.exists(path):
+                    used = os.path.getsize(path)
+                rows = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")).all()
+                tables = [{"name": row[0], "bytes": None} for row in rows]
+    except Exception as exc:
+        connection = "error: " + str(exc)[:250]
+    return {
+        "engine": engine.dialect.name,
+        "connection": connection,
+        "persistent": engine.dialect.name == "postgresql",
+        "used_bytes": used,
+        "used_mb": round(used / 1024 / 1024, 3) if used is not None else None,
+        "configured_capacity_gb": safe_float(os.getenv("DATABASE_CAPACITY_GB")),
+        "capacity_note": "Render plan quota is not exposed through the SQL connection; showing actual database bytes only." if os.getenv("DATABASE_CAPACITY_GB") is None else "Capacity is an operator-supplied environment value.",
+        "tables": tables
+    }
 
-@app.get("/api/status")
-async def status():
+def overview_counts() -> dict:
     with SessionLocal() as db:
         traders = db.scalar(select(func.count()).select_from(Trader)) or 0
-        snaps = db.scalar(select(func.count()).select_from(PositionSnapshot)) or 0
+        snapshots = db.scalar(select(func.count()).select_from(PositionSnapshot)) or 0
         observations = db.scalar(select(func.count()).select_from(PositionObservation)) or 0
-        visible = db.scalar(select(func.count()).select_from(PositionSnapshot).where(PositionSnapshot.hidden == False)) or 0
-        hidden = db.scalar(select(func.count()).select_from(PositionSnapshot).where(PositionSnapshot.hidden == True)) or 0
-        checks = db.scalars(select(SourceCheck).order_by(desc(SourceCheck.checked_at)).limit(8)).all()
-    return {"traders": traders, "position_snapshots": snaps, "position_observations": observations, "visible_snapshots": visible, "hidden_snapshots": hidden, "kopyon_key_configured": bool(KOPYON_API_KEY), "direct_binance_role": "official public market data only; no documented public individual lead-position endpoint", "trading_enabled": False, "sources": [dict(source=c.source, ok=c.ok, checked_at=c.checked_at.isoformat(), status=c.http_status, latency_ms=c.latency_ms, detail=c.detail) for c in checks]}
+        hidden = db.scalar(select(func.count()).select_from(PositionSnapshot).where(PositionSnapshot.hidden.is_(True))) or 0
+        open_paper = db.scalar(select(func.count()).select_from(PaperTrade).where(PaperTrade.status == "OPEN")) or 0
+        closed_paper = db.scalar(select(func.count()).select_from(PaperTrade).where(PaperTrade.status == "CLOSED")) or 0
+        open_loss = db.scalar(select(func.count()).select_from(PositionObservation).where(PositionObservation.unrealized_pnl < 0)) or 0
+        latest = db.scalar(select(func.max(PositionSnapshot.observed_at)))
+    return {
+        "traders": traders, "snapshots": snapshots, "observations": observations,
+        "hidden_snapshots": hidden, "open_paper_trades": open_paper,
+        "closed_paper_trades": closed_paper, "underwater_observations": open_loss,
+        "latest_snapshot": latest.isoformat() if latest else None
+    }
 
-@app.post("/api/sources/check")
-async def check_sources(x_admin_token: str | None = Header(default=None)):
-    require_admin(x_admin_token)
-    import time
-    results = {}
-    if KOPYON_API_KEY:
-        start = time.perf_counter()
-        try:
-            payload, code = await kopyon_get("traders", {"period":"7D", "sortBy":"copierPnl", "order":"DESC", "type":"PUBLIC", "page":1, "rows":1})
-            ms = int((time.perf_counter()-start)*1000); data=unwrap_data(payload)
-            results["kopyon"]={"ok":True,"http_status":code,"latency_ms":ms,"response_keys":list(data.keys()),"sample_count":len(data.get("traders", data.get("rows", [])) or [])}
-            log_check("kopyon", True, code, ms, "Trader endpoint responded")
-        except Exception as e:
-            results["kopyon"]={"ok":False,"detail":str(e)}; log_check("kopyon", False, None, None, str(e))
-    else:
-        results["kopyon"]={"ok":False,"detail":"KOPYON_API_KEY missing; configure it in Render environment"}
-    start=time.perf_counter()
+@app.get("/healthz")
+async def healthz():
     try:
-        _, code = await binance_get("/fapi/v1/ping")
-        ms=int((time.perf_counter()-start)*1000)
-        results["binance_market_data"]={"ok":True,"http_status":code,"latency_ms":ms,"role":"Official market data, not trader identity/position data"}
-        log_check("binance_market_data", True, code, ms, "USDⓈ-M Futures public ping succeeded")
-    except Exception as e:
-        results["binance_market_data"]={"ok":False,"detail":str(e)}; log_check("binance_market_data", False, None, None, str(e))
-    results["binance_copy_trader_positions"]={"ok":False,"detail":"No documented public Binance API endpoint for arbitrary individual lead-trader positions was identified. Use publicly disclosed portfolio data via Kopyon; do not infer or bypass private positions."}
-    return results
+        with SessionLocal() as db:
+            db.execute(select(func.count()).select_from(Trader)).scalar_one()
+        db_ok = True
+    except Exception:
+        db_ok = False
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "database": "connected" if db_ok else "unavailable",
+        "kopyon_key_configured": bool(KOPYON_KEY),
+        "automatic_monitor": worker_alive,
+        "monitor_state": last_scan.get("state"),
+        "paper_only": True,
+        "order_execution": False
+    }
 
-@app.post("/api/sync/traders")
-async def sync_traders(request: Request, x_admin_token: str | None = Header(default=None), period: str="30D", sort_by: str="copierPnl", portfolio_type: str="PUBLIC", pages: int=1):
-    require_admin(x_admin_token)
-    if period not in {"7D","30D","90D","180D","1Y"}: raise HTTPException(400,"Invalid period")
-    if portfolio_type not in {"PUBLIC","PRIVATE","SIGNAL","ALL"}: raise HTTPException(400,"Invalid portfolio_type")
-    pages=max(1,min(pages,5)); total=0; page_results=[]
-    for page in range(1,pages+1):
-        payload, code = await kopyon_get("traders", {"period":period,"sortBy":sort_by,"order":"DESC","type":portfolio_type,"page":page,"rows":20})
-        data=unwrap_data(payload)
-        rows=data.get("traders") or data.get("rows") or data.get("items") or []
-        if not isinstance(rows,list): rows=[]
-        n=persist_traders(rows); total+=n; page_results.append({"page":page,"received":len(rows),"saved":n,"hasMore":data.get("hasMore")})
-        if data.get("hasMore") is False or not rows: break
-    log_check("kopyon_traders", True, 200, None, f"Saved {total} trader rows")
-    return {"saved":total,"pages":page_results,"portfolio_type":portfolio_type,"period":period}
-
-@app.post("/api/sync/trader/{trader_id}/positions")
-async def sync_positions(trader_id: str, x_admin_token: str | None = Header(default=None)):
-    require_admin(x_admin_token)
-    payload, code = await kopyon_get("openPositions", {"traderId":trader_id})
-    data=unwrap_data(payload); positions=data.get("positions") or []
-    hidden=bool(data.get("hidden", False))
-    fetched_at=data.get("fetchedAt") or data.get("fetched_at")
-    with SessionLocal() as db:
-        trader=db.get(Trader,trader_id)
-        if trader is None:
-            trader=Trader(trader_id=trader_id, name=trader_id); db.add(trader)
-        trader.visibility = "hidden_positions" if hidden else ("public_positions" if positions else "visible_empty_or_unreported")
-        snap=PositionSnapshot(trader_id=trader_id, source_fetched_at=str(fetched_at) if fetched_at else None, hidden=hidden, position_count=len(positions), raw_json=json.dumps(payload, separators=(",",":"), default=str))
-        db.add(snap); db.flush()
-        saved=0
-        if not hidden:
-            for p in positions:
-                symbol=str(p.get("symbol") or "UNKNOWN")
-                side=str(p.get("side") or "UNKNOWN").upper()
-                pid=str(p.get("positionId") or "")
-                pkey=f"{pid}|{symbol}|{side}" if pid else f"{symbol}|{side}"
-                db.add(PositionObservation(snapshot_id=snap.id,trader_id=trader_id,position_key=pkey,symbol=symbol,side=side,size=safe_float(p.get("size")),entry_price=safe_float(p.get("entryPrice")),mark_price=safe_float(p.get("markPrice")),unrealized_pnl=safe_float(p.get("unrealizedPnl")),leverage=safe_float(p.get("leverage")),margin_mode=p.get("marginMode"),liquidation_price=safe_float(p.get("liquidationPrice")),roi=safe_float(p.get("roi")),raw_json=json.dumps(p,separators=(",",":"),default=str)))
-                saved+=1
-        # Critical: hidden=true does NOT create close events and does NOT erase previous visible observations.
-        db.commit()
-    log_check("kopyon_open_positions", True, code, None, f"trader={trader_id}; hidden={hidden}; positions={len(positions)}")
-    return {"trader_id":trader_id,"hidden":hidden,"reported_position_count":len(positions),"saved_observations":saved,"source_fetched_at":fetched_at,"interpretation":"Positions are private/unavailable; previous observations retained" if hidden else "Snapshot stored; empty array is not automatically interpreted as a closed position" if not positions else "Visible position snapshot stored"}
+@app.get("/api/overview")
+async def api_overview():
+    db = db_metrics()
+    counts = overview_counts()
+    with SessionLocal() as session:
+        checks = session.scalars(select(SourceCheck).order_by(desc(SourceCheck.checked_at)).limit(12)).all()
+    return {
+        **counts,
+        "database": db,
+        "kopyon": {"configured": bool(KOPYON_KEY), "base": KOPYON_ROOT, "last_status": next(({"ok": c.ok, "detail": c.detail, "at": c.checked_at.isoformat()} for c in checks if c.source == "kopyon"), None)},
+        "binance": {"base": BINANCE_ROOT, "role": "Public USDⓈ-M Futures candles and mark/funding data; not individual leader positions."},
+        "monitor": {**last_scan, "worker_alive": worker_alive, "interval_seconds": DISCOVERY_INTERVAL, "position_batch_per_cycle": POSITION_BATCH, "quota_design": "One 20-trader leaderboard request plus up to five open-position requests per 30-minute cycle; market-data calls are separate."},
+        "paper": paper_config(),
+        "execution_enabled": False,
+        "runtime_note": "On Render Free, the web service can spin down after 15 minutes without inbound traffic. The in-process monitor runs only while the instance is awake."
+    }
 
 @app.get("/api/traders")
-async def get_traders(limit: int=100):
-    limit=max(1,min(limit,500))
+async def api_traders(limit: int = 100, search: str = ""):
+    limit = max(1, min(limit, 300))
     with SessionLocal() as db:
-        rows=db.scalars(select(Trader).order_by(desc(Trader.last_seen_at)).limit(limit)).all()
-        return [{"trader_id":t.trader_id,"name":t.name,"portfolio_type":t.portfolio_type,"visibility":t.visibility,"roi":t.roi,"pnl":t.pnl,"aum":t.aum,"max_drawdown":t.max_drawdown,"win_rate":t.win_rate,"copier_pnl":t.copier_pnl,"sharpe_ratio":t.sharpe_ratio,"last_seen_at":t.last_seen_at.isoformat()} for t in rows]
+        query = select(Trader).order_by(desc(Trader.copier_pnl), desc(Trader.last_seen_at))
+        rows = db.scalars(query.limit(limit)).all()
+        cache = {p.trader_id: p for p in db.scalars(select(TraderProfileCache)).all()}
+    result = []
+    q = search.lower().strip()
+    for t in rows:
+        if q and q not in (t.name or "").lower() and q not in t.trader_id.lower():
+            continue
+        profile_cache = cache.get(t.trader_id)
+        profile = unwrap_data(parse_json(profile_cache.raw_profile)) if profile_cache else {}
+        src = parse_json(t.raw_json)
+        result.append({
+            "trader_id": t.trader_id, "name": t.name, "avatar_url": t.avatar_url,
+            "portfolio_type": t.portfolio_type, "visibility": t.visibility,
+            "roi": t.roi, "pnl": t.pnl, "aum": t.aum, "max_drawdown": t.max_drawdown,
+            "win_rate": t.win_rate, "copier_pnl": t.copier_pnl, "sharpe_ratio": t.sharpe_ratio,
+            "copiers": src.get("copiers"), "max_copiers": src.get("maxCopiers"),
+            "bio": profile.get("bio"), "profit_share": profile.get("profitShare"),
+            "last_seen_at": t.last_seen_at.isoformat(), "profile_loaded": bool(profile_cache)
+        })
+    return result
+
+@app.get("/api/traders/{trader_id}")
+async def api_trader_detail(trader_id: str):
+    with SessionLocal() as db:
+        trader = db.get(Trader, trader_id)
+        cache = db.get(TraderProfileCache, trader_id)
+        history = db.scalars(select(HistoryPosition).where(HistoryPosition.trader_id == trader_id).order_by(desc(HistoryPosition.opened_at_ms)).limit(100)).all()
+    if trader is None:
+        raise HTTPException(404, "Trader not found in the live discovered universe")
+    durations = [((h.closed_at_ms - h.opened_at_ms) / 3600000) for h in history if h.opened_at_ms and h.closed_at_ms and h.closed_at_ms > h.opened_at_ms]
+    pnl_values = [h.net_pnl for h in history if h.net_pnl is not None]
+    wins = sum(1 for x in pnl_values if x > 0)
+    profile = unwrap_data(parse_json(cache.raw_profile)) if cache else {}
+    performance = unwrap_data(parse_json(cache.raw_performance)) if cache else {}
+    return {
+        "trader": {
+            "trader_id": trader.trader_id, "name": trader.name, "avatar_url": trader.avatar_url,
+            "portfolio_type": trader.portfolio_type, "roi": trader.roi, "pnl": trader.pnl,
+            "aum": trader.aum, "max_drawdown": trader.max_drawdown, "win_rate": trader.win_rate,
+            "copier_pnl": trader.copier_pnl, "sharpe_ratio": trader.sharpe_ratio,
+            "visibility": trader.visibility, "raw": parse_json(trader.raw_json)
+        },
+        "profile": profile, "performance": performance,
+        "history_summary": {
+            "records": len(history), "win_rate_closed_history": wins / len(pnl_values) if pnl_values else None,
+            "avg_hold_hours": statistics.mean(durations) if durations else None,
+            "median_hold_hours": statistics.median(durations) if durations else None,
+            "avg_net_pnl": statistics.mean(pnl_values) if pnl_values else None
+        },
+        "history": [history_item(h) for h in history[:40]],
+        "profile_fetched_at": cache.fetched_at.isoformat() if cache else None
+    }
+
+def history_item(h: HistoryPosition) -> dict:
+    return {
+        "position_id": h.position_id, "symbol": h.symbol, "side": h.side, "status": h.status,
+        "opened_at": ms_datetime(h.opened_at_ms).isoformat() if h.opened_at_ms else None,
+        "closed_at": ms_datetime(h.closed_at_ms).isoformat() if h.closed_at_ms else None,
+        "entry_price": h.entry_price, "close_price": h.close_price, "roi": h.roi,
+        "gross_pnl": h.gross_pnl, "net_pnl": h.net_pnl
+    }
+
+@app.post("/api/traders/{trader_id}/intel")
+async def load_trader_intelligence(trader_id: str):
+    with SessionLocal() as db:
+        trader = db.get(Trader, trader_id)
+    if trader is None:
+        raise HTTPException(404, "Trader not found")
+    if not KOPYON_KEY:
+        raise HTTPException(503, "KOPYON_API_KEY is missing from this service's environment")
+    results = {}
+    try:
+        profile_payload, _ = await kopyon_get("traderProfile", {"traderId": trader_id})
+        performance_payload, _ = await kopyon_get("performance", {"traderId": trader_id, "period": "30D"})
+        history_payload, _ = await kopyon_get("positionHistory", {"traderId": trader_id, "rows": 20, "sortBy": "closed"})
+        profile = unwrap_data(profile_payload)
+        performance = unwrap_data(performance_payload)
+        history_data = unwrap_data(history_payload)
+        history_rows = history_data.get("positions") or []
+        with SessionLocal() as db:
+            cache = db.get(TraderProfileCache, trader_id)
+            if cache is None:
+                cache = TraderProfileCache(trader_id=trader_id)
+                db.add(cache)
+            cache.fetched_at = now()
+            cache.raw_profile = json.dumps(profile_payload, separators=(",", ":"), default=str)
+            cache.raw_performance = json.dumps(performance_payload, separators=(",", ":"), default=str)
+            for item in history_rows:
+                pid = str(item.get("positionId") or "")
+                exists = db.scalar(select(HistoryPosition.id).where(
+                    HistoryPosition.trader_id == trader_id,
+                    HistoryPosition.position_id == (pid or None)
+                ).limit(1)) if pid else None
+                if exists:
+                    continue
+                db.add(HistoryPosition(
+                    trader_id=trader_id, position_id=pid or None,
+                    symbol=str(item.get("symbol") or "UNKNOWN").upper(),
+                    side=str(item.get("side") or "UNKNOWN").upper(),
+                    status=item.get("status"),
+                    opened_at_ms=int(item["openedAt"]) if item.get("openedAt") else None,
+                    closed_at_ms=int(item["closedAt"]) if item.get("closedAt") else None,
+                    entry_price=safe_float(item.get("entryPrice")),
+                    close_price=safe_float(item.get("closePrice")),
+                    roi=safe_float(item.get("roi")),
+                    gross_pnl=safe_float(item.get("grossPnl")),
+                    net_pnl=safe_float(item.get("netPnl")),
+                    raw_json=json.dumps(item, separators=(",", ":"), default=str)
+                ))
+            db.commit()
+        results = {"profile_loaded": True, "history_rows_received": len(history_rows), "history_total": history_data.get("total"), "performance_loaded": True}
+    except Exception as exc:
+        raise HTTPException(502, f"Could not load trader intelligence: {str(exc)[:700]}")
+    return results
 
 @app.get("/api/positions")
-async def get_positions(limit: int=200):
-    limit=max(1,min(limit,1000))
+async def api_positions(limit: int = 500):
+    limit = max(1, min(limit, 1000))
     with SessionLocal() as db:
-        rows=db.execute(select(PositionObservation, PositionSnapshot.observed_at).join(PositionSnapshot, PositionObservation.snapshot_id==PositionSnapshot.id).order_by(desc(PositionSnapshot.observed_at)).limit(limit)).all()
-        return [{"trader_id":p.trader_id,"symbol":p.symbol,"side":p.side,"size":p.size,"entry_price":p.entry_price,"mark_price":p.mark_price,"unrealized_pnl":p.unrealized_pnl,"leverage":p.leverage,"margin_mode":p.margin_mode,"liquidation_price":p.liquidation_price,"roi":p.roi,"observed_at":ts.isoformat()} for p,ts in rows]
+        observations = db.scalars(select(PositionObservation).order_by(desc(PositionObservation.id)).limit(limit * 3)).all()
+        snapshots = {s.id: s for s in db.scalars(select(PositionSnapshot).where(PositionSnapshot.id.in_([o.snapshot_id for o in observations])).all())} if observations else {}
+    latest = {}
+    for obs in observations:
+        key = f"{obs.trader_id}|{obs.position_key}"
+        if key not in latest:
+            snap = snapshots.get(obs.snapshot_id)
+            latest[key] = {
+                "trader_id": obs.trader_id, "symbol": obs.symbol, "side": obs.side, "position_key": obs.position_key,
+                "size": obs.size, "entry_price": obs.entry_price, "mark_price": obs.mark_price,
+                "unrealized_pnl": obs.unrealized_pnl, "leverage": obs.leverage, "margin_mode": obs.margin_mode,
+                "liquidation_price": obs.liquidation_price, "roi": obs.roi,
+                "observed_at": snap.observed_at.isoformat() if snap else None,
+                "source_fetched_at": snap.source_fetched_at if snap else None,
+                "hidden": False, "raw": parse_json(obs.raw_json)
+            }
+        if len(latest) >= limit:
+            break
+    return list(latest.values())
 
-@app.get("/api/binance/market/{symbol}")
-async def binance_market(symbol: str):
-    symbol=symbol.upper()
-    if not symbol.isalnum(): raise HTTPException(400,"Invalid symbol")
-    data,_=await binance_get("/fapi/v1/premiumIndex",{"symbol":symbol})
-    return {"source":"Binance USDⓈ-M Futures public market data","symbol":data.get("symbol"),"mark_price":data.get("markPrice"),"index_price":data.get("indexPrice"),"last_funding_rate":data.get("lastFundingRate"),"next_funding_time":data.get("nextFundingTime"),"time":data.get("time")}
+async def fetch_news_items() -> list[dict]:
+    if time.time() - news_cache["fetched_at"] < 1800:
+        return news_cache["items"]
+    feeds = ["https://www.coindesk.com/arc/outboundfeeds/rss/"]
+    items = []
+    for url in feeds:
+        try:
+            async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
+                response = await client.get(url)
+            response.raise_for_status()
+            root = ET.fromstring(response.text)
+            for item in root.findall(".//item")[:60]:
+                title = item.findtext("title") or ""
+                link = item.findtext("link") or ""
+                pub = item.findtext("pubDate") or ""
+                items.append({"title": title, "url": link, "published_at": pub, "source": "CoinDesk RSS"})
+        except Exception as exc:
+            news_cache["error"] = str(exc)[:180]
+    news_cache.update({"fetched_at": time.time(), "items": items, "error": news_cache.get("error")})
+    return items
 
-@app.get("/api/binance/klines/{symbol}")
-async def binance_klines(symbol: str, interval: str="1m", limit: int=100):
-    if interval not in {"1m","3m","5m","15m","30m","1h","2h","4h","1d"}: raise HTTPException(400,"Unsupported interval")
-    limit=max(1,min(limit,500))
-    data,_=await binance_get("/fapi/v1/klines",{"symbol":symbol.upper(),"interval":interval,"limit":limit})
-    return {"source":"Binance USDⓈ-M Futures public market data","symbol":symbol.upper(),"interval":interval,"candles":data}
+def rsi_value(closes: list[float], period: int = 14) -> float | None:
+    if len(closes) <= period:
+        return None
+    diffs = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains = [max(x, 0) for x in diffs[-period:]]
+    losses = [max(-x, 0) for x in diffs[-period:]]
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
-@app.get("/api/observations/{trader_id}")
-async def trader_observations(trader_id: str, limit: int=50):
-    limit=max(1,min(limit,200))
+async def market_features(symbol: str, refresh: bool = False) -> dict:
     with SessionLocal() as db:
-        snaps=db.scalars(select(PositionSnapshot).where(PositionSnapshot.trader_id==trader_id).order_by(desc(PositionSnapshot.observed_at)).limit(limit)).all()
-        return [{"observed_at":s.observed_at.isoformat(),"source_fetched_at":s.source_fetched_at,"hidden":s.hidden,"position_count":s.position_count,"raw":json.loads(s.raw_json)} for s in snaps]
+        cache = db.get(MarketInsight, symbol)
+        if cache and not refresh and (now() - cache.fetched_at).total_seconds() < 1800:
+            return parse_json(cache.raw_json)
+    premium, _ = await binance_get("/fapi/v1/premiumIndex", {"symbol": symbol})
+    klines, _ = await binance_get("/fapi/v1/klines", {"symbol": symbol, "interval": "1h", "limit": 168})
+    micro, _ = await binance_get("/fapi/v1/klines", {"symbol": symbol, "interval": "5m", "limit": 3})
+    closes = [float(k[4]) for k in klines if len(k) > 4]
+    highs = [float(k[2]) for k in klines if len(k) > 4]
+    lows = [float(k[3]) for k in klines if len(k) > 4]
+    last = closes[-1] if closes else safe_float(premium.get("markPrice"))
+    seven_return = (closes[-1] / closes[0] - 1) * 100 if len(closes) >= 2 and closes[0] else None
+    day_return = (closes[-1] / closes[-25] - 1) * 100 if len(closes) >= 25 and closes[-25] else None
+    tr = []
+    for i in range(1, len(closes)):
+        tr.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
+    atr_pct = (statistics.mean(tr[-24:]) / last * 100) if tr and last else None
+    micro_closes = [float(k[4]) for k in micro if len(k) > 4]
+    mom5 = ((micro_closes[-1] / micro_closes[-2]) - 1) * 100 if len(micro_closes) >= 2 and micro_closes[-2] else None
+    data = {
+        "symbol": symbol, "fetched_at": now().isoformat(),
+        "mark_price": safe_float(premium.get("markPrice")),
+        "index_price": safe_float(premium.get("indexPrice")),
+        "funding_rate": safe_float(premium.get("lastFundingRate")),
+        "next_funding_time": premium.get("nextFundingTime"),
+        "seven_day_return_pct": seven_return, "twenty_four_hour_return_pct": day_return,
+        "atr_24h_pct": atr_pct, "rsi_1h": rsi_value(closes),
+        "momentum_5m_pct": mom5, "closes_1h": closes[-30:],
+        "source": "Binance USDⓈ-M Futures public market data"
+    }
+    with SessionLocal() as db:
+        row = db.get(MarketInsight, symbol)
+        if row is None:
+            row = MarketInsight(symbol=symbol)
+            db.add(row)
+        row.fetched_at = now()
+        row.raw_json = json.dumps(data, separators=(",", ":"), default=str)
+        db.commit()
+    return data
+
+def recovery_statistics(trader_id: str, position_key: str, symbol: str, side: str, entry: float | None) -> dict:
+    position_id = position_key.split("|", 1)[0] if "|" in position_key else ""
+    with SessionLocal() as db:
+        history = db.scalars(select(HistoryPosition).where(
+            HistoryPosition.trader_id == trader_id,
+            HistoryPosition.symbol == symbol,
+            HistoryPosition.side == side
+        )).all()
+        observed = []
+        if position_id:
+            observed = db.scalars(select(PositionObservation).where(
+                PositionObservation.trader_id == trader_id,
+                PositionObservation.position_key.like(position_id + "|%")
+            )).all()
+    recovered = []
+    for h in history:
+        had_adverse = False
+        if h.position_id:
+            had_adverse = any((o.unrealized_pnl is not None and o.unrealized_pnl < 0) for o in observed if o.position_key.startswith(h.position_id + "|"))
+        if not had_adverse and h.position_id == position_id:
+            had_adverse = any((o.unrealized_pnl is not None and o.unrealized_pnl < 0) for o in observed)
+        if had_adverse:
+            profitable = h.net_pnl > 0 if h.net_pnl is not None else (
+                (h.close_price > h.entry_price) if side == "LONG" and h.close_price and h.entry_price else
+                (h.close_price < h.entry_price) if side == "SHORT" and h.close_price and h.entry_price else False
+            )
+            recovered.append(bool(profitable))
+    n = len(recovered)
+    if n < 10:
+        return {
+            "probability": None, "sample_size": n,
+            "label": "Insufficient LAES-observed underwater-to-close samples",
+            "note": "A recovery probability is withheld until at least 10 comparable closed paths have been observed by LAES."
+        }
+    p = sum(recovered) / n
+    z = 1.96
+    denom = 1 + z*z/n
+    center = (p + z*z/(2*n)) / denom
+    margin = (z * math.sqrt((p*(1-p)/n) + z*z/(4*n*n))) / denom
+    return {
+        "probability": round(p * 100, 1), "sample_size": n,
+        "ci_low": round(max(0, center - margin) * 100, 1),
+        "ci_high": round(min(1, center + margin) * 100, 1),
+        "label": "Empirical LAES path recovery rate",
+        "note": "Computed only from this trader/symbol/side positions that LAES observed underwater and later matched to a closed result."
+    }
+
+def holding_time(trader_id: str, position_key: str, raw: dict, observed_at: str | None) -> dict:
+    opened = ms_datetime(raw.get("openedAt") or raw.get("opened_at"))
+    source = "Provider open timestamp" if opened else None
+    if opened is None and observed_at:
+        try:
+            opened = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+            source = "First observed by LAES; true open time unavailable"
+        except Exception:
+            opened = None
+    hours = (now() - opened).total_seconds() / 3600 if opened else None
+    with SessionLocal() as db:
+        cache = db.get(TraderProfileCache, trader_id)
+        durations = []
+        if cache:
+            histories = db.scalars(select(HistoryPosition).where(HistoryPosition.trader_id == trader_id)).all()
+            durations = [(h.closed_at_ms - h.opened_at_ms) / 3600000 for h in histories if h.opened_at_ms and h.closed_at_ms and h.closed_at_ms > h.opened_at_ms]
+    return {
+        "current_hours": round(hours, 2) if hours is not None else None,
+        "source": source or "Unavailable",
+        "typical_median_hours": round(statistics.median(durations), 2) if durations else None,
+        "completed_positions_sample": len(durations)
+    }
+
+def find_news_for_symbol(symbol: str, items: list[dict]) -> list[dict]:
+    base = symbol.upper().replace("USDT", "").replace("USDC", "").replace("BUSD", "")
+    aliases = {"BTC": ["bitcoin", "btc"], "ETH": ["ethereum", "ether", "eth"], "SOL": ["solana", "sol"], "BNB": ["binance coin", "bnb"], "XRP": ["ripple", "xrp"], "DOGE": ["dogecoin", "doge"]}
+    terms = aliases.get(base, [base.lower()])
+    matches = []
+    for item in items:
+        title = (item.get("title") or "").lower()
+        if any(term in title for term in terms):
+            matches.append(item)
+    return matches[:5]
+
+async def build_opportunity(obs: PositionObservation, snapshot_time: str | None, trader_name: str | None, news: list[dict]) -> dict:
+    raw = parse_json(obs.raw_json)
+    entry = obs.entry_price
+    try:
+        market = await market_features(obs.symbol)
+    except Exception as exc:
+        market = {"symbol": obs.symbol, "error": str(exc)[:220], "source": "Binance market data unavailable"}
+    mark = safe_float(market.get("mark_price")) or obs.mark_price
+    adverse = None
+    if entry and mark and entry > 0:
+        adverse = ((entry - mark) / entry * 100) if obs.side == "LONG" else ((mark - entry) / entry * 100)
+    underwater = (obs.unrealized_pnl is not None and obs.unrealized_pnl < 0) or (adverse is not None and adverse > 0)
+    cfg = paper_config()
+    momentum = safe_float(market.get("momentum_5m_pct"))
+    confirmation = momentum is not None and ((momentum > 0) if obs.side == "LONG" else (momentum < 0))
+    min_adverse = float(cfg["min_adverse_pct"])
+    qualified = bool(underwater and adverse is not None and adverse >= min_adverse and confirmation)
+    status = "QUALIFIED" if qualified else ("UNDERWATER WATCH" if underwater else "NOT UNDERWATER")
+    causes = []
+    week = safe_float(market.get("seven_day_return_pct"))
+    day = safe_float(market.get("twenty_four_hour_return_pct"))
+    atr = safe_float(market.get("atr_24h_pct"))
+    if week is not None:
+        against = (week < 0) if obs.side == "LONG" else (week > 0)
+        causes.append({"type": "market_trend", "label": f"7-day market return {week:+.2f}%", "effect": "Against position" if against else "With position", "risk": "adverse" if against else "supportive"})
+    if day is not None:
+        against = (day < 0) if obs.side == "LONG" else (day > 0)
+        causes.append({"type": "short_term", "label": f"24-hour market return {day:+.2f}%", "effect": "Against position" if against else "With position", "risk": "adverse" if against else "supportive"})
+    if atr is not None:
+        causes.append({"type": "volatility", "label": f"24-hour ATR / price {atr:.2f}%", "effect": "Elevated volatility" if atr >= 1.5 else "Normal-to-moderate volatility", "risk": "warning" if atr >= 1.5 else "neutral"})
+    matched_news = find_news_for_symbol(obs.symbol, news)
+    causes.extend([{"type": "news_context", "label": item["title"], "effect": "Contemporaneous headline; not proof of causation", "url": item["url"], "published_at": item["published_at"], "risk": "context"} for item in matched_news])
+    recovery = recovery_statistics(obs.trader_id, obs.position_key, obs.symbol, obs.side, entry)
+    hold = holding_time(obs.trader_id, obs.position_key, raw, snapshot_time)
+    if qualified and cfg.get("auto_enabled"):
+        create_paper_trade(obs, trader_name, mark or entry or 0, cfg, market)
+    return {
+        "trader_id": obs.trader_id, "trader_name": trader_name or obs.trader_id,
+        "position_key": obs.position_key, "symbol": obs.symbol, "side": obs.side,
+        "entry_price": entry, "mark_price": mark, "adverse_pct": round(adverse, 3) if adverse is not None else None,
+        "unrealized_pnl": obs.unrealized_pnl, "roi": obs.roi, "leverage": obs.leverage,
+        "margin_mode": obs.margin_mode, "liquidation_price": obs.liquidation_price,
+        "observed_at": snapshot_time, "underwater": underwater, "qualified": qualified,
+        "status": status, "momentum_5m_pct": momentum, "market": market,
+        "recovery": recovery, "holding": hold, "likely_causes": causes,
+        "news_context_count": len(matched_news),
+        "recovery_warning": "Market trend/news are contextual risk factors, not a deterministic cause or guarantee of recovery."
+    }
+
+def create_paper_trade(obs: PositionObservation, trader_name: str | None, mark: float, cfg: dict, market: dict) -> None:
+    if mark <= 0 or not obs.entry_price or obs.entry_price <= 0:
+        return
+    source_key = f"{obs.trader_id}|{obs.position_key}"
+    with SessionLocal() as db:
+        existing = db.scalar(select(PaperTrade.id).where(PaperTrade.source_key == source_key, PaperTrade.status == "OPEN").limit(1))
+        if existing:
+            return
+        opened_trades = db.scalars(select(PaperTrade).where(PaperTrade.status == "OPEN")).all()
+        used_margin = sum(t.margin_used for t in opened_trades)
+        realized = db.scalar(select(func.coalesce(func.sum(PaperTrade.net_pnl), 0)).where(PaperTrade.status == "CLOSED")) or 0
+        capital = max(0.0, float(cfg["capital_usdt"]) + float(realized))
+        free_capital = max(0.0, capital - used_margin)
+        max_margin = capital * float(cfg["max_margin_pct"]) / 100
+        margin = min(capital * float(cfg["risk_pct"]) / 100 / max(float(cfg["stop_pct"]) / 100, 0.0001), max_margin, free_capital)
+        leverage = max(1.0, min(float(cfg["max_leverage"]), float(obs.leverage or 1.0)))
+        notional = margin * leverage
+        notional = min(notional, capital * 0.25)
+        if notional < 5 or margin <= 0:
+            return
+        quantity = notional / mark
+        stop_frac = float(cfg["stop_pct"]) / 100
+        target_frac = float(cfg["target_pct"]) / 100
+        if obs.side == "LONG":
+            stop = mark * (1 - stop_frac)
+            target = mark * (1 + target_frac)
+        else:
+            stop = mark * (1 + stop_frac)
+            target = mark * (1 - target_frac)
+        db.add(PaperTrade(
+            source_key=source_key, trader_id=obs.trader_id, trader_name=trader_name,
+            symbol=obs.symbol, side=obs.side, status="OPEN",
+            entry_price=mark, mark_price=mark, quantity=quantity, notional=notional,
+            margin_used=margin, leverage=leverage, stop_price=stop, target_price=target,
+            raw_json=json.dumps({"leader_entry": obs.entry_price, "leader_mark": obs.mark_price, "adverse_pct": ((obs.entry_price-mark)/obs.entry_price*100 if obs.side=="LONG" else (mark-obs.entry_price)/obs.entry_price*100), "funding_rate_at_entry": market.get("funding_rate")}, default=str)
+        ))
+        db.commit()
+
+async def evaluate_open_paper_trades() -> None:
+    with SessionLocal() as db:
+        trades = db.scalars(select(PaperTrade).where(PaperTrade.status == "OPEN").limit(200)).all()
+        symbols = sorted({t.symbol for t in trades})
+    prices = {}
+    for symbol in symbols:
+        try:
+            premium, _ = await binance_get("/fapi/v1/premiumIndex", {"symbol": symbol})
+            prices[symbol] = safe_float(premium.get("markPrice"))
+        except Exception as exc:
+            log_check("paper_mark_price", False, None, None, f"{symbol}: {str(exc)[:200]}")
+    cfg = paper_config()
+    with SessionLocal() as db:
+        trades = db.scalars(select(PaperTrade).where(PaperTrade.status == "OPEN")).all()
+        for trade in trades:
+            mark = prices.get(trade.symbol)
+            if mark is None or mark <= 0:
+                continue
+            trade.mark_price = mark
+            directional = 1 if trade.side == "LONG" else -1
+            trade.gross_pnl = directional * (mark - trade.entry_price) * trade.quantity
+            fee_cost = trade.notional * (float(cfg["taker_fee_pct"]) / 100) * 2
+            slip_cost = trade.notional * (float(cfg["slippage_pct"]) / 100) * 2
+            trade.estimated_costs = fee_cost + slip_cost
+            trade.net_pnl = trade.gross_pnl - trade.estimated_costs
+            hit_stop = mark <= trade.stop_price if trade.side == "LONG" else mark >= trade.stop_price
+            hit_target = mark >= trade.target_price if trade.side == "LONG" else mark <= trade.target_price
+            if hit_stop or hit_target:
+                trade.status = "CLOSED"
+                trade.exit_price = mark
+                trade.exit_reason = "STOP_LOSS" if hit_stop else "TARGET"
+                trade.closed_at = now()
+        db.commit()
+
+@app.get("/api/opportunities")
+async def api_opportunities(limit: int = 100):
+    limit = max(1, min(limit, 200))
+    with SessionLocal() as db:
+        observations = db.scalars(select(PositionObservation).order_by(desc(PositionObservation.id)).limit(500)).all()
+        traders = {t.trader_id: t.name for t in db.scalars(select(Trader)).all()}
+        snapshots = {s.id: s for s in db.scalars(select(PositionSnapshot).where(PositionSnapshot.id.in_([o.snapshot_id for o in observations])).all())} if observations else {}
+    latest = {}
+    for obs in observations:
+        key = f"{obs.trader_id}|{obs.position_key}"
+        if key not in latest:
+            latest[key] = obs
+    news = await fetch_news_items()
+    result = []
+    for obs in list(latest.values())[:limit]:
+        snapshot = snapshots.get(obs.snapshot_id)
+        result.append(await build_opportunity(obs, snapshot.observed_at.isoformat() if snapshot else None, traders.get(obs.trader_id), news))
+    # Ensure paper marks and open/close checks continue as the intelligence page is used.
+    await evaluate_open_paper_trades()
+    return sorted(result, key=lambda x: (x["qualified"], x["adverse_pct"] or 0), reverse=True)
+
+@app.get("/api/paper")
+async def api_paper():
+    await evaluate_open_paper_trades()
+    cfg = paper_config()
+    with SessionLocal() as db:
+        trades = db.scalars(select(PaperTrade).order_by(desc(PaperTrade.opened_at)).limit(300)).all()
+    open_trades = [t for t in trades if t.status == "OPEN"]
+    closed_trades = [t for t in trades if t.status == "CLOSED"]
+    realized = sum(t.net_pnl for t in closed_trades)
+    unrealized = sum(t.net_pnl for t in open_trades)
+    deployed_margin = sum(t.margin_used for t in open_trades)
+    return {
+        "config": cfg, "capital": cfg["capital_usdt"], "realized_pnl": round(realized, 4),
+        "unrealized_pnl": round(unrealized, 4), "equity": round(float(cfg["capital_usdt"]) + realized + unrealized, 4),
+        "deployed_margin": round(deployed_margin, 4), "free_capital": round(max(0, float(cfg["capital_usdt"]) + realized - deployed_margin), 4),
+        "open_count": len(open_trades), "closed_count": len(closed_trades),
+        "trades": [{
+            "id": t.id, "trader_id": t.trader_id, "trader_name": t.trader_name, "symbol": t.symbol, "side": t.side,
+            "status": t.status, "entry_price": t.entry_price, "mark_price": t.mark_price, "exit_price": t.exit_price,
+            "quantity": t.quantity, "notional": t.notional, "margin_used": t.margin_used, "leverage": t.leverage,
+            "stop_price": t.stop_price, "target_price": t.target_price, "gross_pnl": t.gross_pnl,
+            "estimated_costs": t.estimated_costs, "net_pnl": t.net_pnl, "exit_reason": t.exit_reason,
+            "opened_at": t.opened_at.isoformat(), "closed_at": t.closed_at.isoformat() if t.closed_at else None
+        } for t in trades]
+    }
+
+@app.post("/api/paper/settings")
+async def update_paper_settings(request: Request):
+    body = await request.json()
+    cfg = paper_config()
+    for key in ["capital_usdt", "risk_pct", "max_margin_pct", "target_pct", "stop_pct", "taker_fee_pct", "slippage_pct", "max_leverage", "min_adverse_pct"]:
+        if key in body:
+            val = safe_float(body[key])
+            if val is None or val < 0:
+                raise HTTPException(400, f"Invalid value for {key}")
+            cfg[key] = val
+    if "auto_enabled" in body:
+        cfg["auto_enabled"] = bool(body["auto_enabled"])
+    cfg["capital_usdt"] = max(0.0, min(float(cfg["capital_usdt"]), 100000000))
+    cfg["risk_pct"] = min(float(cfg["risk_pct"]), 5.0)
+    cfg["max_margin_pct"] = min(float(cfg["max_margin_pct"]), 100.0)
+    cfg["target_pct"] = min(float(cfg["target_pct"]), 20.0)
+    cfg["stop_pct"] = min(max(float(cfg["stop_pct"]), 0.05), 20.0)
+    cfg["taker_fee_pct"] = min(float(cfg["taker_fee_pct"]), 2.0)
+    cfg["slippage_pct"] = min(float(cfg["slippage_pct"]), 2.0)
+    cfg["max_leverage"] = min(max(float(cfg["max_leverage"]), 1.0), 5.0)
+    cfg["min_adverse_pct"] = min(max(float(cfg["min_adverse_pct"]), 0.05), 20.0)
+    set_setting("paper_config", cfg)
+    return {"saved": True, "config": cfg}
+
+@app.get("/api/system")
+async def api_system():
+    metrics = db_metrics()
+    with SessionLocal() as db:
+        counts = {}
+        for table_name, model in [
+            ("traders", Trader), ("position_snapshots", PositionSnapshot),
+            ("position_observations", PositionObservation), ("history_positions", HistoryPosition),
+            ("paper_trades", PaperTrade), ("source_checks", SourceCheck)
+        ]:
+            try:
+                counts[table_name] = db.scalar(select(func.count()).select_from(model)) or 0
+            except Exception:
+                counts[table_name] = 0
+    return {
+        "database": metrics, "counts": counts,
+        "monitor": {**last_scan, "worker_alive": worker_alive, "interval_seconds": DISCOVERY_INTERVAL, "batch": POSITION_BATCH},
+        "provider": {
+            "kopyon_key_configured": bool(KOPYON_KEY), "kopyon_base": KOPYON_ROOT,
+            "binance_public_market_data": BINANCE_ROOT, "browser_token_required": False
+        },
+        "runtime": {
+            "python_env": os.getenv("PYTHON_VERSION", "Render default"),
+            "mode": os.getenv("LAES_MODE", "paper"),
+            "execution_enabled": False,
+            "render_free_sleep_warning": "Render Free web services sleep after 15 minutes without inbound traffic; the in-process monitor pauses while sleeping."
+        }
+    }
+
+@app.post("/api/sync/now")
+async def sync_now():
+    global last_manual_sync
+    if time.time() - last_manual_sync < 300:
+        raise HTTPException(429, "A monitor cycle ran recently. Automatic cadence is 30 minutes to protect the Kopyon free-tier request budget.")
+    return await run_monitor_cycle(force=True)
+
+@app.get("/api/news")
+async def api_news(symbol: str = ""):
+    items = await fetch_news_items()
+    return {"source": "CoinDesk RSS", "items": find_news_for_symbol(symbol, items) if symbol else items[:40], "warning": "Headline timing is context only; LAES does not claim a headline caused a particular price move.", "feed_error": news_cache.get("error")}
+
+@app.get("/api/market/{symbol}")
+async def api_market(symbol: str, refresh: bool = False):
+    symbol = symbol.upper()
+    if not symbol.isalnum():
+        raise HTTPException(400, "Invalid symbol")
+    try:
+        return await market_features(symbol, refresh=refresh)
+    except Exception as exc:
+        raise HTTPException(502, f"Market analysis unavailable: {str(exc)[:400]}")
+
+@app.get("/api/status")
+async def api_status():
+    return await api_overview()
