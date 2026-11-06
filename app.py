@@ -1407,52 +1407,158 @@ async def build_opportunity(obs: PositionObservation, snapshot_time: str | None,
     raw = parse_json(obs.raw_json)
     entry = obs.entry_price
     try:
-        market = await market_features(obs.symbol)
+        market = await market_features(obs.symbol, allow_stale=True)
     except Exception as exc:
-        market = {"symbol": obs.symbol, "error": str(exc)[:220], "source": "Binance market data unavailable"}
-    mark = safe_float(market.get("mark_price")) or obs.mark_price
+        market = {
+            "symbol": obs.symbol, "error": str(exc)[:220],
+            "market_data_fresh": False, "market_data_status": "UNAVAILABLE",
+            "source": "Binance market data unavailable"
+        }
+
+    market_age = safe_float(market.get("cache_age_seconds"))
+    market_fresh = bool(market.get("market_data_fresh"))
+    live = live_market_overlay(obs.symbol)
+    live_mark = safe_float(live.get("price")) if live.get("fresh") else None
+    cached_mark = safe_float(market.get("mark_price")) if market_fresh else None
+    mark = live_mark or cached_mark or obs.mark_price
+    mark_source = "BINANCE_WS" if live_mark else ("BINANCE_METADATA_CACHE" if cached_mark else "LAST_KOPYON_SNAPSHOT")
+
+    snapshot_age = None
+    if snapshot_time:
+        try:
+            observed = datetime.fromisoformat(snapshot_time.replace("Z", "+00:00"))
+            if observed.tzinfo is None:
+                observed = observed.replace(tzinfo=timezone.utc)
+            snapshot_age = max(0.0, (now() - observed).total_seconds())
+        except Exception:
+            snapshot_age = None
+    leader_snapshot_fresh = snapshot_age is not None and snapshot_age <= 600.0
+
+    with SessionLocal() as db:
+        latest_leader_snapshot = db.scalar(
+            select(PositionSnapshot)
+            .where(PositionSnapshot.trader_id == obs.trader_id)
+            .order_by(desc(PositionSnapshot.id))
+            .limit(1)
+        )
+    leader_snapshot_current = bool(
+        latest_leader_snapshot
+        and not latest_leader_snapshot.hidden
+        and latest_leader_snapshot.id == obs.snapshot_id
+    )
+
     adverse = None
     if entry and mark and entry > 0:
-        adverse = ((entry - mark) / entry * 100) if obs.side == "LONG" else ((mark - entry) / entry * 100)
-    underwater = (obs.unrealized_pnl is not None and obs.unrealized_pnl < 0) or (adverse is not None and adverse > 0)
+        adverse = (
+            (entry - mark) / entry * 100
+            if obs.side == "LONG"
+            else (mark - entry) / entry * 100
+        )
+
+    live_leader_pnl = None
+    if live_mark and entry and obs.size is not None:
+        direction = 1.0 if obs.side == "LONG" else -1.0
+        live_leader_pnl = direction * (float(live_mark) - float(entry)) * abs(float(obs.size))
+    leader_pnl = live_leader_pnl if live_leader_pnl is not None else obs.unrealized_pnl
+    underwater = bool(leader_pnl is not None and leader_pnl < 0) or bool(adverse is not None and adverse > 0)
+
     cfg = paper_config()
-    momentum = safe_float(market.get("momentum_5m_pct"))
-    confirmation = momentum is not None and ((momentum > 0) if obs.side == "LONG" else (momentum < 0))
+    cached_momentum = safe_float(market.get("momentum_5m_pct")) if market_fresh else None
+    live_momentum = safe_float(live.get("momentum_5m_pct")) if live.get("momentum_fresh") else None
+    momentum = live_momentum if live_momentum is not None else cached_momentum
+    confirmation = momentum is not None and (
+        (momentum > 0) if obs.side == "LONG" else (momentum < 0)
+    )
     min_adverse = float(cfg["min_adverse_pct"])
+
     quote_volume = safe_float(market.get("quote_volume_24h_usdt"))
     spread_pct = safe_float(market.get("spread_pct"))
     funding_rate = safe_float(market.get("funding_rate"))
     atr_quality = safe_float(market.get("atr_24h_pct"))
-    dead_market_reasons = []
-    if quote_volume is None or quote_volume < 5_000_000:
-        dead_market_reasons.append("24h quote volume below $5M or unavailable")
-    if spread_pct is None or spread_pct > 0.10:
-        dead_market_reasons.append("spread above 0.10% or unavailable")
     depth_usdt = safe_float(market.get("min_depth_within_1pct_usdt"))
-    if depth_usdt is None or depth_usdt < 10000:
-        dead_market_reasons.append("top-20 order-book depth within 1% below $10K or unavailable")
     volume_ratio = safe_float(market.get("volume_ratio_recent_6h_vs_prior_24h"))
-    if volume_ratio is None or volume_ratio < 0.30:
-        dead_market_reasons.append("recent 6h volume below 30% of prior 24h hourly baseline or unavailable")
-    if atr_quality is None or atr_quality < 0.02 or atr_quality > 8.0:
-        dead_market_reasons.append("volatility too low or disorderly")
-    if funding_rate is not None and ((obs.side == "LONG" and funding_rate > 0.0005) or (obs.side == "SHORT" and funding_rate < -0.0005)):
-        dead_market_reasons.append("funding cost is unusually adverse for this side")
-    market_quality_ok = not dead_market_reasons
-    qualified = bool(underwater and adverse is not None and adverse >= min_adverse and confirmation and market_quality_ok)
-    status = "QUALIFIED" if qualified else ("DEAD / COSTLY MARKET" if underwater and not market_quality_ok else ("UNDERWATER WATCH" if underwater else "NOT UNDERWATER"))
-    with SessionLocal() as db:
-        latest_leader_snapshot = db.scalar(select(PositionSnapshot).where(
-            PositionSnapshot.trader_id == obs.trader_id
-        ).order_by(desc(PositionSnapshot.id)).limit(1))
-    leader_snapshot_current = bool(latest_leader_snapshot and not latest_leader_snapshot.hidden and latest_leader_snapshot.id == obs.snapshot_id)
+
+    # Only known, fresh threshold violations are "dead/costly". Missing or stale
+    # fields are data-quality blockers, not evidence that the coin itself is dead.
+    dead_market_reasons = []
+    market_data_gaps = []
+    if not market_fresh:
+        if market_age is None:
+            market_data_gaps.append("No cached Binance liquidity/volatility snapshot")
+        else:
+            market_data_gaps.append(f"Binance liquidity/volatility snapshot is {market_age / 60:.1f} minutes old")
+    for field, label in [
+        (quote_volume, "24h quote volume"),
+        (spread_pct, "spread"),
+        (depth_usdt, "top-20 depth within 1%"),
+        (volume_ratio, "recent 6h volume ratio"),
+        (atr_quality, "24h ATR")
+    ]:
+        if field is None:
+            market_data_gaps.append(f"{label} is unavailable")
+    if market_fresh:
+        if quote_volume is not None and quote_volume < 5_000_000:
+            dead_market_reasons.append("24h quote volume below 5 million USDT")
+        if spread_pct is not None and spread_pct > 0.10:
+            dead_market_reasons.append("spread above 0.10%")
+        if depth_usdt is not None and depth_usdt < 10000:
+            dead_market_reasons.append("top-20 order-book depth within 1% below 10,000 USDT")
+        if volume_ratio is not None and volume_ratio < 0.30:
+            dead_market_reasons.append("recent 6h volume below 30% of prior 24h hourly baseline")
+        if atr_quality is not None and (atr_quality < 0.02 or atr_quality > 8.0):
+            dead_market_reasons.append("volatility too low or disorderly")
+        if funding_rate is not None and (
+            (obs.side == "LONG" and funding_rate > 0.0005)
+            or (obs.side == "SHORT" and funding_rate < -0.0005)
+        ):
+            dead_market_reasons.append("funding cost is unusually adverse for this side")
+
+    market_quality_ok = bool(market_fresh and not market_data_gaps and not dead_market_reasons)
+    qualification_reasons = []
     if not leader_snapshot_current:
-        qualified = False
-        status = "LEADER POSITIONS HIDDEN" if latest_leader_snapshot and latest_leader_snapshot.hidden else "POSITION NOT IN LATEST LEADER SNAPSHOT"
+        qualification_reasons.append("Exact leader position is not in the latest visible Kopyon snapshot")
+    elif not leader_snapshot_fresh:
+        qualification_reasons.append("Leader position snapshot is older than 10 minutes")
+    if not underwater:
+        qualification_reasons.append("Leader is not currently underwater on the freshest available mark")
+    if adverse is None:
+        qualification_reasons.append("Adverse excursion cannot be calculated")
+    elif adverse < min_adverse:
+        qualification_reasons.append(f"Adverse excursion {adverse:.3f}% is below {min_adverse:.3f}%")
+    if not confirmation:
+        qualification_reasons.append("No fresh same-direction 5-minute momentum confirmation")
+    if market_data_gaps:
+        qualification_reasons.extend(market_data_gaps)
+    if dead_market_reasons:
+        qualification_reasons.extend(dead_market_reasons)
+
+    qualified = bool(
+        leader_snapshot_current and leader_snapshot_fresh and underwater
+        and adverse is not None and adverse >= min_adverse
+        and confirmation and market_quality_ok
+    )
+
+    if not leader_snapshot_current:
+        status = "LEADER POSITION NOT IN LATEST SNAPSHOT"
+    elif not leader_snapshot_fresh:
+        status = "LEADER SNAPSHOT STALE"
+    elif not market_fresh or market_data_gaps:
+        status = "MARKET DATA STALE / UNVERIFIED"
+    elif underwater and dead_market_reasons:
+        status = "DEAD / COSTLY MARKET"
+    elif not underwater:
+        status = "NOT UNDERWATER"
+    elif adverse is None or adverse < min_adverse:
+        status = "BELOW MINIMUM ADVERSE MOVE"
+    elif not confirmation:
+        status = "WAITING FOR SAME-SIDE MOMENTUM"
+    else:
+        status = "QUALIFIED"
+
     causes = []
-    week = safe_float(market.get("seven_day_return_pct"))
-    day = safe_float(market.get("twenty_four_hour_return_pct"))
-    atr = safe_float(market.get("atr_24h_pct"))
+    week = safe_float(market.get("seven_day_return_pct")) if market_fresh else None
+    day = safe_float(market.get("twenty_four_hour_return_pct")) if market_fresh else None
+    atr = safe_float(market.get("atr_24h_pct")) if market_fresh else None
     if week is not None:
         against = (week < 0) if obs.side == "LONG" else (week > 0)
         causes.append({"type": "market_trend", "label": f"7-day market return {week:+.2f}%", "effect": "Against position" if against else "With position", "risk": "adverse" if against else "supportive"})
@@ -1461,74 +1567,114 @@ async def build_opportunity(obs: PositionObservation, snapshot_time: str | None,
         causes.append({"type": "short_term", "label": f"24-hour market return {day:+.2f}%", "effect": "Against position" if against else "With position", "risk": "adverse" if against else "supportive"})
     if atr is not None:
         causes.append({"type": "volatility", "label": f"24-hour ATR / price {atr:.2f}%", "effect": "Elevated volatility" if atr >= 1.5 else "Normal-to-moderate volatility", "risk": "warning" if atr >= 1.5 else "neutral"})
+    if live.get("fresh"):
+        causes.append({
+            "type": "live_mark", "label": f"Binance WebSocket mark age {live.get('age_seconds', 0):.1f}s",
+            "effect": "Live market mark", "risk": "supportive"
+        })
     matched_news = find_news_for_symbol(obs.symbol, news)
     causes.extend([{"type": "news_context", "label": item["title"], "effect": "Contemporaneous headline; not proof of causation", "url": item["url"], "published_at": item["published_at"], "risk": "context"} for item in matched_news])
+
     recovery = recovery_statistics(obs.trader_id, obs.position_key, obs.symbol, obs.side, entry)
     hold = holding_time(obs.trader_id, obs.position_key, raw, snapshot_time)
-    if qualified and cfg.get("auto_enabled"):
-        create_paper_trade(obs, trader_name, mark or entry or 0, cfg, market)
+    paper_entry = {"created": False, "reason": None, "trade_id": None}
+    if qualified:
+        if cfg.get("auto_enabled"):
+            paper_entry = create_paper_trade(obs, trader_name, mark or entry or 0, cfg, market)
+        else:
+            paper_entry = {"created": False, "reason": "Automatic paper entries are disabled in paper settings.", "trade_id": None}
+    if qualified and not paper_entry.get("created"):
+        status = "QUALIFIED - PAPER ENTRY BLOCKED"
+
     return {
         "trader_id": obs.trader_id, "trader_name": trader_name or obs.trader_id,
         "position_key": obs.position_key, "symbol": obs.symbol, "side": obs.side,
-        "entry_price": entry, "mark_price": mark, "adverse_pct": round(adverse, 3) if adverse is not None else None,
-        "unrealized_pnl": obs.unrealized_pnl, "roi": obs.roi, "leverage": obs.leverage,
-        "margin_mode": obs.margin_mode, "liquidation_price": obs.liquidation_price,
-        "observed_at": snapshot_time, "underwater": underwater, "qualified": qualified,
-        "status": status, "momentum_5m_pct": momentum, "market": market,
-        "market_quality_ok": market_quality_ok, "dead_market_reasons": dead_market_reasons,
+        "entry_price": entry, "mark_price": mark, "mark_source": mark_source,
+        "live_mark_age_seconds": round(live["age_seconds"], 1) if live.get("age_seconds") is not None else None,
+        "live_mark_fresh": bool(live.get("fresh")),
+        "adverse_pct": round(adverse, 3) if adverse is not None else None,
+        "unrealized_pnl": leader_pnl, "kopyon_unrealized_pnl": obs.unrealized_pnl,
+        "roi": obs.roi, "leverage": obs.leverage, "margin_mode": obs.margin_mode,
+        "liquidation_price": obs.liquidation_price, "observed_at": snapshot_time,
+        "leader_snapshot_age_seconds": round(snapshot_age, 1) if snapshot_age is not None else None,
+        "underwater": underwater, "qualified": qualified, "status": status,
+        "momentum_5m_pct": momentum, "market": market,
+        "market_quality_ok": market_quality_ok, "market_data_fresh": market_fresh,
+        "market_data_status": market.get("market_data_status", "UNAVAILABLE"),
+        "market_data_age_seconds": market_age,
+        "dead_market_reasons": dead_market_reasons, "market_data_gaps": market_data_gaps,
+        "qualification_reasons": qualification_reasons, "paper_entry": paper_entry,
         "leader_snapshot_current": leader_snapshot_current,
         "recovery": recovery, "holding": hold, "likely_causes": causes,
         "news_context_count": len(matched_news),
         "recovery_warning": "Market trend/news are contextual risk factors, not a deterministic cause or guarantee of recovery."
     }
 
-def create_paper_trade(obs: PositionObservation, trader_name: str | None, mark: float, cfg: dict, market: dict) -> None:
+
+def create_paper_trade(obs: PositionObservation, trader_name: str | None, mark: float, cfg: dict, market: dict) -> dict:
     if mark <= 0 or not obs.entry_price or obs.entry_price <= 0:
-        return
+        return {"created": False, "reason": "No valid simulated entry price.", "trade_id": None}
+    if not market.get("market_data_fresh"):
+        return {"created": False, "reason": "Fresh liquidity/volatility metadata is not available.", "trade_id": None}
+
     source_key = f"{obs.trader_id}|{obs.position_key}"
     with SessionLocal() as db:
-        # Re-entry is allowed only against a fresh, visible Kopyon snapshot containing
-        # this exact leader position. Hidden/empty/stale snapshots never authorize entry.
-        latest_snapshot = db.scalar(select(PositionSnapshot).where(
-            PositionSnapshot.trader_id == obs.trader_id
-        ).order_by(desc(PositionSnapshot.id)).limit(1))
+        latest_snapshot = db.scalar(
+            select(PositionSnapshot)
+            .where(PositionSnapshot.trader_id == obs.trader_id)
+            .order_by(desc(PositionSnapshot.id))
+            .limit(1)
+        )
         if latest_snapshot is None or latest_snapshot.hidden or latest_snapshot.id != obs.snapshot_id:
-            return
-        existing = db.scalar(select(PaperTrade.id).where(PaperTrade.source_key == source_key, PaperTrade.status == "OPEN").limit(1))
+            return {"created": False, "reason": "Exact leader position is not in the latest visible snapshot.", "trade_id": None}
+
+        existing = db.scalar(
+            select(PaperTrade.id)
+            .where(PaperTrade.source_key == source_key, PaperTrade.status == "OPEN")
+            .limit(1)
+        )
         if existing:
-            return
-        prior = db.scalars(select(PaperTrade).where(PaperTrade.source_key == source_key).order_by(desc(PaperTrade.opened_at))).all()
+            return {"created": False, "reason": f"Paper trade #{existing} is already open for this exact leader position.", "trade_id": None}
+
+        prior = db.scalars(
+            select(PaperTrade)
+            .where(PaperTrade.source_key == source_key)
+            .order_by(desc(PaperTrade.opened_at))
+        ).all()
         if len(prior) >= 5:
-            return
+            return {"created": False, "reason": "Maximum five paper attempts for this exact leader position have been reached.", "trade_id": None}
         if prior:
             previous_raw = parse_json(prior[0].raw_json)
             if previous_raw.get("leader_snapshot_id") == obs.snapshot_id:
-                return
+                return {"created": False, "reason": "This exact leader snapshot has already been paper-tested; waiting for a fresh leader update.", "trade_id": None}
             previous_close = prior[0].closed_at
             if previous_close and previous_close.tzinfo is None:
                 previous_close = previous_close.replace(tzinfo=timezone.utc)
-            if previous_close and (now() - previous_close).total_seconds() < 180:
-                return
+            if previous_close:
+                cooldown = 180.0 - (now() - previous_close).total_seconds()
+                if cooldown > 0:
+                    return {"created": False, "reason": f"Re-entry cooldown has {cooldown:.0f}s remaining.", "trade_id": None}
+
         opened_trades = db.scalars(select(PaperTrade).where(PaperTrade.status == "OPEN")).all()
         used_margin = sum(t.margin_used for t in opened_trades)
-        realized = db.scalar(select(func.coalesce(func.sum(PaperTrade.net_pnl), 0)).where(PaperTrade.status == "CLOSED")) or 0
+        realized = db.scalar(
+            select(func.coalesce(func.sum(PaperTrade.net_pnl), 0))
+            .where(PaperTrade.status == "CLOSED")
+        ) or 0
         capital = max(0.0, float(cfg["capital_usdt"]) + float(realized))
         free_capital = max(0.0, capital - used_margin)
         max_margin = capital * float(cfg["max_margin_pct"]) / 100
         max_total_margin = capital * float(cfg["max_total_margin_pct"]) / 100
         remaining_portfolio_margin = max(0.0, max_total_margin - used_margin)
         base_margin = capital * float(cfg["risk_pct"]) / 100 / max(float(cfg["stop_pct"]) / 100, 0.0001)
-        # Research mode intentionally takes every qualifying opportunity. It does not
-        # silently discard signals because earlier paper trades consumed the wallet.
-        # The margin/notional of each individual simulation remains bounded.
         margin = min(base_margin, max_margin)
         if not bool(cfg.get("research_unconstrained", True)):
             margin = min(margin, free_capital, remaining_portfolio_margin)
         leverage = max(1.0, min(float(cfg["max_leverage"]), float(obs.leverage or 1.0)))
-        notional = margin * leverage
-        notional = min(notional, capital * 0.25)
+        notional = min(margin * leverage, capital * 0.25)
         if notional < 5 or margin <= 0:
-            return
+            return {"created": False, "reason": f"Simulated notional {notional:.2f} USDT is below the 5 USDT minimum or margin is unavailable.", "trade_id": None}
+
         quantity = notional / mark
         stop_frac = float(cfg["stop_pct"]) / 100
         target_frac = float(cfg["target_pct"]) / 100
@@ -1538,7 +1684,8 @@ def create_paper_trade(obs: PositionObservation, trader_name: str | None, mark: 
         else:
             stop = mark * (1 + stop_frac)
             target = mark * (1 - target_frac)
-        db.add(PaperTrade(
+
+        trade = PaperTrade(
             source_key=source_key, trader_id=obs.trader_id, trader_name=trader_name,
             symbol=obs.symbol, side=obs.side, status="OPEN",
             entry_price=mark, mark_price=mark, quantity=quantity, notional=notional,
@@ -1553,6 +1700,9 @@ def create_paper_trade(obs: PositionObservation, trader_name: str | None, mark: 
                 "funding_history_verified": False,
                 "funding_audit_status": "PENDING_VERIFICATION",
                 "data_quality_status": "CONTINUOUS",
+                "market_data_fetched_at": market.get("fetched_at"),
+                "market_data_age_seconds_at_entry": market.get("cache_age_seconds"),
+                "entry_mark_source": "BINANCE_WS_OR_FRESH_BINANCE_MARKET_DATA",
                 "mfe_net_pnl": 0.0,
                 "mae_net_pnl": 0.0,
                 "mfe_pct": 0.0,
@@ -1560,8 +1710,12 @@ def create_paper_trade(obs: PositionObservation, trader_name: str | None, mark: 
                 "max_data_gap_seconds": 0.0,
                 "meaningful_profit_hits": {}
             }, separators=(",", ":"), default=str)
-        ))
+        )
+        db.add(trade)
+        db.flush()
+        trade_id = trade.id
         db.commit()
+        return {"created": True, "reason": "Paper entry created from a fresh leader snapshot and verified market-quality data.", "trade_id": trade_id}
 
 async def _mark_prices(symbols: list[str]) -> dict[str, float]:
     """Single bulk REST safety net. Never fan out into one request per symbol."""
