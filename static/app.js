@@ -147,11 +147,14 @@ async function loadPaper(){
    const quality=t.data_quality_status==="INFORMATION_CUTOFF"?"INFORMATION CUTOFF":
      t.data_quality_status==="DATA_INTERRUPTED_REVIEW"?"DATA INTERRUPTED":
      t.data_quality_status==="PATH_NOT_RECORDED"?"PATH NOT RECORDED":"";
+   const monitor=t.monitoring_status==="RESUMED_AFTER_GAP"?"FEED RESUMED · HISTORICAL GAP RETAINED":
+     t.monitoring_status==="INTERRUPTED"?"WAITING FOR 3 FRESH PRICES":"";
    const funding=t.funding_history_verified===true?"FUNDING VERIFIED":
      t.funding_audit_status==="LEGACY_FUNDING_UNVERIFIED"?"LEGACY FUNDING UNKNOWN":"FUNDING PENDING";
    return '<tr class="clickable-row" onclick="openPaperTrade('+t.id+')">'+
     '<td><span class="status-tag '+(t.status==="OPEN"?"qualified":"neutral")+'">'+statusText+'</span>'+
-      (quality?'<br><small class="muted-note">'+esc(quality)+'</small>':'')+'</td>'+
+      (quality?'<br><small class="muted-note">'+esc(quality)+'</small>':'')+
+      (monitor?'<br><small class="muted-note">'+esc(monitor)+'</small>':'')+'</td>'+
     '<td><b>'+esc(t.trader_name||t.trader_id)+'</b><br><small>'+esc(t.trader_id)+'</small><br><small>Position: '+esc(t.leader_position_key||"unlinked")+'</small></td>'+
     '<td><b>'+esc(t.symbol)+'</b></td>'+
     '<td class="'+(t.side==="LONG"?"side-long":"side-short")+'">'+esc(t.side)+'</td>'+
@@ -257,6 +260,8 @@ async function refreshPaperTradeDetail(id){
    ['MAE net',money(t.mae_net_pnl)+' · '+pct(t.mae_pct)],
    ['Max saved data gap',fmt(t.max_data_gap_seconds,1)+' sec'],
    ['Data classification',t.data_quality_status||'UNCLASSIFIED'],
+   ['Current feed state',t.monitoring_status||'NOT RECORDED'],
+   ['Feed resumed at',date(t.monitoring_resumed_at)],
    ['Last Binance mark',date(t.last_binance_price_at)]
   ].map(x=>'<div class="profile-metric"><small>'+esc(x[0])+'</small><b>'+esc(x[1])+'</b></div>').join('')+'</div>';
   html+='<div class="analysis-box"><h4>LINKED LEADER POSITION</h4>'+
