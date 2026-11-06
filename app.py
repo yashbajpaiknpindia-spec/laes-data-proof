@@ -265,6 +265,8 @@ def paper_config() -> dict:
         "max_margin_pct": 10.0,
         "max_total_margin_pct": 100.0,
         "research_unconstrained": True,
+        "shadow_max_total_margin_pct": 40.0,
+        "shadow_max_positions_per_symbol_direction": 1,
         "path_sample_seconds": 5.0,
         "meaningful_profit_steps": [0.10, 0.20, 0.30, 0.50, 0.70, 1.00],
         "target_pct": 0.70,
@@ -1602,6 +1604,11 @@ async def api_paper():
     cfg = paper_config()
     with SessionLocal() as db:
         trades = db.scalars(select(PaperTrade).order_by(desc(PaperTrade.opened_at)).limit(300)).all()
+        # The shadow portfolio replays the complete paper history, separately from
+        # the newest 300 rows shown in the visible ledger.
+        shadow_trades = db.scalars(
+            select(PaperTrade).order_by(PaperTrade.opened_at, PaperTrade.id)
+        ).all()
         gap_rows = db.execute(
             select(PaperTradePath.paper_trade_id, func.max(PaperTradePath.data_gap_seconds))
             .group_by(PaperTradePath.paper_trade_id)
@@ -1644,6 +1651,132 @@ async def api_paper():
             group[key] = round(group[key], 8)
     correlated_groups = [group for group in concentrations if group["open_count"] > 1]
 
+    # Counterfactual shadow portfolio: replay every recorded research entry in time
+    # order, but accept only positions that fit a fixed margin cap and the configured
+    # maximum simultaneous positions per underlying symbol/direction. This NEVER
+    # changes, suppresses, or closes any research PaperTrade row.
+    def _shadow_utc(value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    shadow_capital = max(0.0, float(cfg["capital_usdt"]))
+    shadow_margin_cap_pct = min(
+        100.0, max(5.0, float(cfg.get("shadow_max_total_margin_pct", 40.0)))
+    )
+    shadow_margin_cap = shadow_capital * shadow_margin_cap_pct / 100.0
+    shadow_symbol_limit = min(
+        5, max(1, int(float(cfg.get("shadow_max_positions_per_symbol_direction", 1))))
+    )
+    shadow_now = now()
+    shadow_active: list[dict] = []
+    shadow_selected: list[PaperTrade] = []
+    shadow_skipped_correlated = 0
+    shadow_skipped_margin = 0
+
+    for candidate in shadow_trades:
+        opened_at = _shadow_utc(candidate.opened_at)
+        if opened_at is None or opened_at > shadow_now:
+            continue
+
+        # Free shadow capital only when a previously selected trade had actually
+        # closed by this candidate's entry timestamp.
+        still_active = []
+        for active in shadow_active:
+            closed_at = active["closed_at"]
+            if closed_at is not None and closed_at <= opened_at:
+                continue
+            still_active.append(active)
+        shadow_active = still_active
+
+        symbol_key = (candidate.symbol.upper(), candidate.side.upper())
+        same_direction_open = sum(
+            1 for active in shadow_active if active["symbol_key"] == symbol_key
+        )
+        if same_direction_open >= shadow_symbol_limit:
+            shadow_skipped_correlated += 1
+            continue
+
+        margin = max(0.0, float(candidate.margin_used or 0.0))
+        active_margin = sum(active["margin"] for active in shadow_active)
+        if margin > shadow_margin_cap or active_margin + margin > shadow_margin_cap + 1e-9:
+            shadow_skipped_margin += 1
+            continue
+
+        close_at = _shadow_utc(candidate.closed_at) if candidate.status == "CLOSED" else None
+        shadow_selected.append(candidate)
+        shadow_active.append({
+            "trade_id": candidate.id,
+            "symbol_key": symbol_key,
+            "symbol": candidate.symbol,
+            "margin": margin,
+            "closed_at": close_at
+        })
+
+    shadow_closed = [trade for trade in shadow_selected if trade.status == "CLOSED"]
+    shadow_open = [trade for trade in shadow_selected if trade.status == "OPEN"]
+    shadow_realized = sum(float(trade.net_pnl or 0.0) for trade in shadow_closed)
+    shadow_unrealized = sum(float(trade.net_pnl or 0.0) for trade in shadow_open)
+    shadow_deployed_margin = sum(float(trade.margin_used or 0.0) for trade in shadow_open)
+    shadow_equity = shadow_capital + shadow_realized + shadow_unrealized
+    shadow_free_capital = max(0.0, shadow_equity - shadow_deployed_margin)
+    shadow_wins = sum(1 for trade in shadow_closed if float(trade.net_pnl or 0.0) > 0)
+    shadow_losses = sum(1 for trade in shadow_closed if float(trade.net_pnl or 0.0) < 0)
+    shadow_gross_wins = sum(
+        float(trade.net_pnl or 0.0) for trade in shadow_closed if float(trade.net_pnl or 0.0) > 0
+    )
+    shadow_gross_losses = sum(
+        float(trade.net_pnl or 0.0) for trade in shadow_closed if float(trade.net_pnl or 0.0) < 0
+    )
+    shadow_pf = (
+        shadow_gross_wins / abs(shadow_gross_losses)
+        if shadow_gross_losses < 0 else (None if shadow_gross_wins == 0 else None)
+    )
+    uncertain_quality = {
+        "INFORMATION_CUTOFF", "DATA_INTERRUPTED_REVIEW",
+        "PATH_NOT_RECORDED", "LEGACY_UNCLASSIFIED", "LEGACY_FUNDING_UNVERIFIED"
+    }
+    shadow_uncertain_count = sum(
+        1 for trade in shadow_selected
+        if parse_json(trade.raw_json).get("data_quality_status", "LEGACY_UNCLASSIFIED") in uncertain_quality
+    )
+    shadow_portfolio = {
+        "model": "COUNTERFACTUAL_SHADOW_PORTFOLIO",
+        "capital": round(shadow_capital, 8),
+        "margin_cap_pct": shadow_margin_cap_pct,
+        "margin_cap": round(shadow_margin_cap, 8),
+        "max_positions_per_symbol_direction": shadow_symbol_limit,
+        "deployed_margin": round(shadow_deployed_margin, 8),
+        "margin_utilization_pct": round(
+            shadow_deployed_margin / max(shadow_capital, 0.01) * 100, 4
+        ),
+        "realized_pnl": round(shadow_realized, 8),
+        "unrealized_pnl": round(shadow_unrealized, 8),
+        "equity": round(shadow_equity, 8),
+        "free_capital": round(shadow_free_capital, 8),
+        "selected_count": len(shadow_selected),
+        "selected_closed_count": len(shadow_closed),
+        "selected_open_count": len(shadow_open),
+        "skipped_correlated": shadow_skipped_correlated,
+        "skipped_margin_cap": shadow_skipped_margin,
+        "closed_wins": shadow_wins,
+        "closed_losses": shadow_losses,
+        "realized_profit_factor": round(shadow_pf, 6) if shadow_pf is not None else None,
+        "uncertain_data_quality_count": shadow_uncertain_count,
+        "uncertain_data_quality_pct": round(
+            shadow_uncertain_count / max(len(shadow_selected), 1) * 100, 2
+        ),
+        "note": (
+            "Counterfactual replay of recorded research entries/exits. It applies the configured "
+            "margin cap and symbol-direction overlap limit but does not simulate new fills, "
+            "intrabar ordering, queue priority, or alternate exits. Trades with information cutoffs, "
+            "data gaps, or legacy-unclassified paths remain uncertain. This is not a guarantee of "
+            "real-world execution or profitability."
+        )
+    }
+
     trade_rows = []
     for trade in trades:
         raw = parse_json(trade.raw_json)
@@ -1680,6 +1813,7 @@ async def api_paper():
         "free_capital": round(max(0.0, equity - deployed_margin), 8),
         "open_count": len(open_trades), "closed_count": len(closed_trades),
         "correlated_exposure_groups": correlated_groups,
+        "shadow_portfolio": shadow_portfolio,
         "risk_summary": {
             "correlated_groups": len(correlated_groups),
             "largest_shared_direction_stop_risk_usdt": max((g["estimated_stop_loss_usdt"] for g in concentrations), default=0.0),
@@ -1936,7 +2070,7 @@ async def api_paper_trade_detail(trade_id: int):
 async def update_paper_settings(request: Request):
     body = await request.json()
     cfg = paper_config()
-    for key in ["capital_usdt", "risk_pct", "max_margin_pct", "max_total_margin_pct", "research_unconstrained", "target_pct", "stop_pct", "taker_fee_pct", "slippage_pct", "max_leverage", "min_adverse_pct"]:
+    for key in ["capital_usdt", "risk_pct", "max_margin_pct", "max_total_margin_pct", "research_unconstrained", "shadow_max_total_margin_pct", "shadow_max_positions_per_symbol_direction", "target_pct", "stop_pct", "taker_fee_pct", "slippage_pct", "max_leverage", "min_adverse_pct"]:
         if key in body:
             val = safe_float(body[key])
             if val is None or val < 0:
@@ -1948,6 +2082,10 @@ async def update_paper_settings(request: Request):
     cfg["risk_pct"] = min(float(cfg["risk_pct"]), 5.0)
     cfg["max_margin_pct"] = min(float(cfg["max_margin_pct"]), 100.0)
     cfg["max_total_margin_pct"] = min(max(float(cfg["max_total_margin_pct"]), 5.0), 100.0)
+    cfg["shadow_max_total_margin_pct"] = min(max(float(cfg.get("shadow_max_total_margin_pct", 40.0)), 5.0), 100.0)
+    cfg["shadow_max_positions_per_symbol_direction"] = min(
+        max(int(float(cfg.get("shadow_max_positions_per_symbol_direction", 1))), 1), 5
+    )
     cfg["target_pct"] = min(float(cfg["target_pct"]), 20.0)
     cfg["stop_pct"] = min(max(float(cfg["stop_pct"]), 0.05), 20.0)
     cfg["taker_fee_pct"] = min(float(cfg["taker_fee_pct"]), 2.0)
