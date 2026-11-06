@@ -1472,6 +1472,28 @@ def _leader_for_trade(db, trade: PaperTrade) -> PositionObservation | None:
         PositionObservation.position_key == position_key
     ).order_by(desc(PositionObservation.id)).limit(1))
 
+def _funding_settlement_count(trade: PaperTrade, raw: dict, at: datetime | None) -> int:
+    """Count settlement boundaries after this paper entry, not before it."""
+    if at is None:
+        return 0
+    next_funding_ms = safe_float(raw.get("next_funding_time"))
+    if not next_funding_ms:
+        return 0
+    opened = trade.opened_at
+    if opened.tzinfo is None:
+        opened = opened.replace(tzinfo=timezone.utc)
+    opened_ms = opened.timestamp() * 1000
+    # MarketInsight can be cached across a funding boundary. Its nextFundingTime
+    # then points to the previous settlement; roll it forward to the first one
+    # that can actually occur after this paper trade was opened.
+    while next_funding_ms <= opened_ms:
+        next_funding_ms += 28800000
+    at_ms = at.timestamp() * 1000
+    if at_ms < next_funding_ms:
+        return 0
+    return 1 + int((at_ms - next_funding_ms) // 28800000)
+
+
 def _paper_pnl(trade: PaperTrade, mark: float, cfg: dict, raw: dict | None = None, at: datetime | None = None) -> tuple[float,float,float,float]:
     directional = 1 if trade.side == "LONG" else -1
     gross = directional * (mark - trade.entry_price) * trade.quantity
@@ -1482,20 +1504,16 @@ def _paper_pnl(trade: PaperTrade, mark: float, cfg: dict, raw: dict | None = Non
     round_trip_turnover = entry_notional + exit_notional
     fee_cost = round_trip_turnover * (float(cfg["taker_fee_pct"]) / 100)
     slip_cost = round_trip_turnover * (float(cfg["slippage_pct"]) / 100)
-    # Estimate funding from the rate captured at entry. When history is not verified,
-    # never assume a funding credit; charge only a conservative positive estimate.
+    # When funding history is unavailable, estimate only settlements that occurred
+    # after this paper entry. Never assume a funding credit: use the larger absolute
+    # entry/live rate as a conservative debit.
     raw = raw or {}
-    funding_rate = safe_float(raw.get("funding_rate_at_entry")) or 0.0
-    next_funding_ms = safe_float(raw.get("next_funding_time"))
-    funding_events = 0
-    if at and next_funding_ms and funding_rate:
-        elapsed_ms = at.timestamp() * 1000 - next_funding_ms
-        if elapsed_ms >= 0:
-            funding_events = 1 + int(elapsed_ms // 28800000)
-    estimated_funding_cost = max(
-        0.0,
-        trade.notional * funding_rate * funding_events * directional
-    )
+    entry_rate = safe_float(raw.get("funding_rate_at_entry"))
+    live_rate = safe_float(PAPER_SYMBOL_FUNDING_RATE.get(trade.symbol.upper()))
+    rate_candidates = [abs(v) for v in (entry_rate, live_rate) if v is not None]
+    funding_rate_abs = max(rate_candidates) if rate_candidates else 0.0
+    funding_events = _funding_settlement_count(trade, raw, at)
+    estimated_funding_cost = trade.notional * funding_rate_abs * funding_events
     funding_cost = safe_float(raw.get("funding_cost_actual")) if raw.get("funding_history_verified") else None
     if funding_cost is None:
         funding_cost = estimated_funding_cost
@@ -1712,6 +1730,18 @@ async def evaluate_open_paper_trades(
                 continue
             prev_check = None
             raw = parse_json(trade.raw_json)
+            # Correct a stale cached nextFundingTime against the actual paper-entry
+            # timestamp. This prevents charging a funding settlement that occurred
+            # before the simulation existed.
+            next_funding_ms_at_entry = safe_float(raw.get("next_funding_time"))
+            if next_funding_ms_at_entry:
+                opened_at = trade.opened_at
+                if opened_at.tzinfo is None:
+                    opened_at = opened_at.replace(tzinfo=timezone.utc)
+                opened_ms = opened_at.timestamp() * 1000
+                while next_funding_ms_at_entry <= opened_ms:
+                    next_funding_ms_at_entry += 28800000
+                raw["next_funding_time"] = next_funding_ms_at_entry
             if raw.get("last_binance_price_at"):
                 try:
                     prev_check = datetime.fromisoformat(raw["last_binance_price_at"].replace("Z", "+00:00"))
@@ -1881,11 +1911,44 @@ async def evaluate_open_paper_trades(
                     raw["funding_audit_status"] = "PENDING_VERIFICATION"
                     raw["funding_history_checked_at"] = ts.isoformat()
                     raw["funding_verification_error"] = str(funding_exc)[:180]
-                    db.add(PaperTradeEvent(paper_trade_id=trade.id,event_type="FUNDING_CHECK_PENDING",observed_at=ts,value=net,detail="Binance funding history unavailable; positive exits wait for verification, while a protective stop may still close using a conservative estimate."))
+                    last_pending_at = None
+                    try:
+                        if raw.get("funding_pending_event_at"):
+                            last_pending_at = datetime.fromisoformat(raw["funding_pending_event_at"].replace("Z", "+00:00"))
+                    except Exception:
+                        last_pending_at = None
+                    if last_pending_at is None or (ts - last_pending_at).total_seconds() >= 300:
+                        db.add(PaperTradeEvent(
+                            paper_trade_id=trade.id, event_type="FUNDING_CHECK_PENDING",
+                            observed_at=ts, value=net,
+                            detail="Funding history is temporarily unavailable. Live PnL includes a conservative debit estimate for settlements since entry; positive exits are allowed only when that estimated net remains positive."
+                        ))
+                        raw["funding_pending_event_at"] = ts.isoformat()
             if net > 0 and funding_verified:
                 # No minimum profit threshold: every observed positive net amount,
                 # after round-trip costs and verified funding, is realized immediately.
                 exit_reason = "PROFIT_HARVEST_NET_POSITIVE"
+            elif net > 0 and not funding_verified:
+                # Funding REST may be blocked. _paper_pnl has already deducted
+                # round-trip fees/slippage and a conservative funding debit for every
+                # settlement since entry. Harvest if that estimated net is positive;
+                # preserve the pending audit flag so actual funding can be reconciled.
+                funding_events_est = _funding_settlement_count(trade, raw, ts)
+                funding_rate_known = (
+                    safe_float(raw.get("funding_rate_at_entry")) is not None
+                    or safe_float(PAPER_SYMBOL_FUNDING_RATE.get(trade.symbol.upper())) is not None
+                )
+                funding_schedule_known = bool(safe_float(raw.get("next_funding_time")))
+                if funding_schedule_known and (funding_events_est == 0 or funding_rate_known):
+                    exit_reason = "PROFIT_HARVEST_NET_POSITIVE_FUNDING_ESTIMATED"
+                    raw["funding_audit_status"] = "PENDING_POST_CLOSE_RECONCILIATION"
+                    raw["funding_source"] = "CONSERVATIVE_ESTIMATE_PENDING_BINANCE_HISTORY"
+                    raw["funding_estimate_at_exit"] = max(0.0, costs - (
+                        (float(trade.entry_price) + float(mark)) * float(trade.quantity)
+                        * ((float(cfg["taker_fee_pct"]) + float(cfg["slippage_pct"])) / 100.0)
+                    ))
+                    raw["funding_estimate_settlement_count"] = funding_events_est
+                    raw["realized_pnl_is_estimate"] = True
             elif net <= 0 and not gap_guard and hit_stop:
                 # Leader-aware continuation: if the exact leader position is still
                 # visibly open, do not let our independent paper stop erase the
@@ -1934,9 +1997,12 @@ async def evaluate_open_paper_trades(
                     # A stale/unknown leader state never gets converted into a fake
                     # leader close. The existing protective stop remains the fallback.
                     if funding_verified:
-                        exit_reason = "STOP_LOSS"
+                        exit_reason = "LEADER_CONTINUATION_HARD_STOP" if leader_state == "OPEN_OBSERVED" else "STOP_LOSS"
                     else:
-                        exit_reason = "STOP_LOSS_FUNDING_ESTIMATED"
+                        exit_reason = (
+                            "LEADER_CONTINUATION_HARD_STOP_FUNDING_ESTIMATED"
+                            if leader_state == "OPEN_OBSERVED" else "STOP_LOSS_FUNDING_ESTIMATED"
+                        )
                         raw["funding_audit_status"] = "STOP_EXIT_USING_CONSERVATIVE_ESTIMATE"
                         funding_event_count_at_exit = 0
                         if next_funding_ms and ts.timestamp() * 1000 >= next_funding_ms:
