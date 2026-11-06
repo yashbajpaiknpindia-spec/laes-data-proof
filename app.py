@@ -4,6 +4,7 @@ import asyncio
 import json
 import math
 import os
+import re
 import statistics
 import time
 import xml.etree.ElementTree as ET
@@ -202,6 +203,21 @@ worker_alive = False
 scan_lock = asyncio.Lock()
 last_manual_sync = 0.0
 news_cache: dict[str, Any] = {"fetched_at": 0.0, "items": [], "error": None}
+
+# Binance public market data is WebSocket-first. A circuit breaker prevents repeated
+# REST fallback calls from extending exchange-side HTTP 418/429 bans.
+BINANCE_REST_BLOCKED_UNTIL = 0.0
+BINANCE_REST_BLOCK_REASON = ""
+BINANCE_REST_LAST_LIMIT_LOG_AT = 0.0
+
+PAPER_PRICE_STREAM_STATE: dict[str, Any] = {
+    "status": "starting", "connected": False, "connected_at": None,
+    "last_message_at": None, "last_price_at": None, "last_flush_at": None,
+    "messages_received": 0, "price_updates_received": 0, "reconnect_count": 0,
+    "subscribed_symbols": [], "unsupported_symbols": [], "last_error": None
+}
+PAPER_SYMBOL_LAST_UPDATE: dict[str, str] = {}
+PAPER_CANDLE_CACHE: dict[str, dict[str, Any]] = {}
 templates = Jinja2Templates(directory="templates")
 
 def now() -> datetime:
@@ -428,9 +444,51 @@ async def kopyon_get(route: str, params: dict | None = None) -> tuple[dict, int]
     log_check("kopyon", True, status, int((time.perf_counter() - started) * 1000), f"{route} responded")
     return payload, status
 
+def _binance_rate_limit_cooldown(error: Exception) -> None:
+    global BINANCE_REST_BLOCKED_UNTIL, BINANCE_REST_BLOCK_REASON, BINANCE_REST_LAST_LIMIT_LOG_AT
+    message = str(error)
+    match = re.search(r"HTTP\s+(418|429)", message)
+    if not match:
+        return
+    status = int(match.group(1))
+    current = time.time()
+    until = None
+    ban_match = re.search(r"banned until\s+(\d{13})", message, re.IGNORECASE)
+    if ban_match:
+        until = int(ban_match.group(1)) / 1000.0
+    if until is None or until <= current:
+        until = current + (3600 if status == 418 else 60)
+    if until > BINANCE_REST_BLOCKED_UNTIL:
+        BINANCE_REST_BLOCKED_UNTIL = until
+        BINANCE_REST_BLOCK_REASON = f"Binance HTTP {status}; REST calls are paused to prevent another IP ban."
+    if current - BINANCE_REST_LAST_LIMIT_LOG_AT >= 30:
+        BINANCE_REST_LAST_LIMIT_LOG_AT = current
+        log_check(
+            "binance_rest_circuit_breaker", False, status, None,
+            f"REST paused until {datetime.fromtimestamp(BINANCE_REST_BLOCKED_UNTIL, timezone.utc).isoformat()}. {message[:350]}"
+        )
+
+
+def binance_rest_status() -> dict:
+    remaining = max(0.0, BINANCE_REST_BLOCKED_UNTIL - time.time())
+    return {
+        "blocked": remaining > 0,
+        "blocked_until": datetime.fromtimestamp(BINANCE_REST_BLOCKED_UNTIL, timezone.utc).isoformat() if remaining else None,
+        "remaining_seconds": round(remaining, 1),
+        "reason": BINANCE_REST_BLOCK_REASON if remaining else None
+    }
+
+
 async def binance_get(path: str, params: dict | None = None) -> tuple[Any, int]:
+    if time.time() < BINANCE_REST_BLOCKED_UNTIL:
+        remaining = max(0.0, BINANCE_REST_BLOCKED_UNTIL - time.time())
+        raise RuntimeError(f"Binance REST circuit breaker active for {remaining:.0f}s; waiting for WebSocket feed.")
     started = time.perf_counter()
-    payload, status = await request_json(f"{BINANCE_ROOT}{path}", params=params, timeout=18)
+    try:
+        payload, status = await request_json(f"{BINANCE_ROOT}{path}", params=params, timeout=18)
+    except Exception as exc:
+        _binance_rate_limit_cooldown(exc)
+        raise
     log_check("binance_market_data", True, status, int((time.perf_counter() - started) * 1000), path)
     return payload, status
 
@@ -1241,25 +1299,26 @@ def create_paper_trade(obs: PositionObservation, trader_name: str | None, mark: 
         db.commit()
 
 async def _mark_prices(symbols: list[str]) -> dict[str, float]:
-    if not symbols:
+    """Single bulk REST safety net. Never fan out into one request per symbol."""
+    if not symbols or time.time() < BINANCE_REST_BLOCKED_UNTIL:
         return {}
     try:
         payload, _ = await binance_get("/fapi/v1/premiumIndex")
-        if isinstance(payload, list):
-            wanted = {s.upper() for s in symbols}
-            return {str(x.get("symbol","")).upper(): safe_float(x.get("markPrice")) for x in payload
-                    if isinstance(x, dict) and str(x.get("symbol","")).upper() in wanted and safe_float(x.get("markPrice"))}
-    except Exception:
-        pass
-    out = {}
-    for symbol in symbols:
-        try:
-            premium, _ = await binance_get("/fapi/v1/premiumIndex", {"symbol": symbol})
-            price = safe_float(premium.get("markPrice"))
-            if price: out[symbol] = price
-        except Exception as exc:
-            log_check("paper_mark_price", False, None, None, f"{symbol}: {str(exc)[:180]}")
-    return out
+        if not isinstance(payload, list):
+            return {}
+        wanted = {str(symbol).upper() for symbol in symbols}
+        return {
+            str(item.get("symbol", "")).upper(): price
+            for item in payload
+            if isinstance(item, dict)
+            and str(item.get("symbol", "")).upper() in wanted
+            and (price := safe_float(item.get("markPrice"))) is not None
+            and price > 0
+        }
+    except Exception as exc:
+        if time.time() >= BINANCE_REST_BLOCKED_UNTIL:
+            log_check("paper_mark_price_bulk", False, None, None, str(exc)[:400])
+        return {}
 
 def _leader_for_trade(db, trade: PaperTrade) -> PositionObservation | None:
     prefix = trade.source_key
@@ -1324,7 +1383,11 @@ async def _actual_funding_cost(trade: PaperTrade, at: datetime) -> tuple[float, 
     return total, len(rows)
 
 
-async def evaluate_open_paper_trades(prices: dict[str,float] | None = None, source: str = "BINANCE_REST") -> None:
+async def evaluate_open_paper_trades(
+    prices: dict[str, float] | None = None,
+    source: str = "BINANCE_REST",
+    event_times: dict[str, datetime] | None = None
+) -> None:
     with SessionLocal() as db:
         open_trades = db.scalars(select(PaperTrade).where(PaperTrade.status == "OPEN").limit(500)).all()
         symbols = sorted({t.symbol for t in open_trades})
@@ -1340,11 +1403,19 @@ async def evaluate_open_paper_trades(prices: dict[str,float] | None = None, sour
             prev_check = None
             raw = parse_json(trade.raw_json)
             if raw.get("last_binance_price_at"):
-                try: prev_check = datetime.fromisoformat(raw["last_binance_price_at"].replace("Z","+00:00"))
-                except Exception: prev_check = None
-            gap = max(0.0, (ts-prev_check).total_seconds()) if prev_check else 0.0
+                try:
+                    prev_check = datetime.fromisoformat(raw["last_binance_price_at"].replace("Z", "+00:00"))
+                    if prev_check.tzinfo is None:
+                        prev_check = prev_check.replace(tzinfo=timezone.utc)
+                except Exception:
+                    prev_check = None
+            price_observed_at = (event_times or {}).get(trade.symbol) or ts
+            if price_observed_at.tzinfo is None:
+                price_observed_at = price_observed_at.replace(tzinfo=timezone.utc)
+            gap = max(0.0, (price_observed_at - prev_check).total_seconds()) if prev_check else 0.0
             gross, costs, net, pnl_pct = _paper_pnl(trade, mark, cfg, raw, ts)
-            raw["last_binance_price_at"] = ts.isoformat()
+            raw["last_binance_price_at"] = price_observed_at.isoformat()
+            raw["last_price_received_at"] = ts.isoformat()
             raw["last_paper_check_at"] = ts.isoformat()
             raw["last_price_source"] = source
             raw["last_data_gap_seconds"] = gap
@@ -1354,7 +1425,7 @@ async def evaluate_open_paper_trades(prices: dict[str,float] | None = None, sour
             trade.mark_price, trade.gross_pnl, trade.estimated_costs, trade.net_pnl = mark, gross, costs, net
 
             path_row = PaperTradePath(
-                paper_trade_id=trade.id, observed_at=ts, paper_price=mark,
+                paper_trade_id=trade.id, observed_at=price_observed_at, paper_price=mark,
                 gross_pnl=gross, net_pnl=net, pnl_pct=pnl_pct,
                 source=source, data_gap_seconds=gap
             )
@@ -1534,49 +1605,226 @@ async def evaluate_open_paper_trades(prices: dict[str,float] | None = None, sour
             trade.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
         db.commit()
 
+async def _open_paper_symbols() -> list[str]:
+    with SessionLocal() as db:
+        return sorted({
+            str(trade.symbol).upper()
+            for trade in db.scalars(select(PaperTrade).where(PaperTrade.status == "OPEN")).all()
+            if trade.symbol
+        })
+
+
+async def _ws_send_symbol_action(ws, action: str, symbols: set[str], request_id: int, pending: dict) -> int:
+    # Binance limits client-to-server WebSocket control messages; pace below 5/sec.
+    for symbol in sorted(symbols):
+        request_id += 1
+        stream = f"{symbol.lower()}@markPrice@1s"
+        await ws.send(json.dumps({"method": action, "params": [stream], "id": request_id}))
+        pending[request_id] = {"action": action, "symbol": symbol}
+        await asyncio.sleep(0.23)
+    return request_id
+
+
 async def paper_price_worker() -> None:
-    # Binance public USD-M mark-price stream publishes markPriceUpdate once per second.
-    # Reconnect periodically so newly opened paper symbols are subscribed automatically.
+    """
+    Persistent USD-M mark-price subscriber:
+    - /ws + per-symbol SUBSCRIBE prevents one invalid futures symbol poisoning a combined URL.
+    - Price frames are batched and evaluated together, not one blocking DB transaction per tick.
+    - New open symbols are subscribed within five seconds.
+    - REST backup is one bulk request/minute and is disabled during a Binance 418/429 cooldown.
+    """
+    reconnect_delay = 2.0
+    last_rest_backup_at = 0.0
+    last_health_log_at = 0.0
+    request_id = 0
+
     while True:
         try:
-            with SessionLocal() as db:
-                symbols = sorted({t.symbol for t in db.scalars(
-                    select(PaperTrade).where(PaperTrade.status == "OPEN")
-                ).all()})
+            symbols = set(await _open_paper_symbols())
             if not symbols:
-                await asyncio.sleep(1.0)
+                PAPER_PRICE_STREAM_STATE.update({
+                    "status": "idle_no_open_trades", "connected": False,
+                    "subscribed_symbols": [], "last_error": None
+                })
+                await asyncio.sleep(2.0)
                 continue
-            streams = "/".join(f"{symbol.lower()}@markPrice@1s" for symbol in symbols)
-            url = f"wss://fstream.binance.com/stream?streams={streams}"
-            async with websockets.connect(url, ping_interval=20, ping_timeout=20, close_timeout=5, max_size=1048576) as ws:
-                connected_at = time.monotonic()
-                while time.monotonic() - connected_at < 300:
+
+            PAPER_PRICE_STREAM_STATE.update({
+                "status": "connecting", "connected": False,
+                "subscribed_symbols": sorted(symbols), "last_error": None
+            })
+            pending_requests: dict[int, dict] = {}
+            requested_symbols: set[str] = set()
+            active_symbols: set[str] = set()
+            unsupported_symbols: set[str] = set()
+            pending_prices: dict[str, float] = {}
+            pending_event_times: dict[str, datetime] = {}
+            connection_started = time.monotonic()
+            last_price_message_at = 0.0
+            last_flush_at = time.monotonic()
+            last_symbol_refresh_at = time.monotonic()
+            connection_id = int(PAPER_PRICE_STREAM_STATE.get("reconnect_count", 0)) + 1
+
+            async with websockets.connect(
+                "wss://fstream.binance.com/ws",
+                ping_interval=20, ping_timeout=20, close_timeout=5,
+                open_timeout=12, max_size=1048576, max_queue=4096
+            ) as ws:
+                PAPER_PRICE_STREAM_STATE.update({
+                    "status": "subscribing", "connected": True,
+                    "connected_at": now().isoformat(), "reconnect_count": connection_id,
+                    "last_error": None
+                })
+                request_id = await _ws_send_symbol_action(
+                    ws, "SUBSCRIBE", symbols, request_id, pending_requests
+                )
+                requested_symbols.update(symbols)
+
+                while time.monotonic() - connection_started < 23 * 3600:
+                    message = None
                     try:
-                        message = await asyncio.wait_for(ws.recv(), timeout=30)
+                        message = await asyncio.wait_for(ws.recv(), timeout=0.25)
                     except asyncio.TimeoutError:
+                        pass
+
+                    if message is not None:
+                        packet = json.loads(message)
+                        if isinstance(packet, dict):
+                            PAPER_PRICE_STREAM_STATE["messages_received"] = int(
+                                PAPER_PRICE_STREAM_STATE.get("messages_received", 0)
+                            ) + 1
+                            PAPER_PRICE_STREAM_STATE["last_message_at"] = now().isoformat()
+                            ack_id = packet.get("id")
+                            try:
+                                ack_id = int(ack_id) if ack_id is not None else None
+                            except (TypeError, ValueError):
+                                ack_id = None
+                            if ack_id is not None and ack_id in pending_requests:
+                                request = pending_requests.pop(ack_id)
+                                symbol = request["symbol"]
+                                if packet.get("code") is not None or packet.get("error"):
+                                    unsupported_symbols.add(symbol)
+                                    requested_symbols.discard(symbol)
+                                    PAPER_PRICE_STREAM_STATE["last_error"] = (
+                                        f"{symbol} {request['action']} rejected: "
+                                        f"{packet.get('msg') or packet.get('error') or packet.get('code')}"
+                                    )
+                                elif request["action"] == "SUBSCRIBE":
+                                    active_symbols.add(symbol)
+                                    if not last_price_message_at:
+                                        last_price_message_at = time.monotonic()
+                                    PAPER_PRICE_STREAM_STATE["status"] = "live"
+                                else:
+                                    active_symbols.discard(symbol)
+                                PAPER_PRICE_STREAM_STATE["subscribed_symbols"] = sorted(active_symbols)
+                                PAPER_PRICE_STREAM_STATE["unsupported_symbols"] = sorted(unsupported_symbols)
+                                continue
+
+                            data = packet.get("data", packet)
+                            if isinstance(data, dict):
+                                symbol = str(data.get("s") or "").upper()
+                                price = safe_float(data.get("p"))
+                                if symbol and price is not None and price > 0 and symbol in requested_symbols:
+                                    event_ms = safe_float(data.get("E"))
+                                    event_at = (
+                                        datetime.fromtimestamp(event_ms / 1000.0, timezone.utc)
+                                        if event_ms else now()
+                                    )
+                                    pending_prices[symbol] = price
+                                    pending_event_times[symbol] = event_at
+                                    last_price_message_at = time.monotonic()
+                                    PAPER_SYMBOL_LAST_UPDATE[symbol] = event_at.isoformat()
+                                    PAPER_PRICE_STREAM_STATE["price_updates_received"] = int(
+                                        PAPER_PRICE_STREAM_STATE.get("price_updates_received", 0)
+                                    ) + 1
+                                    PAPER_PRICE_STREAM_STATE["last_price_at"] = event_at.isoformat()
+                                    PAPER_PRICE_STREAM_STATE["status"] = "live"
+
+                    mono = time.monotonic()
+                    if pending_prices and mono - last_flush_at >= 0.5:
+                        batch_prices = dict(pending_prices)
+                        batch_times = dict(pending_event_times)
+                        pending_prices.clear()
+                        pending_event_times.clear()
+                        await evaluate_open_paper_trades(
+                            batch_prices, "BINANCE_WS_MARK_PRICE_1S", batch_times
+                        )
+                        last_flush_at = mono
+                        PAPER_PRICE_STREAM_STATE["last_flush_at"] = now().isoformat()
+
+                    if mono - last_symbol_refresh_at >= 5.0:
+                        current_symbols = set(await _open_paper_symbols())
+                        removed = requested_symbols - current_symbols
+                        added = current_symbols - requested_symbols - unsupported_symbols
+                        if removed:
+                            request_id = await _ws_send_symbol_action(
+                                ws, "UNSUBSCRIBE", removed, request_id, pending_requests
+                            )
+                            requested_symbols -= removed
+                            active_symbols -= removed
+                        if added:
+                            request_id = await _ws_send_symbol_action(
+                                ws, "SUBSCRIBE", added, request_id, pending_requests
+                            )
+                            requested_symbols.update(added)
+                        last_symbol_refresh_at = time.monotonic()
+                        PAPER_PRICE_STREAM_STATE["subscribed_symbols"] = sorted(active_symbols)
+
+                    if active_symbols and last_price_message_at and mono - last_price_message_at > 12:
+                        PAPER_PRICE_STREAM_STATE.update({
+                            "status": "stale_no_mark_messages",
+                            "last_error": "No mark-price event received for more than 12 seconds; reconnecting."
+                        })
                         break
-                    packet = json.loads(message)
-                    data = packet.get("data", packet) if isinstance(packet, dict) else {}
-                    symbol = str(data.get("s") or "").upper()
-                    price = safe_float(data.get("p"))
-                    if symbol and price and price > 0:
-                        await evaluate_open_paper_trades({symbol: price}, "BINANCE_WS_MARK_PRICE_1S")
+                    if not active_symbols and mono - connection_started > 12:
+                        PAPER_PRICE_STREAM_STATE.update({
+                            "status": "no_valid_subscriptions",
+                            "last_error": "No active USD-M mark-price subscriptions were acknowledged."
+                        })
+                        break
+
+                    if mono - last_health_log_at >= 60:
+                        last_health_log_at = mono
+                        log_check(
+                            "paper_price_stream", True, None, None,
+                            f"connected={bool(active_symbols)} active_symbols={len(active_symbols)} "
+                            f"price_updates={PAPER_PRICE_STREAM_STATE.get('price_updates_received', 0)}"
+                        )
+
+                if pending_prices:
+                    await evaluate_open_paper_trades(
+                        dict(pending_prices), "BINANCE_WS_MARK_PRICE_1S", dict(pending_event_times)
+                    )
+            reconnect_delay = 2.0
+            PAPER_PRICE_STREAM_STATE["connected"] = False
+
         except asyncio.CancelledError:
+            PAPER_PRICE_STREAM_STATE.update({"status": "stopped", "connected": False})
             raise
         except Exception as exc:
-            log_check("paper_price_worker", False, None, None, f"WebSocket: {str(exc)[:250]}")
-            # Public REST fallback keeps the paper desk updating during WS reconnects.
-            try:
-                with SessionLocal() as db:
-                    symbols = sorted({t.symbol for t in db.scalars(
-                        select(PaperTrade).where(PaperTrade.status == "OPEN")
-                    ).all()})
-                prices = await _mark_prices(symbols)
-                if prices:
-                    await evaluate_open_paper_trades(prices, "BINANCE_REST_FALLBACK")
-            except Exception as fallback_exc:
-                log_check("paper_price_worker_fallback", False, None, None, str(fallback_exc)[:250])
-            await asyncio.sleep(2.0)
+            PAPER_PRICE_STREAM_STATE.update({
+                "status": "reconnecting", "connected": False,
+                "last_error": str(exc)[:350],
+                "reconnect_count": int(PAPER_PRICE_STREAM_STATE.get("reconnect_count", 0)) + 1
+            })
+            if time.monotonic() - last_health_log_at >= 30:
+                last_health_log_at = time.monotonic()
+                log_check("paper_price_stream", False, None, None, str(exc)[:850])
+
+        # Backup only when the WebSocket is unavailable: a single bulk REST read
+        # at most once per minute, and never while Binance has an active 418/429 ban.
+        if time.monotonic() - last_rest_backup_at >= 60:
+            last_rest_backup_at = time.monotonic()
+            current_symbols = await _open_paper_symbols()
+            if current_symbols and time.time() >= BINANCE_REST_BLOCKED_UNTIL:
+                backup_prices = await _mark_prices(current_symbols)
+                if backup_prices:
+                    await evaluate_open_paper_trades(backup_prices, "BINANCE_REST_BULK_BACKUP")
+
+        await asyncio.sleep(reconnect_delay)
+        reconnect_delay = min(30.0, reconnect_delay * 2)
+
+
 
 @app.get("/api/opportunities")
 async def api_opportunities(limit: int = 100):
@@ -1817,6 +2065,14 @@ async def api_paper():
         "open_count": len(open_trades), "closed_count": len(closed_trades),
         "correlated_exposure_groups": correlated_groups,
         "shadow_portfolio": shadow_portfolio,
+        "price_feed": {
+            "status": PAPER_PRICE_STREAM_STATE.get("status"),
+            "connected": bool(PAPER_PRICE_STREAM_STATE.get("connected")),
+            "last_price_at": PAPER_PRICE_STREAM_STATE.get("last_price_at"),
+            "last_error": PAPER_PRICE_STREAM_STATE.get("last_error"),
+            "active_symbols": len(PAPER_PRICE_STREAM_STATE.get("subscribed_symbols") or []),
+            "binance_rest": binance_rest_status()
+        },
         "risk_summary": {
             "correlated_groups": len(correlated_groups),
             "largest_shared_direction_stop_risk_usdt": max((g["estimated_stop_loss_usdt"] for g in concentrations), default=0.0),
@@ -1986,7 +2242,9 @@ async def api_paper_trade_detail(trade_id: int):
                 "estimated_net_pnl_usdt": gross - known_costs
             })
 
-    # Real Binance USD-M Futures candlesticks for the actual instrument.
+    # Binance candlesticks are cached for 20 seconds. The live paper mark is read
+    # from Postgres on each detail refresh, so the UI can refresh frequently without
+    # issuing a new historical klines request every time.
     candles = []
     candle_interval = "5m"
     candle_error = None
@@ -1997,22 +2255,37 @@ async def api_paper_trade_detail(trade_id: int):
         age_hours = max(0.0, (now() - opened).total_seconds() / 3600)
         if age_hours > 24:
             candle_interval = "1h"
-            raw_candles, _ = await binance_get(
-                "/fapi/v1/klines", {"symbol": trade.symbol, "interval": candle_interval, "limit": 168}
-            )
+        cache_key = f"{trade.symbol}:{candle_interval}"
+        cached = PAPER_CANDLE_CACHE.get(cache_key)
+        if cached and time.monotonic() - float(cached.get("fetched_at", 0.0)) < 20:
+            candles = list(cached.get("candles") or [])
+            candle_error = cached.get("error")
         else:
+            limit = 168 if candle_interval == "1h" else 288
             raw_candles, _ = await binance_get(
-                "/fapi/v1/klines", {"symbol": trade.symbol, "interval": candle_interval, "limit": 288}
+                "/fapi/v1/klines",
+                {"symbol": trade.symbol, "interval": candle_interval, "limit": limit}
             )
-        if isinstance(raw_candles, list):
-            candles = [{
-                "open_time": int(item[0]), "open": safe_float(item[1]),
-                "high": safe_float(item[2]), "low": safe_float(item[3]),
-                "close": safe_float(item[4]), "volume": safe_float(item[5]),
-                "close_time": int(item[6])
-            } for item in raw_candles if isinstance(item, (list, tuple)) and len(item) >= 7]
+            if isinstance(raw_candles, list):
+                candles = [{
+                    "open_time": int(item[0]), "open": safe_float(item[1]),
+                    "high": safe_float(item[2]), "low": safe_float(item[3]),
+                    "close": safe_float(item[4]), "volume": safe_float(item[5]),
+                    "close_time": int(item[6])
+                } for item in raw_candles if isinstance(item, (list, tuple)) and len(item) >= 7]
+            PAPER_CANDLE_CACHE[cache_key] = {
+                "fetched_at": time.monotonic(), "candles": candles, "error": None
+            }
     except Exception as exc:
         candle_error = str(exc)[:220]
+        cache_key = f"{trade.symbol}:{candle_interval}"
+        cached = PAPER_CANDLE_CACHE.get(cache_key)
+        if cached and cached.get("candles"):
+            candles = list(cached["candles"])
+        else:
+            PAPER_CANDLE_CACHE[cache_key] = {
+                "fetched_at": time.monotonic(), "candles": [], "error": candle_error
+            }
 
     return {
         "trade": {
@@ -2118,6 +2391,12 @@ async def api_system():
         "provider": {
             "kopyon_key_configured": bool(KOPYON_KEY), "kopyon_base": KOPYON_ROOT,
             "binance_public_market_data": BINANCE_ROOT, "browser_token_required": False
+        },
+        "price_feed": {
+            **PAPER_PRICE_STREAM_STATE,
+            "symbol_last_update": dict(PAPER_SYMBOL_LAST_UPDATE),
+            "binance_rest": binance_rest_status(),
+            "rest_policy": "WebSocket-first; at most one bulk premiumIndex fallback per minute; no per-symbol mark-price polling."
         },
         "runtime": {
             "python_env": os.getenv("PYTHON_VERSION", "Render default"),
