@@ -156,7 +156,9 @@ async function loadPaper(){
    const funding=t.funding_history_verified===true?
      (t.funding_audit_status==="VERIFIED_ZERO_BEFORE_NEXT_SETTLEMENT"?"NO FUNDING SETTLED":"FUNDING VERIFIED"):
      t.funding_audit_status==="PENDING_POST_CLOSE_RECONCILIATION"?"FUNDING ESTIMATED · RECONCILE":
-     t.funding_audit_status==="LEGACY_FUNDING_UNVERIFIED"?"LEGACY FUNDING UNKNOWN":"FUNDING PENDING";
+     t.funding_audit_status==="ZERO_SETTLEMENTS_BEFORE_EXIT_SCHEDULE_INFERRED"?"NO SETTLEMENT · SCHEDULE INFERRED":
+     t.funding_audit_status==="LEGACY_FUNDING_UNVERIFIED"?"LEGACY FUNDING UNKNOWN":
+     Number(t.funding_estimate_current||0)>0?"PENDING · ESTIMATE ACTIVE":"FUNDING PENDING";
    return '<tr class="clickable-row" onclick="openPaperTrade('+t.id+')">'+
     '<td><span class="status-tag '+(t.status==="OPEN"?"qualified":"neutral")+'">'+statusText+'</span>'+
       (quality?'<br><small class="muted-note">'+esc(quality)+'</small>':'')+
@@ -262,7 +264,9 @@ async function refreshPaperTradeDetail(id){
    ['Gross PnL',money(t.gross_pnl)],['Round-trip costs',money(t.estimated_costs)],
    ['Funding audit',t.funding_audit_status||'LEGACY UNVERIFIED'],
    ['Actual funding',t.funding_cost_actual===null||t.funding_cost_actual===undefined?'Not verified':money(t.funding_cost_actual)],
-   ['Funding estimate',t.funding_estimate_at_exit===null||t.funding_estimate_at_exit===undefined?'—':money(t.funding_estimate_at_exit)],
+   ['Last verified funding subtotal',t.funding_cost_last_verified===null||t.funding_cost_last_verified===undefined?'—':money(t.funding_cost_last_verified)],
+   ['Current conservative funding estimate',t.funding_estimate_current===null||t.funding_estimate_current===undefined?'—':money(t.funding_estimate_current)],
+   ['Funding estimate at exit',t.funding_estimate_at_exit===null||t.funding_estimate_at_exit===undefined?'—':money(t.funding_estimate_at_exit)],
    ['Funding source',t.funding_source||'Not recorded'],
    ['Net realized / live PnL',money(t.net_pnl)],['Exit reason',t.exit_reason_display||t.exit_reason||'—'],
    ['Exit price',fmt(t.exit_price,8)],['MFE net',money(t.mfe_net_pnl)+' · '+pct(t.mfe_pct)],
