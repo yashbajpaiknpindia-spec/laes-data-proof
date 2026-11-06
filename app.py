@@ -1738,10 +1738,13 @@ async def api_paper():
         "INFORMATION_CUTOFF", "DATA_INTERRUPTED_REVIEW",
         "PATH_NOT_RECORDED", "LEGACY_UNCLASSIFIED", "LEGACY_FUNDING_UNVERIFIED"
     }
-    shadow_uncertain_count = sum(
-        1 for trade in shadow_selected
-        if parse_json(trade.raw_json).get("data_quality_status", "LEGACY_UNCLASSIFIED") in uncertain_quality
-    )
+    shadow_uncertain_count = 0
+    for trade in shadow_selected:
+        trade_audit = parse_json(trade.raw_json)
+        quality_flag = trade_audit.get("data_quality_status", "LEGACY_UNCLASSIFIED")
+        funding_flag = trade_audit.get("funding_audit_status", "LEGACY_FUNDING_UNVERIFIED")
+        if quality_flag in uncertain_quality or funding_flag in uncertain_quality:
+            shadow_uncertain_count += 1
     shadow_portfolio = {
         "model": "COUNTERFACTUAL_SHADOW_PORTFOLIO",
         "capital": round(shadow_capital, 8),
