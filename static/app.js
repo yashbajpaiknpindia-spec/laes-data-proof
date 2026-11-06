@@ -18,6 +18,7 @@ async function refreshOverview(){
  try{
  const d=await api("/api/overview");state.overview=d;const m=d.monitor||{};
  $("mTraders").textContent=fmt(d.traders,0);$("mPositions").textContent=fmt(d.live_positions??0,0);$("mUnderwater").textContent=fmt(d.underwater_live_positions??0,0);$("mPaperOpen").textContent=fmt(d.open_paper_trades,0);
+ $("mPositionsFoot").textContent=fmt(d.stale_visible_trader_snapshots??0,0)+" stale leader snapshots excluded · 15m freshness window";
  $("navTraderCount").textContent=fmt(d.traders,0);$("navPaperCount").textContent=fmt(d.open_paper_trades,0);$("navPositionCount").textContent=fmt(d.live_positions??0,0);
  $("sideStatus").textContent=m.worker_alive?"Automatic monitor running":"Monitor starting / sleeping";$("sidePulse").className="pulse "+(m.worker_alive?"on":"");
  $("monitorBadge").textContent=m.state||"INITIALIZING";$("monitorBadge").className="pill "+(m.state==="idle"?"ok":m.state==="error"?"warn":"");
@@ -25,7 +26,10 @@ async function refreshOverview(){
  $("stepDiscover").textContent=m.last_error||(m.finished_at?fmt(m.traders_found,0)+" new/updated trader records":"Waiting for Kopyon");$("stepDiscoverState").textContent=m.state==="error"?"ERROR":m.finished_at?"DONE":"WAIT";
  $("stepPositions").textContent=m.finished_at?(m.positions_checked||0)+" leader portfolios checked · "+(m.observations_saved||0)+" position rows stored":"Rotation begins after leaderboard fetch";$("stepPositionsState").textContent=m.state==="error"?"CHECK":m.finished_at?"DONE":"WAIT";
  $("stepPaper").textContent=d.paper?.auto_enabled?"Auto paper entries enabled when scanner confirms":"Paper entry automation paused in settings";$("stepPaperState").textContent=d.paper?.auto_enabled?"ACTIVE":"PAUSED";
- source("healthKopyon","kopyonDot",d.kopyon?.configured,d.kopyon?.configured?"KEY CONFIGURED":"KEY MISSING");$("kopyonState").textContent=d.kopyon?.configured?"Configured":"Missing key";source("healthBinance","binanceDot",true,"PUBLIC DATA");$("binanceState").textContent="Public data";
+ source("healthKopyon","kopyonDot",d.kopyon?.configured,d.kopyon?.configured?"KEY CONFIGURED":"KEY MISSING");$("kopyonState").textContent=d.kopyon?.configured?"Configured":"Missing key";
+ const pf=d.price_feed||{},restBlocked=!!pf.binance_rest?.blocked,feedOk=!!pf.connected;
+ const feedLabel=feedOk?(restBlocked?"WEBSOCKET LIVE · REST LIMITED":"WEBSOCKET LIVE"):(restBlocked?"REST RATE LIMITED":"FEED STARTING");
+ source("healthBinance","binanceDot",feedOk,feedLabel);$("binanceState").textContent=feedLabel;
  const dbOk=d.database?.connection==="connected";$("healthDatabase").textContent=dbOk?(d.database.persistent?"POSTGRES":"SQLITE / EPHEMERAL"):"ERROR";$("healthDatabase").className="connection-state "+(dbOk?(d.database.persistent?"ok":""):"bad");
  $("healthDatabaseDesc").textContent=dbOk?(d.database.persistent?"Persistent PostgreSQL":"SQLite: data can be lost on spin-down/redeploy"):"Database unavailable";
  $("dbUsed").textContent=d.database?.used_mb!==null&&d.database?.used_mb!==undefined?fmt(d.database.used_mb,2)+" MB":"Not reported";$("dbCapacityNote").textContent=d.database?.capacity_note||"";
@@ -35,7 +39,7 @@ async function refreshOverview(){
  if(!d.database?.persistent)notice("The running service is not connected to persistent PostgreSQL. Check DATABASE_URL on laes-data-proof-python.","error");
  if(state.page==="overview"){
   try{const p=await api("/api/paper");$("mPaperEquity").textContent=money(p.equity);$("mPaperPnl").textContent="Realized "+money(p.realized_pnl)+" · Unrealized "+money(p.unrealized_pnl);}catch{}
-  try{const o=await api("/api/opportunities?limit=10");const q=o.filter(x=>x.qualified);$("mOpportunities").textContent=fmt(q.length,0);$("navOppCount").textContent=fmt(q.length,0);renderMini(o.slice(0,5));}catch(e){$("overviewOpps").innerHTML='<div class="empty-state">'+esc(e.message)+'</div>';}
+  try{const o=await api("/api/opportunities?limit=100");const q=o.filter(x=>x.qualified);$("mOpportunities").textContent=fmt(q.length,0);$("navOppCount").textContent=fmt(q.length,0);renderMini(o.slice(0,5));}catch(e){$("overviewOpps").innerHTML='<div class="empty-state">'+esc(e.message)+'</div>';}
  }
  }catch(e){notice("Dashboard status unavailable: "+e.message,"error");}
 }
@@ -258,6 +262,8 @@ async function refreshPaperTradeDetail(id){
    ['Gross PnL',money(t.gross_pnl)],['Round-trip costs',money(t.estimated_costs)],
    ['Funding audit',t.funding_audit_status||'LEGACY UNVERIFIED'],
    ['Actual funding',t.funding_cost_actual===null||t.funding_cost_actual===undefined?'Not verified':money(t.funding_cost_actual)],
+   ['Funding estimate',t.funding_estimate_at_exit===null||t.funding_estimate_at_exit===undefined?'—':money(t.funding_estimate_at_exit)],
+   ['Funding source',t.funding_source||'Not recorded'],
    ['Net realized / live PnL',money(t.net_pnl)],['Exit reason',t.exit_reason_display||t.exit_reason||'—'],
    ['Exit price',fmt(t.exit_price,8)],['MFE net',money(t.mfe_net_pnl)+' · '+pct(t.mfe_pct)],
    ['MAE net',money(t.mae_net_pnl)+' · '+pct(t.mae_pct)],
