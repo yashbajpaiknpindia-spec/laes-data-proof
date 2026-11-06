@@ -2,11 +2,14 @@ const $=id=>document.getElementById(id);
 const state={page:"overview"};
 let paperDetailTimer=null;
 let paperLoadInFlight=false;
+let positionsLoadInFlight=false;
+let opportunitiesLoadInFlight=false;
 const fmt=(v,d=2)=>v===null||v===undefined||v===""||Number.isNaN(Number(v))?"—":Number(v).toLocaleString(undefined,{maximumFractionDigits:d});
 const money=v=>v===null||v===undefined?"—":fmt(v,Math.abs(Number(v))<0.01?8:4)+" USDT";
 const pct=v=>v===null||v===undefined?"—":fmt(v,2)+"%";
 const date=v=>{if(!v)return"—";const d=new Date(v);return Number.isNaN(d.getTime())?"—":d.toLocaleString();};
 const duration=h=>h===null||h===undefined?"Unavailable":h<1?Math.round(h*60)+"m":h<24?h.toFixed(1)+"h":(h/24).toFixed(1)+"d";
+const ageText=seconds=>seconds===null||seconds===undefined?"—":seconds<60?Math.round(seconds)+"s":seconds<3600?(seconds/60).toFixed(1)+"m":(seconds/3600).toFixed(1)+"h";
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 async function api(url,options={}){const r=await fetch(url,{headers:{"Content-Type":"application/json"},...options});let d={};try{d=await r.json()}catch{d={detail:await r.text()}}if(!r.ok)throw new Error(d.detail||"HTTP "+r.status);return d;}
 function notice(s,kind){const n=$("notice");n.textContent=s;n.className="notice "+(kind||"");n.classList.remove("hidden");clearTimeout(notice.timer);notice.timer=setTimeout(()=>n.classList.add("hidden"),9000);}
@@ -68,11 +71,38 @@ async function openTrader(enc){
 }
 window.openTrader=openTrader;$("closeDialog").onclick=()=>{clearInterval(paperDetailTimer);paperDetailTimer=null;$("traderDialog").close();};
 async function loadPositions(){
- $("positionTable").innerHTML='<tr><td colspan="9" class="empty-cell">Loading real position observations…</td></tr>';
- try{const [rows,traders]=await Promise.all([api("/api/positions?limit=500"),api("/api/traders?limit=300")]);const names=Object.fromEntries(traders.map(t=>[t.trader_id,t.name||t.trader_id]));
- if(!rows.length){$("positionTable").innerHTML='<tr><td colspan="9" class="empty-cell">No public position observations have been saved. Hidden positions remain unavailable.</td></tr>';return;}
- $("positionTable").innerHTML=rows.map(p=>{const a=p.entry_price&&p.mark_price?(p.side==="LONG"?(p.entry_price-p.mark_price):(p.mark_price-p.entry_price))/p.entry_price*100:null;return '<tr><td>'+esc(names[p.trader_id]||p.trader_id)+'<br><small>'+esc(p.trader_id)+'</small></td><td><b>'+esc(p.symbol)+'</b></td><td class="'+(p.side==="LONG"?"side-long":"side-short")+'">'+esc(p.side)+'</td><td>'+fmt(p.entry_price,6)+'</td><td>'+fmt(p.mark_price,6)+'</td><td class="'+((p.unrealized_pnl||0)<0?"negative":"positive")+'">'+money(p.unrealized_pnl)+'</td><td class="'+((a||0)>0?"negative":"positive")+'">'+pct(a)+'</td><td>'+(p.leverage?fmt(p.leverage,1)+"×":"—")+' '+esc(p.margin_mode||"")+'</td><td>'+date(p.observed_at)+'</td></tr>';}).join("");
- }catch(e){$("positionTable").innerHTML='<tr><td colspan="9" class="empty-cell">'+esc(e.message)+'</td></tr>';}
+ if(positionsLoadInFlight)return;
+ positionsLoadInFlight=true;
+ try{
+  const response=await api("/api/positions?limit=500");
+  const rows=response.positions||[],summary=response.summary||{};
+  $("positionStatus").innerHTML=
+   '<div class="sample-warning">Current visible positions: <b>'+fmt(summary.currently_visible_positions,0)+'</b> · hidden last-known: <b>'+fmt(summary.hidden_last_known_positions,0)+'</b> · stale leader snapshots: <b>'+fmt(summary.stale_leader_snapshots,0)+'</b> · live Binance marks: <b>'+fmt(summary.binance_live_marks,0)+'</b> / '+fmt(summary.positions_returned,0)+
+   '<br>Binance mark feed: <b>'+esc(summary.binance_feed_status||"starting")+'</b> · Kopyon stream: <b>'+esc(summary.kopyon_stream_status||"REST fallback")+'</b></div>';
+  if(!rows.length){
+   $("positionTable").innerHTML='<tr><td colspan="9" class="empty-cell">No positions are present in the latest visible leader snapshots. Hidden portfolios are not treated as closed.</td></tr>';
+   return;
+  }
+  $("positionTable").innerHTML=rows.map(p=>{
+   const hidden=p.leader_state!=="VISIBLE";
+   const leaderAge=ageText(p.leader_snapshot_age_seconds);
+   const markAge=p.live_mark_fresh?"BINANCE "+ageText(p.live_mark_age_seconds):"Binance mark not live";
+   const freshness=hidden?"HIDDEN / LAST KNOWN":(p.leader_snapshot_age_seconds>600?"LEADER STALE":"LEADER "+leaderAge);
+   const pnlSource=p.pnl_source==="BINANCE_MARK_ESTIMATE"?"LIVE ESTIMATE":"KOPYON SNAPSHOT";
+   return '<tr><td>'+esc(p.trader_name||p.trader_id)+'<br><small>'+esc(p.trader_id)+'</small></td>'+
+    '<td><b>'+esc(p.symbol)+'</b></td>'+
+    '<td class="'+(p.side==="LONG"?"side-long":"side-short")+'">'+esc(p.side)+'</td>'+
+    '<td>'+fmt(p.entry_price,8)+'</td>'+
+    '<td>'+fmt(p.mark_price,8)+'<br><small>'+esc(markAge)+'</small></td>'+
+    '<td class="'+((p.unrealized_pnl||0)<0?"negative":"positive")+'">'+money(p.unrealized_pnl)+'<br><small>'+pnlSource+'</small></td>'+
+    '<td class="'+((p.adverse_pct||0)>0?"negative":"positive")+'">'+pct(p.adverse_pct)+'</td>'+
+    '<td>'+(p.leverage?fmt(p.leverage,1)+"×":"—")+' '+esc(p.margin_mode||"")+'</td>'+
+    '<td><b>'+esc(freshness)+'</b><br><small>Leader '+esc(leaderAge)+' · seen '+date(p.observed_at)+'</small></td></tr>';
+  }).join("");
+ }catch(e){
+  $("positionStatus").innerHTML='<div class="notice error">'+esc(e.message)+'</div>';
+  $("positionTable").innerHTML='<tr><td colspan="9" class="empty-cell">'+esc(e.message)+'</td></tr>';
+ }finally{positionsLoadInFlight=false;}
 }
 $("reloadPositions").onclick=loadPositions;
 async function loadOpportunities(){
