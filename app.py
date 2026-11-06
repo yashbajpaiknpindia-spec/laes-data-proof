@@ -1467,7 +1467,7 @@ async def evaluate_open_paper_trades(prices: dict[str,float] | None = None, sour
                     raw["funding_audit_status"] = "PENDING_VERIFICATION"
                     raw["funding_history_checked_at"] = ts.isoformat()
                     raw["funding_verification_error"] = str(funding_exc)[:180]
-                    db.add(PaperTradeEvent(paper_trade_id=trade.id,event_type="FUNDING_CHECK_PENDING",observed_at=ts,value=net,detail="Actual Binance funding history unavailable; positive-profit exit deferred"))
+                    db.add(PaperTradeEvent(paper_trade_id=trade.id,event_type="FUNDING_CHECK_PENDING",observed_at=ts,value=net,detail="Binance funding history unavailable; positive exits wait for verification, while a protective stop may still close using a conservative estimate."))
             if net > 0 and funding_verified:
                 # No minimum profit threshold: every observed positive net amount,
                 # after round-trip costs and verified funding, is realized immediately.
@@ -1481,25 +1481,16 @@ async def evaluate_open_paper_trades(prices: dict[str,float] | None = None, sour
                 else:
                     exit_reason = "STOP_LOSS_FUNDING_ESTIMATED"
                     raw["funding_audit_status"] = "STOP_EXIT_USING_CONSERVATIVE_ESTIMATE"
-                    raw["funding_estimate_at_exit"] = safe_float(
-                        raw.get("funding_estimate_at_exit")
-                    )
+                    funding_event_count_at_exit = 0
+                    if next_funding_ms and ts.timestamp() * 1000 >= next_funding_ms:
+                        funding_event_count_at_exit = 1 + int(
+                            (ts.timestamp() * 1000 - next_funding_ms) // 28800000
+                        )
                     raw["funding_estimate_at_exit"] = max(
                         0.0,
                         trade.notional
                         * (safe_float(raw.get("funding_rate_at_entry")) or 0.0)
-                        * (
-                            max(
-                                0,
-                                1 + int(
-                                    max(
-                                        0.0,
-                                        ts.timestamp() * 1000
-                                        - (safe_float(raw.get("next_funding_time")) or ts.timestamp() * 1000)
-                                    ) // 28800000
-                                )
-                            )
-                        )
+                        * funding_event_count_at_exit
                         * (1 if trade.side == "LONG" else -1)
                     )
                     raw["realized_pnl_is_estimate"] = True
