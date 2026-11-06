@@ -255,7 +255,7 @@ async function refreshPaperTradeDetail(id){
    ['Gross PnL',money(t.gross_pnl)],['Round-trip costs',money(t.estimated_costs)],
    ['Funding audit',t.funding_audit_status||'LEGACY UNVERIFIED'],
    ['Actual funding',t.funding_cost_actual===null||t.funding_cost_actual===undefined?'Not verified':money(t.funding_cost_actual)],
-   ['Net realized / live PnL',money(t.net_pnl)],['Exit reason',t.exit_reason||'—'],
+   ['Net realized / live PnL',money(t.net_pnl)],['Exit reason',t.exit_reason_display||t.exit_reason||'—'],
    ['Exit price',fmt(t.exit_price,8)],['MFE net',money(t.mfe_net_pnl)+' · '+pct(t.mfe_pct)],
    ['MAE net',money(t.mae_net_pnl)+' · '+pct(t.mae_pct)],
    ['Max saved data gap',fmt(t.max_data_gap_seconds,1)+' sec'],
