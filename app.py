@@ -2082,20 +2082,7 @@ async def evaluate_open_paper_trades(
                             exit_reason = reason_base + "_FUNDING_ESTIMATED"
                         raw["funding_estimate_settlement_count"] = funding_event_count_at_exit
                         raw["realized_pnl_is_estimate"] = True
-                        raw["funding_audit_status"] = "STOP_EXIT_USING_CONSERVATIVE_ESTIMATE"
-                        funding_event_count_at_exit = 0
-                        if next_funding_ms and ts.timestamp() * 1000 >= next_funding_ms:
-                            funding_event_count_at_exit = 1 + int(
-                                (ts.timestamp() * 1000 - next_funding_ms) // 28800000
-                            )
-                        raw["funding_estimate_at_exit"] = max(
-                            0.0,
-                            trade.notional
-                            * (safe_float(raw.get("funding_rate_at_entry")) or 0.0)
-                            * funding_event_count_at_exit
-                            * (1 if trade.side == "LONG" else -1)
-                        )
-                        raw["realized_pnl_is_estimate"] = True
+
             elif net <= 0 and not gap_guard and hit_target:
                 # A price target is not a profit exit if fees/funding still leave
                 # net PnL at or below zero. Keep tracking until net turns positive
