@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import deque
 import math
 import os
 import re
@@ -217,7 +218,31 @@ PAPER_PRICE_STREAM_STATE: dict[str, Any] = {
     "subscribed_symbols": [], "unsupported_symbols": [], "last_error": None
 }
 PAPER_SYMBOL_LAST_UPDATE: dict[str, str] = {}
+PAPER_SYMBOL_LAST_PRICE: dict[str, float] = {}
+PAPER_SYMBOL_PRICE_TICKS: dict[str, deque] = {}
 PAPER_CANDLE_CACHE: dict[str, dict[str, Any]] = {}
+
+KOPYON_STREAM_STATE: dict[str, Any] = {
+    "status": "starting", "connected": False, "supported": None,
+    "connected_at": None, "last_message_at": None, "last_snapshot_at": None,
+    "subscriptions": 0, "messages_received": 0, "reconnect_count": 0,
+    "last_error": None, "retry_after": None
+}
+KOPYON_STREAM_RETRY_AFTER = 0.0
+
+OPPORTUNITY_CACHE: list[dict] = []
+OPPORTUNITY_SCAN_STATE: dict[str, Any] = {
+    "status": "starting", "started_at": None, "finished_at": None,
+    "last_error": None, "positions_scanned": 0, "underwater": 0,
+    "qualified": 0, "paper_entries_created": 0, "blocked_entries": 0,
+    "last_duration_ms": None
+}
+OPPORTUNITY_SCAN_LOCK = asyncio.Lock()
+
+MARKET_REFRESH_STATE: dict[str, Any] = {
+    "status": "starting", "last_symbol": None, "last_refresh_at": None,
+    "refreshed_count": 0, "last_error": None
+}
 templates = Jinja2Templates(directory="templates")
 
 def now() -> datetime:
@@ -228,6 +253,117 @@ def safe_float(value: Any) -> float | None:
         return None if value is None else float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _latest_position_contexts(include_hidden_last_known: bool = False) -> list[dict]:
+    """
+    Current position rows are drawn only from each leader's latest visible
+    snapshot. Hidden leaders may optionally be represented by their last
+    visible snapshot, explicitly marked as hidden / last-known, never current.
+    """
+    with SessionLocal() as db:
+        snapshots = db.scalars(
+            select(PositionSnapshot).order_by(desc(PositionSnapshot.id))
+        ).all()
+        latest_by_trader: dict[str, PositionSnapshot] = {}
+        latest_visible_by_trader: dict[str, PositionSnapshot] = {}
+        for snap in snapshots:
+            if snap.trader_id not in latest_by_trader:
+                latest_by_trader[snap.trader_id] = snap
+            if not snap.hidden and snap.trader_id not in latest_visible_by_trader:
+                latest_visible_by_trader[snap.trader_id] = snap
+
+        selected: dict[str, tuple[PositionSnapshot, str]] = {}
+        for trader_id, latest_snap in latest_by_trader.items():
+            if not latest_snap.hidden:
+                selected[trader_id] = (latest_snap, "VISIBLE")
+            elif include_hidden_last_known and trader_id in latest_visible_by_trader:
+                selected[trader_id] = (
+                    latest_visible_by_trader[trader_id],
+                    "HIDDEN / LAST KNOWN"
+                )
+
+        snapshot_ids = [snap.id for snap, _state in selected.values()]
+        observations = (
+            db.scalars(
+                select(PositionObservation)
+                .where(PositionObservation.snapshot_id.in_(snapshot_ids))
+                .order_by(desc(PositionObservation.id))
+            ).all()
+            if snapshot_ids else []
+        )
+        traders = {t.trader_id: t.name for t in db.scalars(select(Trader)).all()}
+
+        result = []
+        seen = set()
+        for obs in observations:
+            chosen = selected.get(obs.trader_id)
+            if not chosen:
+                continue
+            snap, state = chosen
+            if obs.snapshot_id != snap.id:
+                continue
+            key = (obs.trader_id, obs.position_key)
+            if key in seen:
+                continue
+            seen.add(key)
+            age = max(0.0, (now() - snap.observed_at).total_seconds())
+            result.append({
+                "observation": obs,
+                "snapshot": snap,
+                "leader_state": state,
+                "leader_snapshot_age_seconds": age,
+                "trader_name": traders.get(obs.trader_id) or obs.trader_id
+            })
+        return result
+
+
+def _current_visible_position_symbols() -> set[str]:
+    return {
+        str(row["observation"].symbol).upper()
+        for row in _latest_position_contexts(include_hidden_last_known=False)
+        if row["observation"].symbol
+    }
+
+
+def live_market_overlay(symbol: str) -> dict:
+    symbol = str(symbol or "").upper()
+    price = PAPER_SYMBOL_LAST_PRICE.get(symbol)
+    updated = PAPER_SYMBOL_LAST_UPDATE.get(symbol)
+    age = None
+    if updated:
+        try:
+            updated_at = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=timezone.utc)
+            age = max(0.0, (now() - updated_at).total_seconds())
+        except Exception:
+            age = None
+
+    momentum = None
+    ticks = PAPER_SYMBOL_PRICE_TICKS.get(symbol)
+    if ticks and len(ticks) >= 2:
+        cutoff = time.time() - 300.0
+        reference = None
+        for tick_epoch, tick_price in ticks:
+            if tick_epoch <= cutoff:
+                reference = tick_price
+            else:
+                break
+        latest_price = ticks[-1][1]
+        if reference and latest_price and reference > 0:
+            span = time.time() - ticks[0][0]
+            if span >= 240.0:
+                momentum = (latest_price / reference - 1.0) * 100.0
+
+    return {
+        "price": price,
+        "updated_at": updated,
+        "age_seconds": age,
+        "fresh": bool(price and age is not None and age <= 10.0),
+        "momentum_5m_pct": momentum,
+        "momentum_fresh": momentum is not None
+    }
 
 def parse_json(value: str | None, fallback: Any = None) -> Any:
     try:
