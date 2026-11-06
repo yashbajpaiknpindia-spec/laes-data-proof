@@ -106,16 +106,47 @@ async function loadPositions(){
 }
 $("reloadPositions").onclick=loadPositions;
 async function loadOpportunities(){
- $("opportunityList").innerHTML='<div class="empty-state">Analyzing actual positions against Binance market data…</div>';
- try{const items=await api("/api/opportunities?limit=100");const qual=items.filter(o=>o.qualified);$("navOppCount").textContent=fmt(qual.length,0);
- if(!items.length){$("opportunityList").innerHTML='<div class="empty-state">No observed positions yet. Scanner does not create hypothetical opportunities.</div>';return;}
- $("opportunityList").innerHTML=items.map(o=>{
- const rec=o.recovery||{},hold=o.holding||{},causes=[...(o.likely_causes||[]),...(o.dead_market_reasons||[]).map(reason=>({label:'ENTRY BLOCKED',effect:reason,risk:'adverse'}))];
- let recovery=rec.probability===null?'<div class="recovery-prob">N/A</div><div class="sample-warning">'+esc(rec.label||"Insufficient history")+' · sample '+fmt(rec.sample_size,0)+'</div>':'<div class="recovery-prob">'+fmt(rec.probability,1)+'%</div><div class="analysis-line"><span>Wilson 95% interval</span><b>'+fmt(rec.ci_low,1)+'% – '+fmt(rec.ci_high,1)+'%</b></div><div class="analysis-line"><span>Comparable paths</span><b>'+fmt(rec.sample_size,0)+'</b></div>';
- const causeHtml=causes.length?causes.map(c=>'<div class="cause '+esc(c.risk||"")+'">'+esc(c.label)+' · '+esc(c.effect)+(c.url?' · <a href="'+esc(c.url)+'" target="_blank" rel="noreferrer">source</a>':"")+'</div>').join(""):'<div class="cause">No related headline or market cause flagged.</div>';
- return '<article class="opportunity-card"><div class="opp-head"><div class="opp-title"><div><h3>'+esc(o.symbol)+' <span class="'+(o.side==="LONG"?"side-long":"side-short")+'">'+esc(o.side)+'</span></h3><small>'+esc(o.trader_name)+' · '+esc(o.trader_id)+' · seen '+date(o.observed_at)+'</small></div></div><span class="status-tag '+(o.qualified?"qualified":o.underwater?"":"neutral")+'">'+esc(o.status)+'</span></div><div class="opp-stats"><div class="opp-stat"><small>LEADER LOSS</small><b class="negative">'+money(o.unrealized_pnl)+'</b></div><div class="opp-stat"><small>ADVERSE FROM ENTRY</small><b class="negative">'+pct(o.adverse_pct)+'</b></div><div class="opp-stat"><small>ENTRY / CURRENT</small><b>'+fmt(o.entry_price,5)+' / '+fmt(o.mark_price,5)+'</b></div><div class="opp-stat"><small>HOLD TIME</small><b>'+duration(hold.current_hours)+'</b></div><div class="opp-stat"><small>5M MOMENTUM</small><b class="'+((o.momentum_5m_pct||0)>=0?"positive":"negative")+'">'+pct(o.momentum_5m_pct)+'</b></div></div><div class="opp-bottom"><div class="analysis-box"><h4>RECOVERY EVIDENCE</h4>'+recovery+'<div class="analysis-line"><span>Trader typical median hold</span><b>'+duration(hold.typical_median_hours)+'</b></div><div class="sample-warning">'+esc(rec.note||"")+'</div></div><div class="analysis-box"><h4>MARKET / EVENT CONTEXT</h4><div class="cause-list">'+causeHtml+'</div><div class="sample-warning">'+esc(o.recovery_warning||"")+'</div></div></div></article>';
- }).join("");
- }catch(e){$("opportunityList").innerHTML='<div class="empty-state">'+esc(e.message)+'</div>';}
+ if(opportunitiesLoadInFlight)return;
+ opportunitiesLoadInFlight=true;
+ try{
+  const [items,scan]=await Promise.all([
+   api("/api/opportunities?limit=100"),
+   api("/api/opportunities/status")
+  ]);
+  const qual=items.filter(o=>o.qualified);
+  $("navOppCount").textContent=fmt(qual.length,0);
+  $("opportunityStatus").innerHTML=
+   '<div class="sample-warning">Scanner: <b>'+esc(scan.status||"starting")+'</b> · last completed '+date(scan.finished_at)+
+   '<br>Positions scanned: <b>'+fmt(scan.positions_scanned,0)+'</b> · underwater: <b>'+fmt(scan.underwater,0)+'</b> · qualified: <b>'+fmt(scan.qualified,0)+'</b> · paper entries created: <b>'+fmt(scan.paper_entries_created,0)+'</b> · qualified but blocked: <b>'+fmt(scan.blocked_entries,0)+'</b> · market data unverified: <b>'+fmt(scan.market_data_unverified,0)+'</b>'+
+   '<br>Kopyon feed: <b>'+esc(scan.kopyon_stream?.status||"unknown")+'</b> ('+fmt(scan.kopyon_stream?.subscriptions,0)+' subscriptions) · Binance REST: <b>'+esc(scan.binance_rest?.blocked?"RATE-LIMIT COOLDOWN":"available")+'</b>'+
+   (scan.last_error?'<br>Scanner note: '+esc(scan.last_error):'')+'</div>';
+  if(!items.length){
+   $("opportunityList").innerHTML='<div class="empty-state">No positions are present in the latest visible leader snapshots. The scanner does not create hypothetical opportunities.</div>';
+   return;
+  }
+  $("opportunityList").innerHTML=items.map(o=>{
+   const rec=o.recovery||{},hold=o.holding||{},paper=o.paper_entry||{};
+   const reasons=o.qualification_reasons||[];
+   const causes=[...(o.likely_causes||[]),...reasons.map(reason=>({label:"QUALIFICATION / ENTRY CHECK",effect:reason,risk:"adverse"}))];
+   let recovery=rec.probability===null?
+    '<div class="recovery-prob">N/A</div><div class="sample-warning">'+esc(rec.label||"Insufficient history")+' · sample '+fmt(rec.sample_size,0)+'</div>':
+    '<div class="recovery-prob">'+fmt(rec.probability,1)+'%</div><div class="analysis-line"><span>Wilson 95% interval</span><b>'+fmt(rec.ci_low,1)+'% – '+fmt(rec.ci_high,1)+'%</b></div><div class="analysis-line"><span>Comparable paths</span><b>'+fmt(rec.sample_size,0)+'</b></div>';
+   const causeHtml=causes.length?
+    causes.map(c=>'<div class="cause '+esc(c.risk||"")+'">'+esc(c.label)+' · '+esc(c.effect)+(c.url?' · <a href="'+esc(c.url)+'" target="_blank" rel="noreferrer">source</a>':"")+'</div>').join(""):
+    '<div class="cause">No related headline or qualification blocker flagged.</div>';
+   const entryLine=paper.created?
+    '<div class="analysis-line"><span>Paper execution</span><b class="positive">ENTRY CREATED · #'+fmt(paper.trade_id,0)+'</b></div>':
+    (o.qualified?
+     '<div class="analysis-line"><span>Paper execution</span><b class="negative">QUALIFIED BUT NOT ENTERED</b><br><small>'+esc(paper.reason||"No entry reason returned")+'</small></div>':
+     '<div class="analysis-line"><span>Paper execution</span><b>NOT QUALIFIED</b></div>');
+   return '<article class="opportunity-card"><div class="opp-head"><div class="opp-title"><div><h3>'+esc(o.symbol)+' <span class="'+(o.side==="LONG"?"side-long":"side-short")+'">'+esc(o.side)+'</span></h3><small>'+esc(o.trader_name)+' · '+esc(o.trader_id)+' · leader seen '+date(o.observed_at)+'</small></div></div><span class="status-tag '+(o.qualified?"qualified":o.underwater?"":"neutral")+'">'+esc(o.status)+'</span></div>'+
+    '<div class="opp-stats"><div class="opp-stat"><small>LEADER PNL</small><b class="'+((o.unrealized_pnl||0)<0?"negative":"positive")+'">'+money(o.unrealized_pnl)+'</b></div><div class="opp-stat"><small>ADVERSE FROM ENTRY</small><b class="'+((o.adverse_pct||0)>0?"negative":"positive")+'">'+pct(o.adverse_pct)+'</b></div><div class="opp-stat"><small>ENTRY / CURRENT</small><b>'+fmt(o.entry_price,5)+' / '+fmt(o.mark_price,5)+'</b></div><div class="opp-stat"><small>LEADER SNAPSHOT AGE</small><b>'+ageText(o.leader_snapshot_age_seconds)+'</b></div><div class="opp-stat"><small>5M MOMENTUM</small><b class="'+((o.momentum_5m_pct||0)>=0?"positive":"negative")+'">'+pct(o.momentum_5m_pct)+'</b></div><div class="opp-stat"><small>MARK SOURCE</small><b>'+esc(o.mark_source||"—")+'</b></div></div>'+
+    '<div class="opp-bottom"><div class="analysis-box"><h4>PAPER ENTRY DECISION</h4>'+entryLine+'<div class="cause-list">'+causeHtml+'</div></div><div class="analysis-box"><h4>RECOVERY EVIDENCE</h4>'+recovery+'<div class="analysis-line"><span>Trader typical median hold</span><b>'+duration(hold.typical_median_hours)+'</b></div><div class="sample-warning">'+esc(rec.note||"")+'</div></div></div></article>';
+  }).join("");
+ }catch(e){
+  $("opportunityStatus").innerHTML='<div class="notice error">'+esc(e.message)+'</div>';
+  $("opportunityList").innerHTML='<div class="empty-state">'+esc(e.message)+'</div>';
+ }finally{opportunitiesLoadInFlight=false;}
 }
 $("refreshOpps").onclick=loadOpportunities;
 async function loadPaper(){
