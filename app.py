@@ -1665,8 +1665,11 @@ async def paper_price_worker() -> None:
             last_symbol_refresh_at = time.monotonic()
             connection_id = int(PAPER_PRICE_STREAM_STATE.get("reconnect_count", 0)) + 1
 
+            # Current USDⓈ-M API requires the market stream control endpoint
+            # for dynamic SUBSCRIBE/UNSUBSCRIBE requests. The legacy /ws base can
+            # accept a socket but does not serve this control-subscription channel.
             async with websockets.connect(
-                "wss://fstream.binance.com/ws",
+                "wss://fstream.binance.com/market/stream",
                 ping_interval=20, ping_timeout=20, close_timeout=5,
                 open_timeout=12, max_size=1048576, max_queue=4096
             ) as ws:
