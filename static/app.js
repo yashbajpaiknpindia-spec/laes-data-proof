@@ -269,6 +269,7 @@ async function refreshPaperTradeDetail(id){
    ['Funding estimate at exit',t.funding_estimate_at_exit===null||t.funding_estimate_at_exit===undefined?'—':money(t.funding_estimate_at_exit)],
    ['Funding source',t.funding_source||'Not recorded'],
    ['Net realized / live PnL',money(t.net_pnl)],['Exit reason',t.exit_reason_display||t.exit_reason||'—'],
+   ['Post-exit recovery audit',t.post_exit_recovery_label||t.post_exit_recovery?.status||'Pending / not applicable'],
    ['Exit price',fmt(t.exit_price,8)],['MFE net',money(t.mfe_net_pnl)+' · '+pct(t.mfe_pct)],
    ['MAE net',money(t.mae_net_pnl)+' · '+pct(t.mae_pct)],
    ['Max saved data gap',fmt(t.max_data_gap_seconds,1)+' sec'],
