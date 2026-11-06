@@ -338,6 +338,40 @@ def migrate_paper_audit_metadata() -> None:
                     "This record predates persisted funding verification. Funding cannot be reconstructed from its saved audit fields."
                 ))
 
+            # Reconcile legacy closed rows into an explicit realized-exit audit record.
+            # This copies only values already stored on PaperTrade; it never infers a
+            # missing path, price, fee, funding payment, or exit reason.
+            if trade.status == "CLOSED":
+                if raw.get("realized_net_pnl") is None:
+                    raw["realized_net_pnl"] = float(trade.net_pnl or 0.0)
+                    raw["realized_net_pnl_source"] = "LEGACY_PAPER_TRADES_ROW"
+                if raw.get("realized_exit_price") is None and trade.exit_price is not None:
+                    raw["realized_exit_price"] = float(trade.exit_price)
+                if raw.get("realized_exit_at") is None and trade.closed_at is not None:
+                    raw["realized_exit_at"] = trade.closed_at.isoformat()
+                if raw.get("realized_exit_reason") is None:
+                    raw["realized_exit_reason"] = trade.exit_reason
+
+                realized_event_exists = db.scalar(select(PaperTradeEvent.id).where(
+                    PaperTradeEvent.paper_trade_id == trade.id,
+                    PaperTradeEvent.event_type.in_([
+                        "REALIZED_EXIT",
+                        "LEGACY_REALIZED_EXIT_RECONCILED"
+                    ])
+                ).limit(1))
+                if not realized_event_exists:
+                    db.add(PaperTradeEvent(
+                        paper_trade_id=trade.id,
+                        event_type="LEGACY_REALIZED_EXIT_RECONCILED",
+                        observed_at=trade.closed_at or trade.opened_at or now(),
+                        value=float(trade.net_pnl or 0.0),
+                        detail=(
+                            "Historical realized close copied from the preserved paper_trades row. "
+                            "Original exit reason and net PnL are retained; historical price path and "
+                            "funding are not reconstructed."
+                        )
+                    ))
+
             trade.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
             for event_type, event_at, detail in event_specs:
                 exists = db.scalar(select(PaperTradeEvent.id).where(
