@@ -1530,7 +1530,7 @@ async def run_post_exit_recovery_audit() -> dict:
         ).all()
     for trade in trades:
         raw = parse_json(trade.raw_json)
-        if raw.get("post_exit_recovery_audit_version") == 2:
+        if raw.get("post_exit_recovery_audit_version") == 3:
             continue
         # The post-exit market path is independently auditable even when the
         # pre-exit paper path was interrupted or incomplete. Keep the old
@@ -1583,7 +1583,7 @@ async def run_post_exit_recovery_audit() -> dict:
             recovered_to_profit = best["max_net_pnl"] > 0
             recovered_to_entry = first_entry_cross is not None
             raw.update({
-                "post_exit_recovery_audit_version": 2,
+                "post_exit_recovery_audit_version": 3,
                 "post_exit_recovery_status": "RECOVERED_TO_NET_PROFIT" if recovered_to_profit else ("RECOVERED_TO_ENTRY_ONLY" if recovered_to_entry else "NO_ENTRY_RECOVERY"),
                 "post_exit_recovery_market_source": "BINANCE_USDM_MARK_PRICE_1M",
                 "post_exit_recovery_horizon_hours": horizon_hours,
@@ -1615,12 +1615,12 @@ async def run_post_exit_recovery_audit() -> dict:
                     live.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
                     exists = db.scalar(select(PaperTradeEvent.id).where(
                         PaperTradeEvent.paper_trade_id == trade.id,
-                        PaperTradeEvent.event_type == "POST_EXIT_RECOVERY_AUDIT_V2"
+                        PaperTradeEvent.event_type == "POST_EXIT_RECOVERY_AUDIT_V3"
                     ).limit(1))
                     if not exists:
                         db.add(PaperTradeEvent(
                             paper_trade_id=trade.id,
-                            event_type="POST_EXIT_RECOVERY_AUDIT_V2",
+                            event_type="POST_EXIT_RECOVERY_AUDIT_V3",
                             observed_at=live.closed_at or now(),
                             value=best["max_net_pnl"],
                             detail=raw["post_exit_recovery_label"]
