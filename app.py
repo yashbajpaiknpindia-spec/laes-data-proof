@@ -726,7 +726,7 @@ async def run_monitor_cycle(force: bool = False) -> dict:
                 except Exception as exc:
                     log_check("trader_profile", False, None, None, f"{trader_id}: {str(exc)[:700]}")
             try:
-                opportunities = await api_opportunities(limit=100)
+                opportunities = await scan_paper_opportunities(limit=100, allow_entry_creation=True)
                 qualified_count = sum(1 for item in opportunities if item.get("qualified"))
                 market_blocked = sum(1 for item in opportunities if any("live Binance" in reason for reason in item.get("dead_market_reasons", [])))
                 log_check("paper_analysis", True, 200, None, f"observed={len(opportunities)} qualified={qualified_count} live_market_warmup_or_blocked={market_blocked}")
@@ -766,7 +766,7 @@ async def monitor_worker() -> None:
         while True:
             await asyncio.sleep(60)
             try:
-                opportunities = await api_opportunities(limit=100)
+                opportunities = await scan_paper_opportunities(limit=100, allow_entry_creation=True)
                 qualified_count = sum(1 for item in opportunities if item.get("qualified"))
                 log_check("paper_analysis", True, 200, None, f"minute_recheck observed={len(opportunities)} qualified={qualified_count}")
             except Exception as exc:
@@ -1279,7 +1279,10 @@ def find_news_for_symbol(symbol: str, items: list[dict]) -> list[dict]:
             matches.append(item)
     return matches[:5]
 
-async def build_opportunity(obs: PositionObservation, snapshot_time: str | None, trader_name: str | None, news: list[dict]) -> dict:
+async def build_opportunity(
+    obs: PositionObservation, snapshot_time: str | None, trader_name: str | None,
+    news: list[dict], allow_entry_creation: bool = False
+) -> dict:
     raw = parse_json(obs.raw_json)
     entry = obs.entry_price
     cfg = paper_config()
@@ -1359,7 +1362,7 @@ async def build_opportunity(obs: PositionObservation, snapshot_time: str | None,
     causes.extend([{"type": "news_context", "label": item["title"], "effect": "Contemporaneous headline; not proof of causation", "url": item["url"], "published_at": item["published_at"], "risk": "context"} for item in matched_news])
     recovery = recovery_statistics(obs.trader_id, obs.position_key, obs.symbol, obs.side, entry)
     hold = holding_time(obs.trader_id, obs.position_key, raw, snapshot_time)
-    if qualified and cfg.get("auto_enabled"):
+    if qualified and cfg.get("auto_enabled") and allow_entry_creation:
         create_paper_trade(obs, trader_name, mark or entry or 0, cfg, market)
     return {
         "trader_id": obs.trader_id, "trader_name": trader_name or obs.trader_id,
@@ -2321,10 +2324,14 @@ async def paper_price_worker() -> None:
 
 @app.get("/api/opportunities")
 async def api_opportunities(limit: int = 100):
-    async with opportunity_lock:
-        return await _api_opportunities_locked(limit)
+    # Read-only scanner endpoint: opening/refreshing a page must never create a trade.
+    return await scan_paper_opportunities(limit=limit, allow_entry_creation=False)
 
-async def _api_opportunities_locked(limit: int = 100):
+async def scan_paper_opportunities(limit: int = 100, allow_entry_creation: bool = True):
+    async with opportunity_lock:
+        return await _api_opportunities_locked(limit, allow_entry_creation)
+
+async def _api_opportunities_locked(limit: int = 100, allow_entry_creation: bool = False):
     limit = max(1, min(limit, 200))
     with SessionLocal() as db:
         latest_ids = select(func.max(PositionSnapshot.id).label("id")).group_by(PositionSnapshot.trader_id).subquery()
@@ -2343,8 +2350,10 @@ async def _api_opportunities_locked(limit: int = 100):
     result = []
     for obs in list(latest.values())[:limit]:
         snapshot = visible.get(obs.snapshot_id)
-        result.append(await build_opportunity(obs, snapshot.observed_at.isoformat() if snapshot else None, traders.get(obs.trader_id), news))
-    await evaluate_open_paper_trades()
+        result.append(await build_opportunity(
+            obs, snapshot.observed_at.isoformat() if snapshot else None,
+            traders.get(obs.trader_id), news, allow_entry_creation=allow_entry_creation
+        ))
     return sorted(result, key=lambda x: (x["qualified"], x["adverse_pct"] or 0), reverse=True)
 
 
