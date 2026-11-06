@@ -132,7 +132,9 @@
               <label>Taker fee <span>% per side</span><input name="taker_fee_pct" type="number" min="0" step="0.005" value="0.05"></label>
               <label>Slippage <span>% per side</span><input name="slippage_pct" type="number" min="0" step="0.005" value="0.02"></label>
               <label>Leverage ceiling <span>×</span><input name="max_leverage" type="number" min="1" max="5" step="0.5" value="3"></label>
-              <label>Leader adverse threshold <span>%</span><input name="min_adverse_pct" type="number" min="0.05" step="0.05" value="0.3"></label>
+              <label>Leader adverse threshold <span>% before entry can qualify</span><input name="min_adverse_pct" type="number" min="0.05" step="0.05" value="0.3"></label>
+              <label>Leader-continuation hard-loss ceiling <span>% adverse from paper entry</span><input name="leader_continuation_hard_loss_price_pct" type="number" min="0.05" max="10" step="0.05" value="0.6"></label>
+              <label>Maximum leader-continuation hold <span>minutes after paper stop is deferred</span><input name="leader_continuation_max_minutes" type="number" min="1" max="240" step="1" value="30"></label>
             </div>
             <label class="toggle-row"><span><b>Automatic paper entries</b><small>Enter only when an observed underwater leader also has same-direction 5m price confirmation.</small></span><input name="auto_enabled" type="checkbox" checked></label>
             <button class="btn btn-primary" type="submit">Save paper settings</button><span id="paperSaveStatus" class="muted-note"></span>
