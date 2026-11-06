@@ -323,6 +323,8 @@ def migrate_paper_audit_metadata() -> None:
 
             event_specs = []
             if opened and opened < cutoff_utc:
+                # The user's 4:59 PM research cutoff takes precedence over generic
+                # data-gap classification; both facts can still be shown separately.
                 raw["data_quality_status"] = "INFORMATION_CUTOFF"
                 raw["information_cutoff_at"] = "2026-11-05T16:59:00+05:30"
                 raw["information_cutoff_reason"] = (
@@ -334,19 +336,31 @@ def migrate_paper_audit_metadata() -> None:
                     cutoff_utc,
                     "Historical record classified at the requested 2026-11-05 16:59 IST information cutoff; financial outcome unchanged."
                 ))
-            elif trade.status == "CLOSED" and trade.exit_reason == "STOP_LOSS" and max_gap > 15:
+                if max_gap > 15:
+                    event_specs.append((
+                        "DATA_INTERRUPTED_REVIEW",
+                        trade.closed_at or trade.opened_at or cutoff_utc,
+                        f"Historical maximum saved price-path gap: {max_gap:.1f} seconds; INFORMATION_CUTOFF label retained and financial outcome unchanged."
+                    ))
+            elif max_gap > 15:
+                # A historical gap remains visible regardless of whether the path
+                # later recovered or the original paper trade eventually closed.
                 raw["data_quality_status"] = "DATA_INTERRUPTED_REVIEW"
                 raw["data_quality_reason"] = (
-                    "A saved price-path interval exceeded 15 seconds. Stop-loss PnL is retained as the old simulated exit, "
-                    "but this is not a continuously observed strategy-failure label."
+                    "At least one saved price-path interval exceeded 15 seconds. "
+                    "Monitoring may have resumed later, but the missing historical interval "
+                    "cannot be reconstructed. Recorded PnL and exit are preserved."
                 )
                 event_specs.append((
                     "DATA_INTERRUPTED_REVIEW",
-                    trade.closed_at or now(),
-                    f"Historical maximum saved price-path gap: {max_gap:.1f} seconds; existing exit and PnL preserved."
+                    trade.closed_at or trade.opened_at or now(),
+                    f"Historical maximum saved price-path gap: {max_gap:.1f} seconds; existing financial outcome preserved."
                 ))
             elif not raw.get("data_quality_status"):
-                raw["data_quality_status"] = "PATH_NOT_RECORDED" if max_gaps.get(trade.id) is None else "LEGACY_UNCLASSIFIED"
+                raw["data_quality_status"] = "PATH_NOT_RECORDED" if trade.id not in max_gaps else "LEGACY_UNCLASSIFIED"
+
+            if max_gap > 15 and raw.get("monitoring_status") != "RESUMED_AFTER_GAP":
+                raw["monitoring_status"] = "INTERRUPTED"
 
             if "funding_history_verified" not in raw:
                 raw["funding_audit_status"] = "LEGACY_FUNDING_UNVERIFIED"
@@ -477,6 +491,41 @@ def binance_rest_status() -> dict:
         "remaining_seconds": round(remaining, 1),
         "reason": BINANCE_REST_BLOCK_REASON if remaining else None
     }
+
+
+def restore_binance_rest_cooldown() -> None:
+    """
+    Restore an active Binance 418/429 ban after a Render restart/redeploy.
+    Otherwise each restart could make another prohibited REST request.
+    """
+    global BINANCE_REST_BLOCKED_UNTIL, BINANCE_REST_BLOCK_REASON
+    try:
+        with SessionLocal() as db:
+            row = db.scalar(
+                select(SourceCheck)
+                .where(SourceCheck.source == "binance_rest_circuit_breaker")
+                .order_by(desc(SourceCheck.id))
+                .limit(1)
+            )
+        if not row or not row.detail:
+            return
+        match = re.search(r"REST paused until (\S+)", row.detail)
+        if not match:
+            return
+        expires_at = datetime.fromisoformat(match.group(1).rstrip("."))
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        expires_epoch = expires_at.timestamp()
+        if expires_epoch > time.time():
+            BINANCE_REST_BLOCKED_UNTIL = expires_epoch
+            BINANCE_REST_BLOCK_REASON = row.detail[:700]
+    except Exception:
+        # The live WebSocket path must still start even if the persisted audit row
+        # cannot be read; it will re-establish the circuit breaker on next 418/429.
+        return
+
+
+restore_binance_rest_cooldown()
 
 
 async def binance_get(path: str, params: dict | None = None) -> tuple[Any, int]:
@@ -1464,19 +1513,46 @@ async def evaluate_open_paper_trades(
                     db.add(PaperTradeEvent(paper_trade_id=trade.id,event_type=f"PROFIT_{key}PCT",observed_at=ts,value=net,detail=f"First observed net-margin profit >= {step}%"))
             raw["mfe_net_pnl"], raw["mae_net_pnl"] = max(float(raw["mfe_net_pnl"]), net), min(float(raw["mae_net_pnl"]), net)
             trade.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
-            # A long data gap must not be mistaken for a continuously observed stop-out.
-            # If the first resumed mark is losing, wait for three consecutive fresh samples.
-            if gap > 15 and net <= 0:
+            # Keep historical path quality separate from current monitor health.
+            # Three fresh observations mean monitoring has resumed; the earlier missing
+            # interval remains a permanent DATA_INTERRUPTED_REVIEW label.
+            if gap > 15:
+                if raw.get("data_quality_status") != "INFORMATION_CUTOFF":
+                    raw["data_quality_status"] = "DATA_INTERRUPTED_REVIEW"
+                    raw["data_quality_reason"] = (
+                        "A price-feed interval exceeded 15 seconds. The missing historical "
+                        "interval cannot be reconstructed; the financial outcome is preserved."
+                    )
+                raw["monitoring_status"] = "INTERRUPTED"
+                raw["monitoring_interruption_started_at"] = ts.isoformat()
                 raw["post_gap_confirmations"] = 0
-                raw["data_quality_status"] = "DATA_INTERRUPTED_REVIEW"
-                db.add(PaperTradeEvent(paper_trade_id=trade.id,event_type="DATA_GAP",observed_at=ts,value=net,detail=f"Price feed gap {gap:.1f}s; losing exit deferred"))
-            elif raw.get("data_quality_status") == "DATA_INTERRUPTED_REVIEW" and net <= 0:
+                db.add(PaperTradeEvent(
+                    paper_trade_id=trade.id, event_type="DATA_GAP",
+                    observed_at=ts, value=net,
+                    detail=f"Price feed gap {gap:.1f}s; a losing stop is deferred until three consecutive fresh updates."
+                ))
+            elif (
+                raw.get("monitoring_status") == "INTERRUPTED"
+                or (
+                    raw.get("data_quality_status") == "DATA_INTERRUPTED_REVIEW"
+                    and raw.get("monitoring_status") != "RESUMED_AFTER_GAP"
+                )
+            ):
                 raw["post_gap_confirmations"] = int(raw.get("post_gap_confirmations", 0)) + 1
                 if raw["post_gap_confirmations"] >= 3:
-                    raw["data_quality_status"] = "CONTINUOUS_AGAIN"
+                    raw["monitoring_status"] = "RESUMED_AFTER_GAP"
+                    raw["monitoring_resumed_at"] = ts.isoformat()
+                    db.add(PaperTradeEvent(
+                        paper_trade_id=trade.id, event_type="DATA_MONITOR_RESUMED",
+                        observed_at=ts, value=net,
+                        detail="Three fresh consecutive price observations received. Historical data-quality classification remains unchanged."
+                    ))
             # Capture every sampled positive net amount. No minimum threshold: even
             # +0.0014 USDT is a realized paper exit once round-trip costs and funding are covered.
-            gap_guard = raw.get("data_quality_status") == "DATA_INTERRUPTED_REVIEW" and net <= 0
+            gap_guard = (
+                raw.get("monitoring_status") == "INTERRUPTED"
+                and net <= 0
+            )
             hit_stop = mark <= trade.stop_price if trade.side == "LONG" else mark >= trade.stop_price
             hit_target = mark >= trade.target_price if trade.side == "LONG" else mark <= trade.target_price
             exit_reason = None
@@ -2049,6 +2125,7 @@ async def api_paper():
             "mae_net_pnl": safe_float(raw.get("mae_net_pnl")),
             "mfe_pct": safe_float(raw.get("mfe_pct")), "mae_pct": safe_float(raw.get("mae_pct")),
             "data_quality_status": raw.get("data_quality_status", "LEGACY_UNCLASSIFIED"),
+            "monitoring_status": raw.get("monitoring_status", "NOT_RECORDED"),
             "max_data_gap_seconds": round(max_gap, 3),
             "funding_history_verified": raw.get("funding_history_verified"),
             "funding_audit_status": raw.get("funding_audit_status", "LEGACY_FUNDING_UNVERIFIED"),
@@ -2315,6 +2392,8 @@ async def api_paper_trade_detail(trade_id: int):
             "data_gap_seconds": safe_float(raw.get("last_data_gap_seconds")),
             "max_data_gap_seconds": round(max_gap, 3),
             "data_quality_status": quality_status,
+            "monitoring_status": raw.get("monitoring_status", "NOT_RECORDED"),
+            "monitoring_resumed_at": raw.get("monitoring_resumed_at"),
             "meaningful_profit_hits": raw.get("meaningful_profit_hits", {}),
             "funding_history_rows": raw.get("funding_history_rows")
         },
