@@ -217,6 +217,11 @@ PAPER_PRICE_STREAM_STATE: dict[str, Any] = {
     "subscribed_symbols": [], "unsupported_symbols": [], "last_error": None
 }
 PAPER_SYMBOL_LAST_UPDATE: dict[str, str] = {}
+PAPER_SYMBOL_LAST_PRICE: dict[str, float] = {}
+PAPER_SYMBOL_LAST_PRICE_AT: dict[str, float] = {}
+PAPER_SYMBOL_FUNDING_RATE: dict[str, float] = {}
+PAPER_SYMBOL_INDEX_PRICE: dict[str, float] = {}
+PAPER_SYMBOL_PRICE_HISTORY: dict[str, list[tuple[float, float]]] = {}
 PAPER_CANDLE_CACHE: dict[str, dict[str, Any]] = {}
 templates = Jinja2Templates(directory="templates")
 
@@ -720,9 +725,14 @@ async def run_monitor_cycle(force: bool = False) -> dict:
                 except Exception as exc:
                     log_check("trader_profile", False, None, None, f"{trader_id}: {str(exc)[:700]}")
             try:
-                await api_opportunities(limit=100)
+                    opportunities = await api_opportunities(limit=100)
+                qualified_count = sum(1 for item in opportunities if item.get("qualified"))
+                market_blocked = sum(1 for item in opportunities if any("live Binance" in reason for reason in item.get("dead_market_reasons", [])))
+                log_check("paper_analysis", True, 200, None, f"observed={len(opportunities)} qualified={qualified_count} live_market_warmup_or_blocked={market_blocked}")
             except Exception as analysis_exc:
                 log_check("paper_analysis", False, None, None, str(analysis_exc))
+                opportunities = []
+                qualified_count = 0
             await evaluate_open_paper_trades()
             last_scan.update({
                 "state": "idle",
@@ -732,6 +742,8 @@ async def run_monitor_cycle(force: bool = False) -> dict:
                 "positions_checked": checked,
                 "observations_saved": saved,
                 "profiles_loaded": profiles_loaded,
+                "opportunities_analyzed": len(opportunities),
+                "qualified_opportunities": qualified_count,
                 "selected_trader_ids": selected
             })
             last_manual_sync = time.time()
@@ -745,11 +757,22 @@ async def monitor_worker() -> None:
     global worker_alive
     worker_alive = True
     try:
-        # First discovery starts automatically at process startup.
+        # Discover/sync leaders on the existing 30-minute provider cadence.
+        # Re-evaluate the newest visible positions every minute using the
+        # WebSocket-fed market price history; this does not add Kopyon calls.
         await run_monitor_cycle()
+        last_discovery = time.monotonic()
         while True:
-            await asyncio.sleep(DISCOVERY_INTERVAL)
-            await run_monitor_cycle()
+            await asyncio.sleep(60)
+            try:
+                opportunities = await api_opportunities(limit=100)
+                qualified_count = sum(1 for item in opportunities if item.get("qualified"))
+                log_check("paper_analysis", True, 200, None, f"minute_recheck observed={len(opportunities)} qualified={qualified_count}")
+            except Exception as exc:
+                log_check("paper_analysis", False, None, None, f"minute_recheck: {str(exc)[:700]}")
+            if time.monotonic() - last_discovery >= DISCOVERY_INTERVAL:
+                await run_monitor_cycle()
+                last_discovery = time.monotonic()
     except asyncio.CancelledError:
         raise
     finally:
@@ -1069,11 +1092,31 @@ def rsi_value(closes: list[float], period: int = 14) -> float | None:
 async def market_features(symbol: str, refresh: bool = False) -> dict:
     with SessionLocal() as db:
         cache = db.get(MarketInsight, symbol)
-        if cache and not refresh and (now() - cache.fetched_at).total_seconds() < 1800:
+        cache_age = (now() - cache.fetched_at).total_seconds() if cache else None
+        # Static liquidity/volatility data is reused for up to 12h to avoid
+        # repeatedly exhausting Binance REST. Mark price, funding and 5m
+        # confirmation are refreshed from the live mark-price WebSocket.
+        if cache and not refresh and cache_age is not None and cache_age < 43200:
             cached = parse_json(cache.raw_json)
             cached_closes = cached.get("closes_1h") if isinstance(cached, dict) else None
-            # Re-fetch older cache rows created before list-valued Binance klines were parsed correctly.
             if isinstance(cached_closes, list) and len(cached_closes) >= 25 and cached.get("quote_volume_24h_usdt") is not None and cached.get("spread_pct") is not None and cached.get("min_depth_within_1pct_usdt") is not None and cached.get("volume_ratio_recent_6h_vs_prior_24h") is not None:
+                live_at = PAPER_SYMBOL_LAST_PRICE_AT.get(symbol)
+                live_fresh = bool(live_at and time.time() - live_at <= 10)
+                live_price = PAPER_SYMBOL_LAST_PRICE.get(symbol) if live_fresh else None
+                history = PAPER_SYMBOL_PRICE_HISTORY.get(symbol, [])
+                cutoff = time.time() - 300
+                baseline = next((price for stamp, price in history if stamp <= cutoff), None)
+                momentum_fresh = bool(live_fresh and baseline and baseline > 0 and live_price and live_price > 0)
+                cached["momentum_5m_pct"] = ((live_price / baseline) - 1) * 100 if momentum_fresh else None
+                if live_fresh and live_price:
+                    cached["mark_price"] = live_price
+                    cached["funding_rate"] = PAPER_SYMBOL_FUNDING_RATE.get(symbol, cached.get("funding_rate"))
+                    cached["index_price"] = PAPER_SYMBOL_INDEX_PRICE.get(symbol, cached.get("index_price"))
+                cached["live_price_fresh"] = live_fresh
+                cached["momentum_5m_fresh"] = momentum_fresh
+                cached["market_data_age_seconds"] = round(cache_age, 1)
+                cached["fetched_at"] = cache.fetched_at.isoformat()
+                cached["source"] = "Cached Binance liquidity/volatility + live WebSocket mark price"
                 return cached
     premium, _ = await binance_get("/fapi/v1/premiumIndex", {"symbol": symbol})
     ticker24, _ = await binance_get("/fapi/v1/ticker/24hr", {"symbol": symbol})
@@ -1123,6 +1166,8 @@ async def market_features(symbol: str, refresh: bool = False) -> dict:
         "seven_day_return_pct": seven_return, "twenty_four_hour_return_pct": day_return,
         "atr_24h_pct": atr_pct, "rsi_1h": rsi_value(closes),
         "momentum_5m_pct": mom5, "closes_1h": closes[-30:],
+        "live_price_fresh": True, "momentum_5m_fresh": True,
+        "market_data_age_seconds": 0.0,
         "source": "Binance USDⓈ-M Futures public market data"
     }
     with SessionLocal() as db:
@@ -1217,19 +1262,28 @@ def find_news_for_symbol(symbol: str, items: list[dict]) -> list[dict]:
 async def build_opportunity(obs: PositionObservation, snapshot_time: str | None, trader_name: str | None, news: list[dict]) -> dict:
     raw = parse_json(obs.raw_json)
     entry = obs.entry_price
-    try:
-        market = await market_features(obs.symbol)
-    except Exception as exc:
-        market = {"symbol": obs.symbol, "error": str(exc)[:220], "source": "Binance market data unavailable"}
-    mark = safe_float(market.get("mark_price")) or obs.mark_price
+    cfg = paper_config()
+    min_adverse = float(cfg["min_adverse_pct"])
+    leader_mark = safe_float(obs.mark_price)
+    leader_adverse = None
+    if entry and leader_mark and entry > 0:
+        leader_adverse = ((entry - leader_mark) / entry * 100) if obs.side == "LONG" else ((leader_mark - entry) / entry * 100)
+    leader_underwater = (obs.unrealized_pnl is not None and obs.unrealized_pnl < 0) or (leader_adverse is not None and leader_adverse > 0)
+    # Do not fetch six Binance REST endpoints for positions that cannot qualify.
+    if leader_underwater and leader_adverse is not None and leader_adverse >= min_adverse:
+        try:
+            market = await market_features(obs.symbol)
+        except Exception as exc:
+            market = {"symbol": obs.symbol, "error": str(exc)[:220], "source": "Binance market data unavailable"}
+    else:
+        market = {"symbol": obs.symbol, "mark_price": leader_mark, "momentum_5m_pct": None, "not_requested": True}
+    mark = safe_float(market.get("mark_price")) or leader_mark
     adverse = None
     if entry and mark and entry > 0:
         adverse = ((entry - mark) / entry * 100) if obs.side == "LONG" else ((mark - entry) / entry * 100)
     underwater = (obs.unrealized_pnl is not None and obs.unrealized_pnl < 0) or (adverse is not None and adverse > 0)
-    cfg = paper_config()
     momentum = safe_float(market.get("momentum_5m_pct"))
-    confirmation = momentum is not None and ((momentum > 0) if obs.side == "LONG" else (momentum < 0))
-    min_adverse = float(cfg["min_adverse_pct"])
+    confirmation = bool(market.get("momentum_5m_fresh")) and momentum is not None and ((momentum > 0) if obs.side == "LONG" else (momentum < 0))
     quote_volume = safe_float(market.get("quote_volume_24h_usdt"))
     spread_pct = safe_float(market.get("spread_pct"))
     funding_rate = safe_float(market.get("funding_rate"))
@@ -1247,6 +1301,10 @@ async def build_opportunity(obs: PositionObservation, snapshot_time: str | None,
         dead_market_reasons.append("recent 6h volume below 30% of prior 24h hourly baseline or unavailable")
     if atr_quality is None or atr_quality < 0.02 or atr_quality > 8.0:
         dead_market_reasons.append("volatility too low or disorderly")
+    if not market.get("live_price_fresh", False):
+        dead_market_reasons.append("live Binance mark-price stream not warmed")
+    if not market.get("momentum_5m_fresh", False):
+        dead_market_reasons.append("live 5-minute momentum not warmed")
     if funding_rate is not None and ((obs.side == "LONG" and funding_rate > 0.0005) or (obs.side == "SHORT" and funding_rate < -0.0005)):
         dead_market_reasons.append("funding cost is unusually adverse for this side")
     market_quality_ok = not dead_market_reasons
@@ -1932,11 +1990,18 @@ async def evaluate_open_paper_trades(
 
 async def _open_paper_symbols() -> list[str]:
     with SessionLocal() as db:
-        return sorted({
+        open_symbols = {
             str(trade.symbol).upper()
             for trade in db.scalars(select(PaperTrade).where(PaperTrade.status == "OPEN")).all()
             if trade.symbol
-        })
+        }
+        latest_ids = select(func.max(PositionSnapshot.id).label("id")).group_by(PositionSnapshot.trader_id).subquery()
+        latest = db.scalars(select(PositionSnapshot).join(latest_ids, PositionSnapshot.id == latest_ids.c.id)).all()
+        visible_ids = [snap.id for snap in latest if not snap.hidden]
+        leader_symbols = set(db.scalars(
+            select(PositionObservation.symbol).where(PositionObservation.snapshot_id.in_(visible_ids))
+        ).all()) if visible_ids else set()
+        return sorted(open_symbols | {str(symbol).upper() for symbol in leader_symbols if symbol})
 
 
 async def _ws_send_symbol_action(ws, action: str, symbols: set[str], request_id: int, pending: dict) -> int:
@@ -2060,6 +2125,20 @@ async def paper_price_worker() -> None:
                                     )
                                     pending_prices[symbol] = price
                                     pending_event_times[symbol] = event_at
+                                    event_epoch = event_at.timestamp()
+                                    PAPER_SYMBOL_LAST_PRICE[symbol] = price
+                                    PAPER_SYMBOL_LAST_PRICE_AT[symbol] = event_epoch
+                                    funding_value = safe_float(data.get("r"))
+                                    index_value = safe_float(data.get("i"))
+                                    if funding_value is not None:
+                                        PAPER_SYMBOL_FUNDING_RATE[symbol] = funding_value
+                                    if index_value is not None:
+                                        PAPER_SYMBOL_INDEX_PRICE[symbol] = index_value
+                                    history = PAPER_SYMBOL_PRICE_HISTORY.setdefault(symbol, [])
+                                    history.append((event_epoch, price))
+                                    cutoff_epoch = event_epoch - 600
+                                    while history and history[0][0] < cutoff_epoch:
+                                        history.pop(0)
                                     last_price_message_at = time.monotonic()
                                     PAPER_SYMBOL_LAST_UPDATE[symbol] = event_at.isoformat()
                                     PAPER_PRICE_STREAM_STATE["price_updates_received"] = int(
