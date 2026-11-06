@@ -1,6 +1,7 @@
 const $=id=>document.getElementById(id);
 const state={page:"overview"};
 let paperDetailTimer=null;
+let paperLoadInFlight=false;
 const fmt=(v,d=2)=>v===null||v===undefined||v===""||Number.isNaN(Number(v))?"—":Number(v).toLocaleString(undefined,{maximumFractionDigits:d});
 const money=v=>v===null||v===undefined?"—":fmt(v,Math.abs(Number(v))<0.01?8:4)+" USDT";
 const pct=v=>v===null||v===undefined?"—":fmt(v,2)+"%";
@@ -88,6 +89,8 @@ async function loadOpportunities(){
 }
 $("refreshOpps").onclick=loadOpportunities;
 async function loadPaper(){
+ if(paperLoadInFlight)return;
+ paperLoadInFlight=true;
  try{
   const d=await api("/api/paper");
   $("paperCapital").textContent=money(d.capital);
@@ -99,14 +102,21 @@ async function loadPaper(){
   $("paperEquity").textContent=money(d.equity);
   const f=$("paperSettings");
   Object.entries(d.config||{}).forEach(([k,v])=>{const el=f.elements[k];if(el){if(el.type==="checkbox")el.checked=!!v;else el.value=v;}});
-  const rs=d.risk_summary||{}, groups=d.correlated_exposure_groups||[];
+  const rs=d.risk_summary||{}, groups=d.correlated_exposure_groups||[], feed=d.price_feed||{};
+  const feedState=feed.connected?"LIVE":(feed.status||"STARTING").replaceAll("_"," ").toUpperCase();
+  const restState=feed.binance_rest?.blocked?"REST PAUSED · IP RATE LIMIT":"REST BACKUP ARMED";
   $("paperRiskClusters").innerHTML=
    '<div class="profile-grid">'+[
+    ["Binance mark-price feed",feedState],
+    ["Active subscribed symbols",fmt(feed.active_symbols,0)],
+    ["Last mark update",date(feed.last_price_at)],
+    ["REST protection",restState],
     ["Risk mode",rs.mode||"—"],
     ["Shared-direction clusters",fmt(rs.correlated_groups,0)],
     ["Estimated open stop risk",money(rs.estimated_open_stop_risk_usdt)],
     ["Largest cluster stop risk",money(rs.largest_shared_direction_stop_risk_usdt)]
    ].map(x=>'<div class="profile-metric"><small>'+esc(x[0])+'</small><b>'+esc(x[1])+'</b></div>').join("")+'</div>'+
+   (feed.last_error?'<div class="sample-warning">Price feed note: '+esc(feed.last_error)+'</div>':'')+
    '<div class="sample-warning">'+esc(rs.warning||"Correlated exposure is aggregated by futures symbol and direction.")+'</div>'+
    (groups.length?'<div class="profile-history"><table><thead><tr><th>SYMBOL / DIRECTION</th><th>OPEN SIGNALS</th><th>NOTIONAL</th><th>STOP RISK</th><th>LIVE NET PNL</th><th>LEADERS</th></tr></thead><tbody>'+
     groups.map(g=>'<tr><td><b>'+esc(g.symbol)+'</b> <span class="'+(g.side==="LONG"?"side-long":"side-short")+'">'+esc(g.side)+'</span></td><td>'+fmt(g.open_count,0)+'</td><td>'+money(g.open_notional)+'</td><td class="negative">'+money(g.estimated_stop_loss_usdt)+'</td><td class="'+(g.current_net_pnl>=0?"positive":"negative")+'">'+money(g.current_net_pnl)+'</td><td>'+esc((g.leaders||[]).join(", "))+'</td></tr>').join("")+
@@ -157,6 +167,7 @@ async function loadPaper(){
    '</tr>';
   }).join("");
  }catch(e){notice("Paper ledger: "+e.message,"error");}
+ finally{paperLoadInFlight=false;}
 }
 function paperChartSvg(d){
  const candles=d.candles||[], path=d.path||[], leaderPath=d.leader_path||[], t=d.trade||{}, l=d.leader||{};
@@ -165,14 +176,14 @@ function paperChartSvg(d){
  candles.forEach(c=>{if(ts(c.open_time)!==null)times.push(ts(c.open_time));if(ts(c.close_time)!==null)times.push(ts(c.close_time));});
  path.forEach(p=>{if(ts(p.at)!==null)times.push(ts(p.at));});
  leaderPath.forEach(p=>{if(ts(p.at)!==null)times.push(ts(p.at));});
- [t.opened_at,t.closed_at].forEach(v=>{if(ts(v)!==null)times.push(ts(v));});
+ [t.opened_at,t.closed_at,t.last_binance_price_at].forEach(v=>{if(ts(v)!==null)times.push(ts(v));});
  if(!times.length)return '<div class="empty-state">No timestamped market candles or trade path are available for this instrument.</div>';
  const t0=Math.min(...times),t1=Math.max(...times),tspan=Math.max(1,t1-t0);
  const prices=[];
  candles.forEach(c=>[c.high,c.low,c.open,c.close].forEach(v=>{if(v!==null&&v!==undefined&&Number.isFinite(Number(v)))prices.push(Number(v));}));
  path.forEach(p=>{if(p.paper_price!==null&&p.paper_price!==undefined&&Number.isFinite(Number(p.paper_price)))prices.push(Number(p.paper_price));});
  leaderPath.forEach(p=>{if(p.mark_price!==null&&p.mark_price!==undefined&&Number.isFinite(Number(p.mark_price)))prices.push(Number(p.mark_price));});
- [t.entry_price,t.exit_price,t.stop_price,t.target_price,l.entry_price].forEach(v=>{if(v!==null&&v!==undefined&&Number.isFinite(Number(v)))prices.push(Number(v));});
+ [t.entry_price,t.mark_price,t.exit_price,t.stop_price,t.target_price,l.entry_price].forEach(v=>{if(v!==null&&v!==undefined&&Number.isFinite(Number(v)))prices.push(Number(v));});
  if(!prices.length)return '<div class="empty-state">Price history is not available.</div>';
  let pmin=Math.min(...prices),pmax=Math.max(...prices);if(pmax===pmin){pmax+=Math.abs(pmax)*0.001||1;pmin-=Math.abs(pmin)*0.001||1;}
  const x=v=>6+(Math.max(0,Math.min(1,(v-t0)/tspan))*88);
@@ -209,6 +220,11 @@ function paperChartSvg(d){
  };
  hline(t.entry_price,"#b49aff","Our entry");
  hline(l.entry_price,"#5bd5ae","Leader entry / recovery");
+ const liveAt=ts(t.last_binance_price_at);
+ if(t.mark_price!==null&&t.mark_price!==undefined&&Number.isFinite(Number(t.mark_price))){
+  const liveX=liveAt===null?94:x(liveAt),liveY=y(t.mark_price);
+  parts.push('<circle cx="'+liveX+'" cy="'+liveY+'" r="1.9" fill="#f4c96b" stroke="#111923" stroke-width=".5"><title>Latest Binance mark '+fmt(t.mark_price,8)+' · '+date(t.last_binance_price_at)+'</title></circle>');
+ }
  hline(t.stop_price,"#e36a74","Paper stop");
  hline(t.target_price,"#e6bb69","Preferred target");
  (d.campaign?.trades||[]).forEach(camp=>{
@@ -283,7 +299,7 @@ async function openPaperTrade(id){
  paperDetailTimer=setInterval(()=>{
   if(!modal.open){clearInterval(paperDetailTimer);paperDetailTimer=null;return;}
   refreshPaperTradeDetail(id);
- },10000);
+ },2000);
 }
 window.openPaperTrade=openPaperTrade;
 $("reloadPaper").onclick=loadPaper;
@@ -298,5 +314,16 @@ $("loadMarket").onclick=loadMarket;$("marketSymbol").addEventListener("keydown",
 async function loadSystem(){$("tableMetrics").innerHTML='<div class="empty-state">Reading database telemetry…</div>';try{const d=await api("/api/system"),db=d.database||{},m=d.monitor||{};$("dbEngine").textContent=(db.engine||"unknown").toUpperCase();$("dbUsedLarge").textContent=db.used_mb===null||db.used_mb===undefined?"Not reported":fmt(db.used_mb,3)+" MB";$("dbConnection").textContent="Connection: "+db.connection+" · persistent: "+(db.persistent?"yes":"no");$("dbCapacityLarge").textContent=db.capacity_note||"";$("dbBarLarge").style.width=db.configured_capacity_gb&&db.used_mb!==null?Math.min(100,db.used_mb/(db.configured_capacity_gb*1024)*100)+"%":"0%";$("workerState").textContent=m.worker_alive?"Running":"Not active";$("workerInterval").textContent=Math.round((m.interval_seconds||0)/60)+" minutes";$("workerBatch").textContent=(m.batch||0)+" traders / pass";$("workerLastState").textContent=m.state||"—";$("workerError").textContent=m.last_error||"None";$("runtimeCaveat").textContent=d.runtime?.render_free_sleep_warning||"";$("tableMetrics").innerHTML=db.tables?.length?db.tables.map(t=>'<div class="table-metric"><b>'+esc(t.name)+'</b><small>'+(t.bytes===null?"Size unavailable":fmt(t.bytes/1024,1)+" KB")+'</small></div>').join(""):'<div class="empty-state">No table-size breakdown returned.</div>';$("rowCounts").innerHTML=Object.entries(d.counts||{}).map(([k,v])=>'<div class="row-count"><span>'+esc(k.replaceAll("_"," "))+'</span><b>'+fmt(v,0)+'</b></div>').join("");}catch(e){$("tableMetrics").innerHTML='<div class="notice error">'+esc(e.message)+'</div>';}}
 $("reloadSystem").onclick=loadSystem;
 $("scanNow").onclick=async()=>{$("scanNow").disabled=true;$("scanNow").textContent="Scanning…";try{const d=await api("/api/sync/now",{method:"POST"});notice("Monitor pass complete · "+fmt(d.traders_found,0)+" leaders updated · "+fmt(d.positions_checked,0)+" portfolios checked · "+fmt(d.observations_saved,0)+" positions saved.","success");await refreshOverview();if(state.page==="traders")await loadTraders();if(state.page==="positions")await loadPositions();}catch(e){notice(e.message,"error");}finally{$("scanNow").disabled=false;$("scanNow").textContent="↻ Scan now";}};
-async function boot(){await refreshOverview();try{await loadTraders();}catch{}setInterval(async()=>{await refreshOverview();if(state.page==="paper")await loadPaper();if(state.page==="positions")await loadPositions();if(state.page==="traders")await loadTraders();if(state.page==="opportunities")await loadOpportunities();},60000);}
+async function boot(){
+ await refreshOverview();
+ try{await loadTraders();}catch{}
+ // Paper marks/PnL refresh faster than trader discovery and profile refresh.
+ setInterval(()=>{if(state.page==="paper")loadPaper();},3000);
+ setInterval(async()=>{
+  await refreshOverview();
+  if(state.page==="positions")await loadPositions();
+  if(state.page==="traders")await loadTraders();
+  if(state.page==="opportunities")await loadOpportunities();
+ },60000);
+}
 boot();
