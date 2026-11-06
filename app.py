@@ -1980,14 +1980,31 @@ async def evaluate_open_paper_trades(
                 directional = 1.0 if trade.side == "LONG" else -1.0
                 adverse_from_entry_pct = directional * (trade.entry_price - mark) / max(trade.entry_price, 1e-12) * 100.0
                 hard_loss_pct = float(cfg.get("leader_continuation_hard_loss_price_pct", 0.60))
+                continuation_max_minutes = max(1.0, float(cfg.get("leader_continuation_max_minutes", 30)))
+                continuation_started_at = None
+                try:
+                    if raw.get("leader_continuation_started_at"):
+                        continuation_started_at = datetime.fromisoformat(
+                            raw["leader_continuation_started_at"].replace("Z", "+00:00")
+                        )
+                        if continuation_started_at.tzinfo is None:
+                            continuation_started_at = continuation_started_at.replace(tzinfo=timezone.utc)
+                except Exception:
+                    continuation_started_at = None
+                continuation_timed_out = bool(
+                    continuation_started_at
+                    and (ts - continuation_started_at).total_seconds() >= continuation_max_minutes * 60
+                )
+                continuation_enabled = bool(cfg.get("leader_continuation_enabled", True))
                 if leader_state == "REVERSED" and bool(cfg.get("leader_reversal_exit_enabled", True)):
                     exit_reason = "LEADER_POSITION_REVERSED"
                 elif leader_state == "CLOSED_CONFIRMED":
                     exit_reason = "LEADER_POSITION_CLOSED"
                 elif (
                     leader_state == "OPEN_OBSERVED"
-                    and bool(cfg.get("leader_continuation_enabled", True))
+                    and continuation_enabled
                     and adverse_from_entry_pct < hard_loss_pct
+                    and not continuation_timed_out
                 ):
                     raw["leader_continuation_active"] = True
                     raw["leader_continuation_started_at"] = raw.get("leader_continuation_started_at") or ts.isoformat()
@@ -2001,30 +2018,46 @@ async def evaluate_open_paper_trades(
                             value=net,
                             detail=(
                                 f"Stop touched while exact leader position remained visibly OPEN. "
-                                f"Paper stop deferred; hard adverse-price ceiling={hard_loss_pct:.2f}%."
+                                f"Paper stop deferred for at most {continuation_max_minutes:.0f} minutes; "
+                                f"hard adverse-price ceiling={hard_loss_pct:.2f}%."
                             )
                         ))
                         raw["leader_continuation_hold_logged"] = True
                     exit_reason = None
                 else:
                     if leader_state == "OPEN_OBSERVED":
-                        raw["leader_continuation_hard_stop_triggered"] = True
+                        if adverse_from_entry_pct >= hard_loss_pct:
+                            raw["leader_continuation_hard_stop_triggered"] = True
+                            event_type = "LEADER_CONTINUATION_HARD_STOP"
+                            detail = (
+                                f"Leader remained open but adverse price reached {adverse_from_entry_pct:.3f}% "
+                                f">= hard ceiling {hard_loss_pct:.3f}%."
+                            )
+                            reason_base = "LEADER_CONTINUATION_HARD_STOP"
+                        elif continuation_timed_out:
+                            raw["leader_continuation_timeout_triggered"] = True
+                            event_type = "LEADER_CONTINUATION_TIMEOUT"
+                            detail = (
+                                f"Leader remained open, but the {continuation_max_minutes:.0f}-minute "
+                                f"continuation window expired at {adverse_from_entry_pct:.3f}% adverse."
+                            )
+                            reason_base = "LEADER_CONTINUATION_TIMEOUT"
+                        else:
+                            event_type = "LEADER_CONTINUATION_DISABLED_STOP"
+                            detail = "Leader remained open, but leader-continuation holding is disabled; protective stop applied."
+                            reason_base = "LEADER_CONTINUATION_DISABLED_STOP"
                         db.add(PaperTradeEvent(
                             paper_trade_id=trade.id,
-                            event_type="LEADER_CONTINUATION_HARD_STOP",
+                            event_type=event_type,
                             observed_at=ts,
                             value=net,
-                            detail=f"Leader remained open but adverse price reached {adverse_from_entry_pct:.3f}% >= hard ceiling {hard_loss_pct:.3f}%."
+                            detail=detail
                         ))
+                    else:
+                        reason_base = "STOP_LOSS"
                     # A stale/unknown leader state never gets converted into a fake
                     # leader close. The existing protective stop remains the fallback.
-                    if funding_verified:
-                        exit_reason = "LEADER_CONTINUATION_HARD_STOP" if leader_state == "OPEN_OBSERVED" else "STOP_LOSS"
-                    else:
-                        exit_reason = (
-                            "LEADER_CONTINUATION_HARD_STOP_FUNDING_ESTIMATED"
-                            if leader_state == "OPEN_OBSERVED" else "STOP_LOSS_FUNDING_ESTIMATED"
-                        )
+                    exit_reason = reason_base if funding_verified else reason_base + "_FUNDING_ESTIMATED"
                         raw["funding_audit_status"] = "STOP_EXIT_USING_CONSERVATIVE_ESTIMATE"
                         funding_event_count_at_exit = 0
                         if next_funding_ms and ts.timestamp() * 1000 >= next_funding_ms:
@@ -2894,7 +2927,7 @@ async def api_paper_trade_detail(trade_id: int):
 async def update_paper_settings(request: Request):
     body = await request.json()
     cfg = paper_config()
-    for key in ["capital_usdt", "risk_pct", "max_margin_pct", "max_total_margin_pct", "research_unconstrained", "shadow_max_total_margin_pct", "shadow_max_positions_per_symbol_direction", "target_pct", "stop_pct", "taker_fee_pct", "slippage_pct", "max_leverage", "min_adverse_pct"]:
+    for key in ["capital_usdt", "risk_pct", "max_margin_pct", "max_total_margin_pct", "research_unconstrained", "shadow_max_total_margin_pct", "shadow_max_positions_per_symbol_direction", "target_pct", "stop_pct", "taker_fee_pct", "slippage_pct", "max_leverage", "min_adverse_pct", "leader_continuation_hard_loss_price_pct", "leader_continuation_max_minutes"]:
         if key in body:
             val = safe_float(body[key])
             if val is None or val < 0:
@@ -2916,6 +2949,8 @@ async def update_paper_settings(request: Request):
     cfg["slippage_pct"] = min(float(cfg["slippage_pct"]), 2.0)
     cfg["max_leverage"] = min(max(float(cfg["max_leverage"]), 1.0), 5.0)
     cfg["min_adverse_pct"] = min(max(float(cfg["min_adverse_pct"]), 0.05), 20.0)
+    cfg["leader_continuation_hard_loss_price_pct"] = min(max(float(cfg.get("leader_continuation_hard_loss_price_pct", 0.60)), 0.05), 10.0)
+    cfg["leader_continuation_max_minutes"] = min(max(int(float(cfg.get("leader_continuation_max_minutes", 30))), 1), 240)
     set_setting("paper_config", cfg)
     return {"saved": True, "config": cfg}
 
@@ -2948,6 +2983,7 @@ async def api_system():
             "paper_exit_policy": {
                 "leader_continuation_enabled": bool(paper_config().get("leader_continuation_enabled", True)),
                 "leader_continuation_hard_loss_price_pct": float(paper_config().get("leader_continuation_hard_loss_price_pct", 0.60)),
+                "leader_continuation_max_minutes": float(paper_config().get("leader_continuation_max_minutes", 30)),
                 "leader_reversal_exit_enabled": bool(paper_config().get("leader_reversal_exit_enabled", True))
             }
         },
