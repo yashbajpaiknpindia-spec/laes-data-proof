@@ -2646,7 +2646,13 @@ async def api_paper():
             "funding_cost_last_verified": safe_float(raw.get("funding_cost_actual")) if not raw.get("funding_history_verified") else None,
             "funding_estimate_current": safe_float(raw.get("funding_estimate_current")),
             "funding_estimate_at_exit": safe_float(raw.get("funding_estimate_at_exit")),
-            "funding_source": raw.get("funding_source"),
+            "funding_history_rows": safe_float(raw.get("funding_history_rows")),
+            "funding_source": (
+                raw.get("funding_source") if raw.get("funding_history_verified")
+                else "CONSERVATIVE_ESTIMATE_PENDING_BINANCE_HISTORY"
+                if raw.get("funding_cost_actual") is not None else raw.get("funding_source")
+            ),
+            "funding_source_last_verified": raw.get("funding_source") if not raw.get("funding_history_verified") else None,
             "hold_duration_seconds": round(hold_seconds, 2),
             "hold_duration_hours": round(hold_seconds / 3600, 3),
             "post_exit_recovery_minutes_to_entry": safe_float(raw.get("post_exit_minutes_to_entry")),
@@ -2916,9 +2922,15 @@ async def api_paper_trade_detail(trade_id: int):
             "funding_estimate_at_exit": safe_float(raw.get("funding_estimate_at_exit")),
             "funding_estimate_settlement_count": safe_float(raw.get("funding_estimate_settlement_count")),
             "funding_estimate_rate_abs": safe_float(raw.get("funding_estimate_rate_abs")),
+            "funding_history_rows": safe_float(raw.get("funding_history_rows")),
             "funding_verified": bool(raw.get("funding_history_verified")),
             "funding_audit_status": raw.get("funding_audit_status", "LEGACY_FUNDING_UNVERIFIED"),
-            "funding_source": raw.get("funding_source"),
+            "funding_source": (
+                raw.get("funding_source") if raw.get("funding_history_verified")
+                else "CONSERVATIVE_ESTIMATE_PENDING_BINANCE_HISTORY"
+                if raw.get("funding_cost_actual") is not None else raw.get("funding_source")
+            ),
+            "funding_source_last_verified": raw.get("funding_source") if not raw.get("funding_history_verified") else None,
             "funding_verification_error": raw.get("funding_verification_error"),
             "margin_used": trade.margin_used, "leverage": trade.leverage,
             "opened_at": trade.opened_at.isoformat(),
