@@ -201,6 +201,7 @@ if engine.dialect.name == "postgresql":
 last_scan: dict[str, Any] = {"state": "starting", "started_at": None, "finished_at": None, "last_error": None, "traders_found": 0, "positions_checked": 0, "observations_saved": 0}
 worker_alive = False
 scan_lock = asyncio.Lock()
+opportunity_lock = asyncio.Lock()
 last_manual_sync = 0.0
 news_cache: dict[str, Any] = {"fetched_at": 0.0, "items": [], "error": None}
 
@@ -2235,6 +2236,10 @@ async def paper_price_worker() -> None:
 
 @app.get("/api/opportunities")
 async def api_opportunities(limit: int = 100):
+    async with opportunity_lock:
+        return await _api_opportunities_locked(limit)
+
+async def _api_opportunities_locked(limit: int = 100):
     limit = max(1, min(limit, 200))
     with SessionLocal() as db:
         latest_ids = select(func.max(PositionSnapshot.id).label("id")).group_by(PositionSnapshot.trader_id).subquery()
