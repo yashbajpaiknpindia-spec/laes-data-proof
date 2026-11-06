@@ -296,7 +296,10 @@ def migrate_paper_audit_metadata() -> None:
             opened = trade.opened_at
             if opened and opened.tzinfo is None:
                 opened = opened.replace(tzinfo=timezone.utc)
-            max_gap = max_gaps.get(trade.id, 0.0)
+            max_gap = max(
+                max_gaps.get(trade.id, 0.0),
+                float(raw.get("max_data_gap_seconds", 0.0) or 0.0)
+            )
             raw["max_data_gap_seconds"] = max_gap
             raw.setdefault("audit_schema_version", 2)
 
