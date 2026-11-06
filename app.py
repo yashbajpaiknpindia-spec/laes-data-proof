@@ -2580,23 +2580,36 @@ async def opportunity_scanner_worker() -> None:
 @app.get("/api/opportunities")
 async def api_opportunities(limit: int = 100):
     limit = max(1, min(limit, 200))
-    with SessionLocal() as db:
-        observations = db.scalars(select(PositionObservation).order_by(desc(PositionObservation.id)).limit(500)).all()
-        traders = {t.trader_id: t.name for t in db.scalars(select(Trader)).all()}
-        snapshots = {s.id: s for s in db.scalars(select(PositionSnapshot).where(PositionSnapshot.id.in_([o.snapshot_id for o in observations]))).all()} if observations else {}
-    latest = {}
-    for obs in observations:
-        key = f"{obs.trader_id}|{obs.position_key}"
-        if key not in latest:
-            latest[key] = obs
-    news = await fetch_news_items()
-    result = []
-    for obs in list(latest.values())[:limit]:
-        snapshot = snapshots.get(obs.snapshot_id)
-        result.append(await build_opportunity(obs, snapshot.observed_at.isoformat() if snapshot else None, traders.get(obs.trader_id), news))
-    # Ensure paper marks and open/close checks continue as the intelligence page is used.
-    await evaluate_open_paper_trades()
-    return sorted(result, key=lambda x: (x["qualified"], x["adverse_pct"] or 0), reverse=True)
+    finished = OPPORTUNITY_SCAN_STATE.get("finished_at")
+    stale = True
+    if finished:
+        try:
+            scanned_at = datetime.fromisoformat(str(finished).replace("Z", "+00:00"))
+            if scanned_at.tzinfo is None:
+                scanned_at = scanned_at.replace(tzinfo=timezone.utc)
+            stale = (now() - scanned_at).total_seconds() > 90
+        except Exception:
+            stale = True
+    if not OPPORTUNITY_CACHE or stale:
+        await run_opportunity_scan()
+    return list(OPPORTUNITY_CACHE[:limit])
+
+
+@app.get("/api/opportunities/status")
+async def api_opportunities_status():
+    return {
+        **OPPORTUNITY_SCAN_STATE,
+        "kopyon_stream": {
+            "status": KOPYON_STREAM_STATE.get("status"),
+            "connected": bool(KOPYON_STREAM_STATE.get("connected")),
+            "supported": KOPYON_STREAM_STATE.get("supported"),
+            "subscriptions": KOPYON_STREAM_STATE.get("subscriptions"),
+            "last_snapshot_at": KOPYON_STREAM_STATE.get("last_snapshot_at"),
+            "last_error": KOPYON_STREAM_STATE.get("last_error")
+        },
+        "market_metadata_refresh": dict(MARKET_REFRESH_STATE),
+        "binance_rest": binance_rest_status()
+    }
 
 @app.get("/api/paper")
 async def api_paper():
