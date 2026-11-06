@@ -1903,6 +1903,11 @@ async def evaluate_open_paper_trades(
             if check_due:
                 try:
                     actual_funding, funding_rows = await _actual_funding_cost(trade, ts)
+                    expected_funding_rows = _funding_settlement_count(trade, raw, ts)
+                    if funding_rows < expected_funding_rows:
+                        raise RuntimeError(
+                            f"Binance funding history incomplete: expected {expected_funding_rows} settlement rows, received {funding_rows}"
+                        )
                     raw["funding_cost_actual"] = actual_funding
                     raw["funding_history_rows"] = funding_rows
                     raw["funding_history_checked_at"] = ts.isoformat()
@@ -2057,7 +2062,26 @@ async def evaluate_open_paper_trades(
                         reason_base = "STOP_LOSS"
                     # A stale/unknown leader state never gets converted into a fake
                     # leader close. The existing protective stop remains the fallback.
-                    exit_reason = reason_base if funding_verified else reason_base + "_FUNDING_ESTIMATED"
+                    if funding_verified:
+                        exit_reason = reason_base
+                    else:
+                        funding_event_count_at_exit = _funding_settlement_count(trade, raw, ts)
+                        if funding_event_count_at_exit == 0 and next_funding_ms:
+                            raw["funding_audit_status"] = "ZERO_SETTLEMENTS_BEFORE_EXIT_SCHEDULE_INFERRED"
+                            raw["funding_source"] = "NO_SETTLEMENT_SINCE_ENTRY"
+                            raw["funding_estimate_at_exit"] = 0.0
+                            exit_reason = reason_base
+                        else:
+                            entry_rate = safe_float(raw.get("funding_rate_at_entry"))
+                            live_rate = safe_float(PAPER_SYMBOL_FUNDING_RATE.get(trade.symbol.upper()))
+                            rate_candidates = [abs(v) for v in (entry_rate, live_rate) if v is not None]
+                            conservative_rate = max(rate_candidates) if rate_candidates else 0.0
+                            raw["funding_audit_status"] = "STOP_EXIT_USING_CONSERVATIVE_ESTIMATE"
+                            raw["funding_source"] = "CONSERVATIVE_ESTIMATE_PENDING_BINANCE_HISTORY"
+                            raw["funding_estimate_at_exit"] = trade.notional * conservative_rate * funding_event_count_at_exit
+                            exit_reason = reason_base + "_FUNDING_ESTIMATED"
+                        raw["funding_estimate_settlement_count"] = funding_event_count_at_exit
+                        raw["realized_pnl_is_estimate"] = True
                         raw["funding_audit_status"] = "STOP_EXIT_USING_CONSERVATIVE_ESTIMATE"
                         funding_event_count_at_exit = 0
                         if next_funding_ms and ts.timestamp() * 1000 >= next_funding_ms:
