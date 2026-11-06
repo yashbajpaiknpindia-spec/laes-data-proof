@@ -817,17 +817,25 @@ def overview_counts() -> dict:
         traders = db.scalar(select(func.count()).select_from(Trader)) or 0
         snapshots = db.scalar(select(func.count()).select_from(PositionSnapshot)) or 0
         observations = db.scalar(select(func.count()).select_from(PositionObservation)) or 0
-        hidden = db.scalar(select(func.count()).select_from(PositionSnapshot).where(PositionSnapshot.hidden.is_(True))) or 0
+        latest_ids = select(func.max(PositionSnapshot.id).label("id")).group_by(PositionSnapshot.trader_id).subquery()
+        latest_rows = db.scalars(select(PositionSnapshot).join(latest_ids, PositionSnapshot.id == latest_ids.c.id)).all()
+        latest_visible_ids = [row.id for row in latest_rows if not row.hidden]
+        latest_hidden = sum(1 for row in latest_rows if row.hidden)
+        live_rows = db.scalars(select(PositionObservation).where(PositionObservation.snapshot_id.in_(latest_visible_ids))).all() if latest_visible_ids else []
+        live_positions = len(live_rows)
+        underwater_live = sum(1 for row in live_rows if row.unrealized_pnl is not None and row.unrealized_pnl < 0)
         open_paper = db.scalar(select(func.count()).select_from(PaperTrade).where(PaperTrade.status == "OPEN")) or 0
         closed_paper = db.scalar(select(func.count()).select_from(PaperTrade).where(PaperTrade.status == "CLOSED")) or 0
-        open_loss = db.scalar(select(func.count()).select_from(PositionObservation).where(PositionObservation.unrealized_pnl < 0)) or 0
         latest = db.scalar(select(func.max(PositionSnapshot.observed_at)))
     return {
         "traders": traders, "snapshots": snapshots, "observations": observations,
-        "hidden_snapshots": hidden, "open_paper_trades": open_paper,
-        "closed_paper_trades": closed_paper, "underwater_observations": open_loss,
+        "live_positions": live_positions, "underwater_live_positions": underwater_live,
+        "latest_trader_snapshots_hidden": latest_hidden, "hidden_snapshots": latest_hidden,
+        "open_paper_trades": open_paper, "closed_paper_trades": closed_paper,
+        "underwater_observations": underwater_live,
         "latest_snapshot": latest.isoformat() if latest else None
     }
+
 
 @app.get("/healthz")
 async def healthz():
@@ -989,13 +997,19 @@ async def load_trader_intelligence(trader_id: str):
 async def api_positions(limit: int = 500):
     limit = max(1, min(limit, 1000))
     with SessionLocal() as db:
-        observations = db.scalars(select(PositionObservation).order_by(desc(PositionObservation.id)).limit(limit * 3)).all()
-        snapshots = {s.id: s for s in db.scalars(select(PositionSnapshot).where(PositionSnapshot.id.in_([o.snapshot_id for o in observations]))).all()} if observations else {}
+        latest_ids = select(func.max(PositionSnapshot.id).label("id")).group_by(PositionSnapshot.trader_id).subquery()
+        latest_snapshots = db.scalars(select(PositionSnapshot).join(latest_ids, PositionSnapshot.id == latest_ids.c.id)).all()
+        visible = {snap.id: snap for snap in latest_snapshots if not snap.hidden}
+        observations = db.scalars(select(PositionObservation).where(
+            PositionObservation.snapshot_id.in_(list(visible.keys()))
+        ).order_by(desc(PositionObservation.id)).limit(limit * 3)).all() if visible else []
     latest = {}
+    current_time = now()
     for obs in observations:
         key = f"{obs.trader_id}|{obs.position_key}"
         if key not in latest:
-            snap = snapshots.get(obs.snapshot_id)
+            snap = visible.get(obs.snapshot_id)
+            age = max(0.0, (current_time - snap.observed_at).total_seconds()) if snap else None
             latest[key] = {
                 "trader_id": obs.trader_id, "symbol": obs.symbol, "side": obs.side, "position_key": obs.position_key,
                 "size": obs.size, "entry_price": obs.entry_price, "mark_price": obs.mark_price,
@@ -1003,11 +1017,14 @@ async def api_positions(limit: int = 500):
                 "liquidation_price": obs.liquidation_price, "roi": obs.roi,
                 "observed_at": snap.observed_at.isoformat() if snap else None,
                 "source_fetched_at": snap.source_fetched_at if snap else None,
+                "snapshot_age_seconds": round(age, 1) if age is not None else None,
+                "freshness": "FRESH" if age is not None and age <= 900 else "STALE",
                 "hidden": False, "raw": parse_json(obs.raw_json)
             }
         if len(latest) >= limit:
             break
     return list(latest.values())
+
 
 async def fetch_news_items() -> list[dict]:
     if time.time() - news_cache["fetched_at"] < 1800:
@@ -1239,9 +1256,14 @@ async def build_opportunity(obs: PositionObservation, snapshot_time: str | None,
             PositionSnapshot.trader_id == obs.trader_id
         ).order_by(desc(PositionSnapshot.id)).limit(1))
     leader_snapshot_current = bool(latest_leader_snapshot and not latest_leader_snapshot.hidden and latest_leader_snapshot.id == obs.snapshot_id)
+    snapshot_age_seconds = max(0.0, (now() - latest_leader_snapshot.observed_at).total_seconds()) if latest_leader_snapshot else None
+    leader_snapshot_fresh = bool(leader_snapshot_current and snapshot_age_seconds is not None and snapshot_age_seconds <= 900)
     if not leader_snapshot_current:
         qualified = False
         status = "LEADER POSITIONS HIDDEN" if latest_leader_snapshot and latest_leader_snapshot.hidden else "POSITION NOT IN LATEST LEADER SNAPSHOT"
+    elif not leader_snapshot_fresh:
+        qualified = False
+        status = "STALE LEADER SNAPSHOT"
     causes = []
     week = safe_float(market.get("seven_day_return_pct"))
     day = safe_float(market.get("twenty_four_hour_return_pct"))
@@ -1270,6 +1292,8 @@ async def build_opportunity(obs: PositionObservation, snapshot_time: str | None,
         "status": status, "momentum_5m_pct": momentum, "market": market,
         "market_quality_ok": market_quality_ok, "dead_market_reasons": dead_market_reasons,
         "leader_snapshot_current": leader_snapshot_current,
+        "leader_snapshot_fresh": leader_snapshot_fresh,
+        "snapshot_age_seconds": round(snapshot_age_seconds, 1) if snapshot_age_seconds is not None else None,
         "recovery": recovery, "holding": hold, "likely_causes": causes,
         "news_context_count": len(matched_news),
         "recovery_warning": "Market trend/news are contextual risk factors, not a deterministic cause or guarantee of recovery."
@@ -1511,6 +1535,8 @@ async def run_post_exit_recovery_audit() -> dict:
         if quality in {"INFORMATION_CUTOFF", "DATA_INTERRUPTED_REVIEW", "PATH_NOT_RECORDED"}:
             raw["post_exit_recovery_audit_version"] = 1
             raw["post_exit_recovery_status"] = "SKIPPED_UNVERIFIED_PATH"
+            raw["post_exit_old_exit_reason"] = trade.exit_reason
+            raw["post_exit_recovery_label"] = f"[RECOVERY AUDIT SKIPPED · {quality} · OLD EXIT: {trade.exit_reason or 'UNKNOWN'}]"
             with SessionLocal() as db:
                 live = db.get(PaperTrade, trade.id)
                 if live:
@@ -2123,9 +2149,13 @@ async def paper_price_worker() -> None:
 async def api_opportunities(limit: int = 100):
     limit = max(1, min(limit, 200))
     with SessionLocal() as db:
-        observations = db.scalars(select(PositionObservation).order_by(desc(PositionObservation.id)).limit(500)).all()
+        latest_ids = select(func.max(PositionSnapshot.id).label("id")).group_by(PositionSnapshot.trader_id).subquery()
+        latest_snapshots = db.scalars(select(PositionSnapshot).join(latest_ids, PositionSnapshot.id == latest_ids.c.id)).all()
+        visible = {snap.id: snap for snap in latest_snapshots if not snap.hidden}
+        observations = db.scalars(select(PositionObservation).where(
+            PositionObservation.snapshot_id.in_(list(visible.keys()))
+        ).order_by(desc(PositionObservation.id)).limit(500)).all() if visible else []
         traders = {t.trader_id: t.name for t in db.scalars(select(Trader)).all()}
-        snapshots = {s.id: s for s in db.scalars(select(PositionSnapshot).where(PositionSnapshot.id.in_([o.snapshot_id for o in observations]))).all()} if observations else {}
     latest = {}
     for obs in observations:
         key = f"{obs.trader_id}|{obs.position_key}"
@@ -2134,11 +2164,11 @@ async def api_opportunities(limit: int = 100):
     news = await fetch_news_items()
     result = []
     for obs in list(latest.values())[:limit]:
-        snapshot = snapshots.get(obs.snapshot_id)
+        snapshot = visible.get(obs.snapshot_id)
         result.append(await build_opportunity(obs, snapshot.observed_at.isoformat() if snapshot else None, traders.get(obs.trader_id), news))
-    # Ensure paper marks and open/close checks continue as the intelligence page is used.
     await evaluate_open_paper_trades()
     return sorted(result, key=lambda x: (x["qualified"], x["adverse_pct"] or 0), reverse=True)
+
 
 @app.get("/api/paper")
 async def api_paper():
