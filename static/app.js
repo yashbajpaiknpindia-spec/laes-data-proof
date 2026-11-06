@@ -17,8 +17,8 @@ function source(id,dot,ok,label){$(id).textContent=label;$(id).className="connec
 async function refreshOverview(){
  try{
  const d=await api("/api/overview");state.overview=d;const m=d.monitor||{};
- $("mTraders").textContent=fmt(d.traders,0);$("mPositions").textContent=fmt(d.observations,0);$("mUnderwater").textContent=fmt(d.underwater_observations,0);$("mPaperOpen").textContent=fmt(d.open_paper_trades,0);
- $("navTraderCount").textContent=fmt(d.traders,0);$("navPaperCount").textContent=fmt(d.open_paper_trades,0);$("navPositionCount").textContent=fmt(d.observations,0);
+ $("mTraders").textContent=fmt(d.traders,0);$("mPositions").textContent=fmt(d.live_positions??0,0);$("mUnderwater").textContent=fmt(d.underwater_live_positions??0,0);$("mPaperOpen").textContent=fmt(d.open_paper_trades,0);
+ $("navTraderCount").textContent=fmt(d.traders,0);$("navPaperCount").textContent=fmt(d.open_paper_trades,0);$("navPositionCount").textContent=fmt(d.live_positions??0,0);
  $("sideStatus").textContent=m.worker_alive?"Automatic monitor running":"Monitor starting / sleeping";$("sidePulse").className="pulse "+(m.worker_alive?"on":"");
  $("monitorBadge").textContent=m.state||"INITIALIZING";$("monitorBadge").className="pill "+(m.state==="idle"?"ok":m.state==="error"?"warn":"");
  $("lastScan").textContent=m.finished_at?date(m.finished_at):"Waiting for first scan";$("nextScan").textContent="Discovery cadence "+Math.round((m.interval_seconds||1800)/60)+" min · up to "+(m.position_batch_per_cycle||5)+" leaders per pass";
@@ -71,7 +71,7 @@ async function loadPositions(){
  $("positionTable").innerHTML='<tr><td colspan="9" class="empty-cell">Loading real position observations…</td></tr>';
  try{const [rows,traders]=await Promise.all([api("/api/positions?limit=500"),api("/api/traders?limit=300")]);const names=Object.fromEntries(traders.map(t=>[t.trader_id,t.name||t.trader_id]));
  if(!rows.length){$("positionTable").innerHTML='<tr><td colspan="9" class="empty-cell">No public position observations have been saved. Hidden positions remain unavailable.</td></tr>';return;}
- $("positionTable").innerHTML=rows.map(p=>{const a=p.entry_price&&p.mark_price?(p.side==="LONG"?(p.entry_price-p.mark_price):(p.mark_price-p.entry_price))/p.entry_price*100:null;return '<tr><td>'+esc(names[p.trader_id]||p.trader_id)+'<br><small>'+esc(p.trader_id)+'</small></td><td><b>'+esc(p.symbol)+'</b></td><td class="'+(p.side==="LONG"?"side-long":"side-short")+'">'+esc(p.side)+'</td><td>'+fmt(p.entry_price,6)+'</td><td>'+fmt(p.mark_price,6)+'</td><td class="'+((p.unrealized_pnl||0)<0?"negative":"positive")+'">'+money(p.unrealized_pnl)+'</td><td class="'+((a||0)>0?"negative":"positive")+'">'+pct(a)+'</td><td>'+(p.leverage?fmt(p.leverage,1)+"×":"—")+' '+esc(p.margin_mode||"")+'</td><td>'+date(p.observed_at)+'</td></tr>';}).join("");
+ $("positionTable").innerHTML=rows.map(p=>{const a=p.entry_price&&p.mark_price?(p.side==="LONG"?(p.entry_price-p.mark_price):(p.mark_price-p.entry_price))/p.entry_price*100:null;const age=p.snapshot_age_seconds===null||p.snapshot_age_seconds===undefined?"":(p.snapshot_age_seconds<3600?Math.round(p.snapshot_age_seconds/60)+"m old":(p.snapshot_age_seconds/3600).toFixed(1)+"h old");return '<tr><td>'+esc(names[p.trader_id]||p.trader_id)+'<br><small>'+esc(p.trader_id)+'</small></td><td><b>'+esc(p.symbol)+'</b></td><td class="'+(p.side==="LONG"?"side-long":"side-short")+'">'+esc(p.side)+'</td><td>'+fmt(p.entry_price,6)+'</td><td>'+fmt(p.mark_price,6)+'</td><td class="'+((p.unrealized_pnl||0)<0?"negative":"positive")+'">'+money(p.unrealized_pnl)+'</td><td class="'+((a||0)>0?"negative":"positive")+'">'+pct(a)+'</td><td>'+(p.leverage?fmt(p.leverage,1)+"×":"—")+' '+esc(p.margin_mode||"")+'</td><td><span class="status-tag '+(p.freshness==="FRESH"?"qualified":"neutral")+'">'+esc(p.freshness||"UNKNOWN")+'</span><br>'+date(p.observed_at)+'<br><small>'+esc(age)+'</small></td></tr>';}).join("");
  }catch(e){$("positionTable").innerHTML='<tr><td colspan="9" class="empty-cell">'+esc(e.message)+'</td></tr>';}
 }
 $("reloadPositions").onclick=loadPositions;
@@ -154,7 +154,8 @@ async function loadPaper(){
    return '<tr class="clickable-row" onclick="openPaperTrade('+t.id+')">'+
     '<td><span class="status-tag '+(t.status==="OPEN"?"qualified":"neutral")+'">'+statusText+'</span>'+
       (quality?'<br><small class="muted-note">'+esc(quality)+'</small>':'')+
-      (monitor?'<br><small class="muted-note">'+esc(monitor)+'</small>':'')+'</td>'+
+      (monitor?'<br><small class="muted-note">'+esc(monitor)+'</small>':'')+
+      (t.exit_reason_display?'<br><small class="muted-note recovery-audit-label">'+esc(t.exit_reason_display)+'</small>':'')+'</td>'+
     '<td><b>'+esc(t.trader_name||t.trader_id)+'</b><br><small>'+esc(t.trader_id)+'</small><br><small>Position: '+esc(t.leader_position_key||"unlinked")+'</small></td>'+
     '<td><b>'+esc(t.symbol)+'</b></td>'+
     '<td class="'+(t.side==="LONG"?"side-long":"side-short")+'">'+esc(t.side)+'</td>'+
