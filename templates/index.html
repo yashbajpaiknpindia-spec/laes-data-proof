@@ -4,7 +4,7 @@
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#0a1018">
   <title>LAES · Intelligence Terminal</title>
-  <link rel="stylesheet" href="/static/style.css?v=2">
+  <link rel="stylesheet" href="/static/style.css?v=3">
 </head>
 <body>
 <div class="app-shell">
@@ -146,8 +146,9 @@
         </article>
       </div>
       <article class="panel trades-panel"><div class="panel-heading"><div><div class="section-kicker">SIMULATED ORDERS</div><h3>Paper trade ledger</h3><p>Open and completed simulated positions.</p></div><button class="btn btn-subtle" id="reloadPaper">Refresh ledger</button></div>
-        <div class="table-scroll"><table><thead><tr><th>STATUS</th><th>LEADER</th><th>SYMBOL</th><th>SIDE</th><th>ENTRY / MARK</th><th>NOTIONAL</th><th>MARGIN</th><th>NET PNL</th><th>STOP / TARGET</th><th>OPENED</th></tr></thead><tbody id="paperTrades"><tr><td colspan="10" class="empty-cell">No paper trades have qualified yet. No placeholder trades are generated.</td></tr></tbody></table></div>
+        <div class="table-scroll"><table><thead><tr><th>STATUS / QUALITY</th><th>LEADER / POSITION</th><th>SYMBOL</th><th>SIDE</th><th>ENTRY / MARK</th><th>NOTIONAL</th><th>MARGIN</th><th>NET PNL / MFE / MAE</th><th>STOP / TARGET</th><th>OPENED</th><th>DETAILS</th></tr></thead><tbody id="paperTrades"><tr><td colspan="11" class="empty-cell">No paper trades have qualified yet. No placeholder trades are generated.</td></tr></tbody></table></div>
       </article>
+      <article class="panel" style="margin-top:16px"><div class="panel-heading"><div><div class="section-kicker">CORRELATED FUTURES EXPOSURE</div><h3>Same-symbol loss concentration</h3><p>Leaders holding the same coin and direction can lose together. These estimates expose shared risk without suppressing research signals.</p></div></div><div id="paperRiskClusters"><div class="empty-state">Waiting for portfolio exposure analysis…</div></div></article>
     </section>
 
     <section class="page" id="page-market">
@@ -174,5 +175,5 @@
 </div>
 
 <dialog id="traderDialog" class="trader-dialog"><div class="dialog-head"><div><div class="section-kicker">TRADER FORENSICS</div><h2 id="dialogName">Trader</h2><p id="dialogSub"></p></div><button class="icon-btn" id="closeDialog">×</button></div><div id="dialogBody"></div></dialog>
-<script src="/static/app.js?v=3"></script>
+<script src="/static/app.js?v=4"></script>
 </body></html>

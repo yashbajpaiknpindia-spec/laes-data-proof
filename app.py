@@ -277,6 +277,87 @@ def paper_config() -> dict:
     saved = setting("paper_config", {})
     return {**defaults, **(saved if isinstance(saved, dict) else {})}
 
+def migrate_paper_audit_metadata() -> None:
+    """
+    Idempotent, non-destructive metadata migration.
+    Financial PnL/status/exit prices are never rewritten here.
+    """
+    cutoff_utc = datetime(2026, 11, 5, 11, 29, 0, tzinfo=timezone.utc)  # 16:59 IST
+    with SessionLocal() as db:
+        trades = db.scalars(select(PaperTrade)).all()
+        gap_rows = db.execute(
+            select(PaperTradePath.paper_trade_id, func.max(PaperTradePath.data_gap_seconds))
+            .group_by(PaperTradePath.paper_trade_id)
+        ).all()
+        max_gaps = {int(trade_id): float(gap or 0.0) for trade_id, gap in gap_rows}
+
+        for trade in trades:
+            raw = parse_json(trade.raw_json)
+            opened = trade.opened_at
+            if opened and opened.tzinfo is None:
+                opened = opened.replace(tzinfo=timezone.utc)
+            max_gap = max(
+                max_gaps.get(trade.id, 0.0),
+                float(raw.get("max_data_gap_seconds", 0.0) or 0.0)
+            )
+            raw["max_data_gap_seconds"] = max_gap
+            raw.setdefault("audit_schema_version", 2)
+
+            event_specs = []
+            if opened and opened < cutoff_utc:
+                raw["data_quality_status"] = "INFORMATION_CUTOFF"
+                raw["information_cutoff_at"] = "2026-11-05T16:59:00+05:30"
+                raw["information_cutoff_reason"] = (
+                    "Historical record opened before the 4:59 PM IST research information cutoff. "
+                    "Its PnL is preserved, but the full observation path is not considered complete."
+                )
+                event_specs.append((
+                    "INFORMATION_CUTOFF",
+                    cutoff_utc,
+                    "Historical record classified at the requested 2026-11-05 16:59 IST information cutoff; financial outcome unchanged."
+                ))
+            elif trade.status == "CLOSED" and trade.exit_reason == "STOP_LOSS" and max_gap > 15:
+                raw["data_quality_status"] = "DATA_INTERRUPTED_REVIEW"
+                raw["data_quality_reason"] = (
+                    "A saved price-path interval exceeded 15 seconds. Stop-loss PnL is retained as the old simulated exit, "
+                    "but this is not a continuously observed strategy-failure label."
+                )
+                event_specs.append((
+                    "DATA_INTERRUPTED_REVIEW",
+                    trade.closed_at or now(),
+                    f"Historical maximum saved price-path gap: {max_gap:.1f} seconds; existing exit and PnL preserved."
+                ))
+            elif not raw.get("data_quality_status"):
+                raw["data_quality_status"] = "PATH_NOT_RECORDED" if max_gaps.get(trade.id) is None else "LEGACY_UNCLASSIFIED"
+
+            if "funding_history_verified" not in raw:
+                raw["funding_audit_status"] = "LEGACY_FUNDING_UNVERIFIED"
+                event_specs.append((
+                    "LEGACY_FUNDING_UNVERIFIED",
+                    trade.closed_at or trade.opened_at or now(),
+                    "This record predates persisted funding verification. Funding cannot be reconstructed from its saved audit fields."
+                ))
+
+            trade.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
+            for event_type, event_at, detail in event_specs:
+                exists = db.scalar(select(PaperTradeEvent.id).where(
+                    PaperTradeEvent.paper_trade_id == trade.id,
+                    PaperTradeEvent.event_type == event_type
+                ).limit(1))
+                if not exists:
+                    db.add(PaperTradeEvent(
+                        paper_trade_id=trade.id,
+                        event_type=event_type,
+                        observed_at=event_at,
+                        value=trade.net_pnl,
+                        detail=detail
+                    ))
+        db.commit()
+
+
+migrate_paper_audit_metadata()
+
+
 def log_check(source: str, ok: bool, status: int | None = None, latency: int | None = None, detail: str = "") -> None:
     try:
         with SessionLocal() as db:
@@ -1103,7 +1184,23 @@ def create_paper_trade(obs: PositionObservation, trader_name: str | None, mark: 
             symbol=obs.symbol, side=obs.side, status="OPEN",
             entry_price=mark, mark_price=mark, quantity=quantity, notional=notional,
             margin_used=margin, leverage=leverage, stop_price=stop, target_price=target,
-            raw_json=json.dumps({"leader_entry": obs.entry_price, "leader_mark": obs.mark_price, "adverse_pct": ((obs.entry_price-mark)/obs.entry_price*100 if obs.side=="LONG" else (mark-obs.entry_price)/obs.entry_price*100), "funding_rate_at_entry": market.get("funding_rate"), "next_funding_time": market.get("next_funding_time"), "leader_snapshot_id": obs.snapshot_id}, default=str)
+            raw_json=json.dumps({
+                "leader_entry": obs.entry_price,
+                "leader_mark": obs.mark_price,
+                "adverse_pct": ((obs.entry_price-mark)/obs.entry_price*100 if obs.side=="LONG" else (mark-obs.entry_price)/obs.entry_price*100),
+                "funding_rate_at_entry": market.get("funding_rate"),
+                "next_funding_time": market.get("next_funding_time"),
+                "leader_snapshot_id": obs.snapshot_id,
+                "funding_history_verified": False,
+                "funding_audit_status": "PENDING_VERIFICATION",
+                "data_quality_status": "CONTINUOUS",
+                "mfe_net_pnl": 0.0,
+                "mae_net_pnl": 0.0,
+                "mfe_pct": 0.0,
+                "mae_pct": 0.0,
+                "max_data_gap_seconds": 0.0,
+                "meaningful_profit_hits": {}
+            }, separators=(",", ":"), default=str)
         ))
         db.commit()
 
@@ -1206,7 +1303,9 @@ async def evaluate_open_paper_trades(prices: dict[str,float] | None = None, sour
             raw["last_binance_price_at"] = ts.isoformat()
             raw["last_paper_check_at"] = ts.isoformat()
             raw["last_price_source"] = source
-            raw["data_gap_seconds"] = gap
+            raw["last_data_gap_seconds"] = gap
+            raw["data_gap_seconds"] = max(float(raw.get("data_gap_seconds", 0.0) or 0.0), gap)
+            raw["max_data_gap_seconds"] = max(float(raw.get("max_data_gap_seconds", 0.0) or 0.0), gap)
             trade.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
             trade.mark_price, trade.gross_pnl, trade.estimated_costs, trade.net_pnl = mark, gross, costs, net
 
@@ -1268,6 +1367,18 @@ async def evaluate_open_paper_trades(prices: dict[str,float] | None = None, sour
             exit_reason = None
             funding_verified = bool(raw.get("funding_history_verified"))
             next_funding_ms = safe_float(raw.get("next_funding_time"))
+            # Before the next scheduled settlement, no funding event can yet have
+            # accrued to this newly-opened paper position. This permits immediate
+            # harvesting without an unnecessary REST funding-history round trip.
+            if (not funding_verified and next_funding_ms
+                    and ts.timestamp() * 1000 < next_funding_ms):
+                raw["funding_cost_actual"] = 0.0
+                raw["funding_history_verified"] = True
+                raw["funding_history_checked_at"] = ts.isoformat()
+                raw["funding_source"] = "NO_SETTLEMENT_SINCE_ENTRY"
+                raw["funding_audit_status"] = "VERIFIED_ZERO_BEFORE_NEXT_SETTLEMENT"
+                raw["funding_verification_error"] = None
+                funding_verified = True
             funding_check_at = None
             if raw.get("funding_history_checked_at"):
                 try:
@@ -1289,6 +1400,8 @@ async def evaluate_open_paper_trades(prices: dict[str,float] | None = None, sour
                     raw["funding_history_checked_at"] = ts.isoformat()
                     raw["funding_history_verified"] = True
                     raw["funding_source"] = "BINANCE_FUNDING_HISTORY"
+                    raw["funding_audit_status"] = "VERIFIED"
+                    raw["funding_verification_error"] = None
                     fee_and_slippage = trade.notional * (float(cfg["taker_fee_pct"]) / 100 + float(cfg["slippage_pct"]) / 100) * 2
                     costs = fee_and_slippage + actual_funding
                     net = gross - costs
@@ -1302,6 +1415,7 @@ async def evaluate_open_paper_trades(prices: dict[str,float] | None = None, sour
                 except Exception as funding_exc:
                     funding_verified = False
                     raw["funding_history_verified"] = False
+                    raw["funding_audit_status"] = "PENDING_VERIFICATION"
                     raw["funding_history_checked_at"] = ts.isoformat()
                     raw["funding_verification_error"] = str(funding_exc)[:180]
                     db.add(PaperTradeEvent(paper_trade_id=trade.id,event_type="FUNDING_CHECK_PENDING",observed_at=ts,value=net,detail="Actual Binance funding history unavailable; positive-profit exit deferred"))
@@ -1326,6 +1440,14 @@ async def evaluate_open_paper_trades(prices: dict[str,float] | None = None, sour
                 raw["realized_exit_price"] = mark
                 raw["realized_exit_at"] = ts.isoformat()
                 db.add(PaperTradeEvent(paper_trade_id=trade.id,event_type="REALIZED_EXIT",observed_at=ts,value=net,detail=exit_reason))
+            raw["funding_history_verified"] = bool(funding_verified)
+            raw["funding_audit_status"] = (
+                raw.get("funding_audit_status")
+                or ("VERIFIED" if funding_verified else "PENDING_VERIFICATION")
+            )
+            raw["last_net_pnl_calculated_at"] = ts.isoformat()
+            raw["last_net_pnl_source"] = source
+            trade.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
         db.commit()
 
 async def paper_price_worker() -> None:
@@ -1398,49 +1520,93 @@ async def api_paper():
     cfg = paper_config()
     with SessionLocal() as db:
         trades = db.scalars(select(PaperTrade).order_by(desc(PaperTrade.opened_at)).limit(300)).all()
-        # Legacy stop-outs that occurred on the first tick after a long feed outage
-        # are unresolved, not verified strategy losses. Reopen them for fresh tracking.
-        repaired = False
-        for t in trades:
-            raw = parse_json(t.raw_json)
-            gap = safe_float(raw.get("data_gap_seconds")) or 0.0
-            if t.status == "CLOSED" and (t.net_pnl or 0) < 0 and t.exit_reason == "STOP_LOSS" and gap > 15:
-                t.status = "OPEN"
-                t.exit_price = None
-                t.closed_at = None
-                t.exit_reason = None
-                raw["data_quality_status"] = "DATA_INTERRUPTED_REVIEW"
-                raw["post_gap_confirmations"] = 0
-                t.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
-                db.add(PaperTradeEvent(paper_trade_id=t.id,event_type="REOPENED_AFTER_DATA_GAP",observed_at=now(),value=t.net_pnl,detail=f"Legacy stop-out followed a {gap:.1f}s price-feed gap; outcome is uncertain"))
-                repaired = True
-        if repaired:
-            db.commit()
-    open_trades = [t for t in trades if t.status == "OPEN"]
-    closed_trades = [t for t in trades if t.status == "CLOSED"]
-    realized = sum(t.net_pnl for t in closed_trades)
-    unrealized = sum(t.net_pnl for t in open_trades)
-    deployed_margin = sum(t.margin_used for t in open_trades)
+        gap_rows = db.execute(
+            select(PaperTradePath.paper_trade_id, func.max(PaperTradePath.data_gap_seconds))
+            .group_by(PaperTradePath.paper_trade_id)
+        ).all()
+        max_gaps = {int(trade_id): float(gap or 0.0) for trade_id, gap in gap_rows}
+
+    open_trades = [trade for trade in trades if trade.status == "OPEN"]
+    closed_trades = [trade for trade in trades if trade.status == "CLOSED"]
+    realized = sum(float(trade.net_pnl or 0.0) for trade in closed_trades)
+    unrealized = sum(float(trade.net_pnl or 0.0) for trade in open_trades)
+    deployed_margin = sum(float(trade.margin_used or 0.0) for trade in open_trades)
     equity = float(cfg["capital_usdt"]) + realized + unrealized
     margin_cap = float(cfg["capital_usdt"]) * float(cfg["max_total_margin_pct"]) / 100
-    return {
-        "config": cfg, "capital": cfg["capital_usdt"], "realized_pnl": round(realized, 4),
-        "unrealized_pnl": round(unrealized, 4), "equity": round(equity, 4),
-        "deployed_margin": round(deployed_margin, 4), "margin_cap": round(margin_cap, 4),
-        "margin_utilization_pct": round(deployed_margin / max(float(cfg["capital_usdt"]), 0.01) * 100, 2),
-        "margin_cap_exceeded": deployed_margin > margin_cap,
-        "free_capital": round(max(0, equity - deployed_margin), 4),
-        "open_count": len(open_trades), "closed_count": len(closed_trades),
-        "trades": [{
-            "id": t.id, "trader_id": t.trader_id, "trader_name": t.trader_name, "leader_position_key": (t.source_key.split("|", 1)[1] if "|" in t.source_key else t.source_key), "symbol": t.symbol, "side": t.side,
-            "status": t.status, "entry_price": t.entry_price, "mark_price": t.mark_price, "exit_price": t.exit_price,
-            "quantity": t.quantity, "notional": t.notional, "margin_used": t.margin_used, "leverage": t.leverage,
-            "stop_price": t.stop_price, "target_price": t.target_price, "gross_pnl": t.gross_pnl,
-            "estimated_costs": t.estimated_costs, "net_pnl": t.net_pnl, "exit_reason": t.exit_reason,
-            "opened_at": t.opened_at.isoformat(), "closed_at": t.closed_at.isoformat() if t.closed_at else None
-        } for t in trades]
-    }
 
+    # Aggregate simultaneous positions by underlying instrument and direction.
+    # Separate leader signals on the same coin are correlated exposures, not
+    # statistically independent bets. These are warnings, not hidden trade filters.
+    risk_groups: dict[str, dict] = {}
+    for trade in open_trades:
+        key = f"{trade.symbol}|{trade.side}"
+        group = risk_groups.setdefault(key, {
+            "symbol": trade.symbol, "side": trade.side, "open_count": 0,
+            "open_notional": 0.0, "margin_in_use": 0.0,
+            "current_net_pnl": 0.0, "estimated_stop_loss_usdt": 0.0,
+            "leaders": []
+        })
+        group["open_count"] += 1
+        group["open_notional"] += float(trade.notional or 0.0)
+        group["margin_in_use"] += float(trade.margin_used or 0.0)
+        group["current_net_pnl"] += float(trade.net_pnl or 0.0)
+        direction = 1.0 if trade.side == "LONG" else -1.0
+        stop_gross = direction * (float(trade.stop_price) - float(trade.entry_price)) * float(trade.quantity)
+        stop_net = stop_gross - float(trade.estimated_costs or 0.0)
+        group["estimated_stop_loss_usdt"] += max(0.0, -stop_net)
+        if trade.trader_name and trade.trader_name not in group["leaders"]:
+            group["leaders"].append(trade.trader_name)
+    concentrations = sorted(risk_groups.values(), key=lambda group: group["estimated_stop_loss_usdt"], reverse=True)
+    for group in concentrations:
+        for key in ("open_notional", "margin_in_use", "current_net_pnl", "estimated_stop_loss_usdt"):
+            group[key] = round(group[key], 8)
+    correlated_groups = [group for group in concentrations if group["open_count"] > 1]
+
+    trade_rows = []
+    for trade in trades:
+        raw = parse_json(trade.raw_json)
+        max_gap = max(max_gaps.get(trade.id, 0.0), float(raw.get("max_data_gap_seconds", 0.0) or 0.0))
+        trade_rows.append({
+            "id": trade.id, "trader_id": trade.trader_id, "trader_name": trade.trader_name,
+            "leader_position_key": (trade.source_key.split("|", 1)[1] if "|" in trade.source_key else trade.source_key),
+            "symbol": trade.symbol, "side": trade.side, "status": trade.status,
+            "entry_price": trade.entry_price, "mark_price": trade.mark_price, "exit_price": trade.exit_price,
+            "quantity": trade.quantity, "notional": trade.notional, "margin_used": trade.margin_used,
+            "leverage": trade.leverage, "stop_price": trade.stop_price, "target_price": trade.target_price,
+            "gross_pnl": round(float(trade.gross_pnl or 0.0), 8),
+            "estimated_costs": round(float(trade.estimated_costs or 0.0), 8),
+            "net_pnl": round(float(trade.net_pnl or 0.0), 8), "exit_reason": trade.exit_reason,
+            "mfe_net_pnl": safe_float(raw.get("mfe_net_pnl")),
+            "mae_net_pnl": safe_float(raw.get("mae_net_pnl")),
+            "mfe_pct": safe_float(raw.get("mfe_pct")), "mae_pct": safe_float(raw.get("mae_pct")),
+            "data_quality_status": raw.get("data_quality_status", "LEGACY_UNCLASSIFIED"),
+            "max_data_gap_seconds": round(max_gap, 3),
+            "funding_history_verified": raw.get("funding_history_verified"),
+            "funding_audit_status": raw.get("funding_audit_status", "LEGACY_FUNDING_UNVERIFIED"),
+            "funding_cost_actual": safe_float(raw.get("funding_cost_actual")),
+            "opened_at": trade.opened_at.isoformat(),
+            "closed_at": trade.closed_at.isoformat() if trade.closed_at else None
+        })
+
+    return {
+        "config": cfg, "capital": round(float(cfg["capital_usdt"]), 8),
+        "realized_pnl": round(realized, 8), "unrealized_pnl": round(unrealized, 8),
+        "equity": round(equity, 8), "deployed_margin": round(deployed_margin, 8),
+        "margin_cap": round(margin_cap, 8),
+        "margin_utilization_pct": round(deployed_margin / max(float(cfg["capital_usdt"]), 0.01) * 100, 4),
+        "margin_cap_exceeded": deployed_margin > margin_cap,
+        "free_capital": round(max(0.0, equity - deployed_margin), 8),
+        "open_count": len(open_trades), "closed_count": len(closed_trades),
+        "correlated_exposure_groups": correlated_groups,
+        "risk_summary": {
+            "correlated_groups": len(correlated_groups),
+            "largest_shared_direction_stop_risk_usdt": max((g["estimated_stop_loss_usdt"] for g in concentrations), default=0.0),
+            "estimated_open_stop_risk_usdt": round(sum(g["estimated_stop_loss_usdt"] for g in concentrations), 8),
+            "mode": "RESEARCH_UNCONSTRAINED" if cfg.get("research_unconstrained", True) else "CAPITAL_CONSTRAINED",
+            "warning": "Positions in the same symbol and direction share market risk. Research-mode parallel PnL is not a deployable capital allocation."
+        },
+        "trades": trade_rows
+    }
 
 
 @app.get("/api/paper/{trade_id}")
@@ -1452,85 +1618,238 @@ async def api_paper_trade_detail(trade_id: int):
         raw = parse_json(trade.raw_json)
         trader = db.get(Trader, trade.trader_id)
         leader_obs = _leader_for_trade(db, trade)
-        path = db.scalars(select(PaperTradePath).where(PaperTradePath.paper_trade_id==trade.id).order_by(PaperTradePath.observed_at)).all()
-        events = db.scalars(select(PaperTradeEvent).where(PaperTradeEvent.paper_trade_id==trade.id).order_by(PaperTradeEvent.observed_at)).all()
-        campaign_rows = db.scalars(select(PaperTrade).where(PaperTrade.source_key == trade.source_key).order_by(PaperTrade.opened_at)).all()
+        path = db.scalars(
+            select(PaperTradePath).where(PaperTradePath.paper_trade_id == trade.id)
+            .order_by(PaperTradePath.observed_at)
+        ).all()
+        events = db.scalars(
+            select(PaperTradeEvent).where(PaperTradeEvent.paper_trade_id == trade.id)
+            .order_by(PaperTradeEvent.observed_at)
+        ).all()
+        campaign_rows = db.scalars(
+            select(PaperTrade).where(PaperTrade.source_key == trade.source_key)
+            .order_by(PaperTrade.opened_at)
+        ).all()
+
+        leader_path = []
+        leader_snapshot = None
+        latest_leader_snapshot = db.scalar(
+            select(PositionSnapshot).where(PositionSnapshot.trader_id == trade.trader_id)
+            .order_by(desc(PositionSnapshot.id)).limit(1)
+        )
+        if "|" in trade.source_key:
+            leader_trader_id, leader_position_key = trade.source_key.split("|", 1)
+            leader_observations = db.execute(
+                select(PositionObservation, PositionSnapshot)
+                .join(PositionSnapshot, PositionSnapshot.id == PositionObservation.snapshot_id)
+                .where(
+                    PositionObservation.trader_id == leader_trader_id,
+                    PositionObservation.position_key == leader_position_key
+                )
+                .order_by(PositionSnapshot.observed_at)
+                .limit(500)
+            ).all()
+            leader_path = [{
+                "at": snapshot.observed_at.isoformat(),
+                "mark_price": observation.mark_price,
+                "entry_price": observation.entry_price,
+                "unrealized_pnl": observation.unrealized_pnl,
+                "snapshot_id": snapshot.id
+            } for observation, snapshot in leader_observations if not snapshot.hidden]
+        if leader_obs:
+            leader_snapshot = db.get(PositionSnapshot, leader_obs.snapshot_id)
+
+        latest_contains_position = False
+        if latest_leader_snapshot and not latest_leader_snapshot.hidden:
+            latest_contains_position = bool(db.scalar(
+                select(PositionObservation.id).where(
+                    PositionObservation.snapshot_id == latest_leader_snapshot.id,
+                    PositionObservation.position_key == (
+                        trade.source_key.split("|", 1)[1] if "|" in trade.source_key else ""
+                    )
+                ).limit(1)
+            ))
+
+    max_gap = max(
+        [float(path_point.data_gap_seconds or 0.0) for path_point in path] +
+        [float(raw.get("max_data_gap_seconds", 0.0) or 0.0)]
+    )
+    quality_status = raw.get("data_quality_status")
+    if not quality_status:
+        quality_status = "DATA_INTERRUPTED_REVIEW" if max_gap > 15 else ("PATH_NOT_RECORDED" if not path else "LEGACY_UNCLASSIFIED")
+
     campaign = {
         "trade_count": len(campaign_rows),
         "reentry_count": max(0, len(campaign_rows) - 1),
         "open_count": sum(1 for item in campaign_rows if item.status == "OPEN"),
-        "realized_net_pnl": round(sum(item.net_pnl or 0 for item in campaign_rows if item.status == "CLOSED"), 8),
-        "total_net_pnl": round(sum(item.net_pnl or 0 for item in campaign_rows), 8),
-        "trade_ids": [item.id for item in campaign_rows]
+        "realized_net_pnl": round(sum(float(item.net_pnl or 0.0) for item in campaign_rows if item.status == "CLOSED"), 8),
+        "total_net_pnl": round(sum(float(item.net_pnl or 0.0) for item in campaign_rows), 8),
+        "trade_ids": [item.id for item in campaign_rows],
+        "trades": [{
+            "id": item.id, "status": item.status, "entry_price": item.entry_price,
+            "exit_price": item.exit_price, "net_pnl": round(float(item.net_pnl or 0.0), 8),
+            "opened_at": item.opened_at.isoformat(),
+            "closed_at": item.closed_at.isoformat() if item.closed_at else None,
+            "exit_reason": item.exit_reason
+        } for item in campaign_rows]
     }
+
     leader = None
     recovery = None
     if leader_obs:
         lentry = leader_obs.entry_price
         lmark = leader_obs.mark_price
-        our = trade.entry_price
-        if lentry and our:
-            recovery_profit_pct = ((lentry-our)/our*100) if trade.side=="LONG" else ((our-lentry)/our*100)
-            recovery_profit_usdt = ((lentry-our)*trade.quantity) if trade.side=="LONG" else ((our-lentry)*trade.quantity)
+        if trade.side == "LONG" and lentry and lmark:
+            leader_adverse = (lentry - lmark) / lentry * 100
+        elif trade.side == "SHORT" and lentry and lmark:
+            leader_adverse = (lmark - lentry) / lentry * 100
+        else:
+            leader_adverse = None
+
+        if trade.side == "LONG" and lentry and trade.entry_price:
+            recovery_profit_pct = (lentry - trade.entry_price) / trade.entry_price * 100
+            recovery_profit_usdt = (lentry - trade.entry_price) * trade.quantity
+        elif trade.side == "SHORT" and lentry and trade.entry_price:
+            recovery_profit_pct = (trade.entry_price - lentry) / trade.entry_price * 100
+            recovery_profit_usdt = (trade.entry_price - lentry) * trade.quantity
         else:
             recovery_profit_pct = recovery_profit_usdt = None
+
+        if trade.exit_reason == "LEADER_POSITION_CLOSED":
+            leader_status = "CLOSED_CONFIRMED"
+        elif latest_leader_snapshot and latest_leader_snapshot.hidden:
+            leader_status = "HIDDEN_OR_UNAVAILABLE"
+        elif latest_leader_snapshot and latest_contains_position:
+            leader_status = "OPEN_OBSERVED"
+        else:
+            leader_status = "LAST_OBSERVED_STALE_OR_MISSING"
+
         leader = {
-            "symbol": leader_obs.symbol, "side": leader_obs.side, "entry_price": lentry, "mark_price": lmark,
-            "unrealized_pnl": leader_obs.unrealized_pnl, "adverse_pct": ((lentry-lmark)/lentry*100 if trade.side=="LONG" and lentry and lmark else (lmark-lentry)/lentry*100 if trade.side=="SHORT" and lentry and lmark else None),
+            "trader_id": trade.trader_id,
+            "trader_name": trader.name if trader else trade.trader_name,
+            "position_key": trade.source_key.split("|", 1)[1] if "|" in trade.source_key else trade.source_key,
+            "symbol": leader_obs.symbol, "side": leader_obs.side,
+            "entry_price": lentry, "mark_price": lmark,
+            "unrealized_pnl": leader_obs.unrealized_pnl, "adverse_pct": leader_adverse,
             "leverage": leader_obs.leverage, "margin_mode": leader_obs.margin_mode,
-            "observed_at": leader_obs.raw_json and leader_obs.snapshot_id,
+            "observed_at": leader_snapshot.observed_at.isoformat() if leader_snapshot else None,
             "recovery_price": lentry, "our_recovery_profit_pct": recovery_profit_pct,
-            "our_recovery_profit_usdt": recovery_profit_usdt, "status": ("CLOSED_BY_LEADER" if trade.exit_reason == "LEADER_POSITION_CLOSED" else ("STILL_OPEN_LAST_OBSERVED" if trade.status == "CLOSED" else "OPEN_OBSERVED"))
+            "our_recovery_profit_usdt": recovery_profit_usdt, "status": leader_status
         }
-        recovery = recovery_statistics(trade.trader_id, trade.source_key.split("|",1)[1] if "|" in trade.source_key else "", trade.symbol, trade.side, lentry)
-    # Intermediate swing targets are independent of leader recovery; the leader's
-    # entry remains a separate anchor. Net estimates subtract known round-trip costs
-    # and funding accrued to the latest mark, but cannot predict future funding.
+        recovery = recovery_statistics(
+            trade.trader_id,
+            trade.source_key.split("|", 1)[1] if "|" in trade.source_key else "",
+            trade.symbol, trade.side, lentry
+        )
+
     ladder = []
     directional = 1 if trade.side == "LONG" else -1
     known_costs = safe_float(trade.estimated_costs) or 0.0
     if trade.entry_price and trade.mark_price:
-        for swing in (0.10,0.20,0.30,0.50,0.70,1.00):
-            p = trade.mark_price * (1 + directional * swing / 100)
-            gross = directional * (p - trade.entry_price) * trade.quantity
+        for swing in (0.10, 0.20, 0.30, 0.50, 0.70, 1.00):
+            target_price = trade.mark_price * (1 + directional * swing / 100)
+            gross = directional * (target_price - trade.entry_price) * trade.quantity
             ladder.append({
                 "target_type": "INTERMEDIATE_SWING_FROM_LATEST_MARK",
-                "target_pct_from_reference": swing,
-                "reference_price": trade.mark_price,
-                "price": p,
-                "gross_pnl_usdt": gross,
+                "target_pct_from_reference": swing, "reference_price": trade.mark_price,
+                "price": target_price, "gross_pnl_usdt": gross,
                 "estimated_net_pnl_usdt": gross - known_costs
             })
     if leader and leader.get("recovery_price") and trade.entry_price:
         anchor = leader["recovery_price"]
-        for extra in (0.0,0.3,0.5,0.7,1.0):
-            p = anchor*(1+extra/100) if trade.side=="LONG" else anchor*(1-extra/100)
-            gross = directional * (p-trade.entry_price) * trade.quantity
+        for extra in (0.0, 0.3, 0.5, 0.7, 1.0):
+            target_price = anchor * (1 + extra / 100) if trade.side == "LONG" else anchor * (1 - extra / 100)
+            gross = directional * (target_price - trade.entry_price) * trade.quantity
             ladder.append({
                 "target_type": "LEADER_RECOVERY_AND_CONTINUATION",
-                "target_pct_from_reference": extra,
-                "reference_price": anchor,
-                "price": p,
-                "gross_pnl_usdt": gross,
+                "target_pct_from_reference": extra, "reference_price": anchor,
+                "price": target_price, "gross_pnl_usdt": gross,
                 "estimated_net_pnl_usdt": gross - known_costs
             })
-    return {
-        "trade": {"id":trade.id,"status":trade.status,"trader_id":trade.trader_id,"leader_position_key":(trade.source_key.split("|",1)[1] if "|" in trade.source_key else trade.source_key),"symbol":trade.symbol,"side":trade.side,"entry_price":trade.entry_price,
-                  "mark_price":trade.mark_price,"exit_price":trade.exit_price,"exit_reason":trade.exit_reason,"gross_pnl":trade.gross_pnl,"estimated_costs":trade.estimated_costs,"net_pnl":trade.net_pnl,"funding_cost_actual":raw.get("funding_cost_actual"),"funding_verified":bool(raw.get("funding_history_verified")),"funding_source":raw.get("funding_source"),"margin_used":trade.margin_used,"leverage":trade.leverage,
-                  "opened_at":trade.opened_at.isoformat(),"closed_at":trade.closed_at.isoformat() if trade.closed_at else None,
-                  "mfe_net_pnl":raw.get("mfe_net_pnl",trade.net_pnl),"mae_net_pnl":raw.get("mae_net_pnl",trade.net_pnl),
-                  "mfe_pct":raw.get("mfe_pct",0),"mae_pct":raw.get("mae_pct",0),"last_binance_price_at":raw.get("last_binance_price_at"),
-                  "last_leader_check_at":raw.get("last_leader_check_at"),"data_gap_seconds":raw.get("data_gap_seconds",0),
-                  "meaningful_profit_hits":raw.get("meaningful_profit_hits",{})},
-        "trader": {"id":trade.trader_id,"name":trader.name if trader else trade.trader_name},
-        "campaign": campaign,
-        "leader": leader, "recovery": recovery, "potential_ladder": ladder,
-        "path": [{"at":p.observed_at.isoformat(),"paper_price":p.paper_price,"leader_mark":p.leader_mark,"leader_pnl":p.leader_unrealized_pnl,
-                  "leader_adverse_pct":p.leader_adverse_pct,"net_pnl":p.net_pnl,"pnl_pct":p.pnl_pct,"source":p.source,"gap":p.data_gap_seconds} for p in path],
-        "events": [{"at":e.observed_at.isoformat(),"type":e.event_type,"value":e.value,"detail":e.detail} for e in events],
-        "data_quality": {"status":"CONTINUOUS" if not any(p.gap>15 for p in path) else "INTERRUPTED","note":"A final loss after a monitor/data gap is not classified as a clean strategy failure."}
-    }
 
+    # Real Binance USD-M Futures candlesticks for the actual instrument.
+    candles = []
+    candle_interval = "5m"
+    candle_error = None
+    try:
+        opened = trade.opened_at
+        if opened.tzinfo is None:
+            opened = opened.replace(tzinfo=timezone.utc)
+        age_hours = max(0.0, (now() - opened).total_seconds() / 3600)
+        if age_hours > 24:
+            candle_interval = "1h"
+            raw_candles, _ = await binance_get(
+                "/fapi/v1/klines", {"symbol": trade.symbol, "interval": candle_interval, "limit": 168}
+            )
+        else:
+            raw_candles, _ = await binance_get(
+                "/fapi/v1/klines", {"symbol": trade.symbol, "interval": candle_interval, "limit": 288}
+            )
+        if isinstance(raw_candles, list):
+            candles = [{
+                "open_time": int(item[0]), "open": safe_float(item[1]),
+                "high": safe_float(item[2]), "low": safe_float(item[3]),
+                "close": safe_float(item[4]), "volume": safe_float(item[5]),
+                "close_time": int(item[6])
+            } for item in raw_candles if isinstance(item, (list, tuple)) and len(item) >= 7]
+    except Exception as exc:
+        candle_error = str(exc)[:220]
+
+    return {
+        "trade": {
+            "id": trade.id, "status": trade.status, "trader_id": trade.trader_id,
+            "leader_position_key": trade.source_key.split("|", 1)[1] if "|" in trade.source_key else trade.source_key,
+            "symbol": trade.symbol, "side": trade.side, "entry_price": trade.entry_price,
+            "mark_price": trade.mark_price, "exit_price": trade.exit_price,
+            "exit_reason": trade.exit_reason, "gross_pnl": round(float(trade.gross_pnl or 0.0), 8),
+            "estimated_costs": round(float(trade.estimated_costs or 0.0), 8),
+            "net_pnl": round(float(trade.net_pnl or 0.0), 8),
+            "funding_cost_actual": safe_float(raw.get("funding_cost_actual")),
+            "funding_verified": bool(raw.get("funding_history_verified")),
+            "funding_audit_status": raw.get("funding_audit_status", "LEGACY_FUNDING_UNVERIFIED"),
+            "funding_source": raw.get("funding_source"),
+            "funding_verification_error": raw.get("funding_verification_error"),
+            "margin_used": trade.margin_used, "leverage": trade.leverage,
+            "opened_at": trade.opened_at.isoformat(),
+            "closed_at": trade.closed_at.isoformat() if trade.closed_at else None,
+            "mfe_net_pnl": safe_float(raw.get("mfe_net_pnl")),
+            "mae_net_pnl": safe_float(raw.get("mae_net_pnl")),
+            "mfe_pct": safe_float(raw.get("mfe_pct")), "mae_pct": safe_float(raw.get("mae_pct")),
+            "last_binance_price_at": raw.get("last_binance_price_at"),
+            "last_leader_check_at": raw.get("last_leader_check_at"),
+            "data_gap_seconds": safe_float(raw.get("last_data_gap_seconds")),
+            "max_data_gap_seconds": round(max_gap, 3),
+            "data_quality_status": quality_status,
+            "meaningful_profit_hits": raw.get("meaningful_profit_hits", {}),
+            "funding_history_rows": raw.get("funding_history_rows")
+        },
+        "trader": {"id": trade.trader_id, "name": trader.name if trader else trade.trader_name},
+        "campaign": campaign, "leader": leader, "leader_path": leader_path,
+        "recovery": recovery, "potential_ladder": ladder,
+        "path": [{
+            "at": point.observed_at.isoformat(), "paper_price": point.paper_price,
+            "leader_mark": point.leader_mark, "leader_pnl": point.leader_unrealized_pnl,
+            "leader_adverse_pct": point.leader_adverse_pct,
+            "net_pnl": round(float(point.net_pnl or 0.0), 8),
+            "pnl_pct": point.pnl_pct, "source": point.source,
+            "gap": point.data_gap_seconds
+        } for point in path],
+        "events": [{
+            "at": event.observed_at.isoformat(), "type": event.event_type,
+            "value": event.value, "detail": event.detail
+        } for event in events],
+        "candles": candles, "candle_interval": candle_interval, "candle_error": candle_error,
+        "data_quality": {
+            "status": quality_status, "max_gap_seconds": round(max_gap, 3),
+            "note": (
+                "INFORMATION_CUTOFF: historical PnL is preserved, but the complete path is not considered verified."
+                if quality_status == "INFORMATION_CUTOFF" else
+                "A recorded gap over 15 seconds makes this path interrupted; it is not a clean continuously-observed failure."
+                if quality_status == "DATA_INTERRUPTED_REVIEW" else
+                "Path quality is based on persisted observations. Unrecorded historical intervals cannot be reconstructed."
+            )
+        }
+    }
 @app.post("/api/paper/settings")
 async def update_paper_settings(request: Request):
     body = await request.json()
