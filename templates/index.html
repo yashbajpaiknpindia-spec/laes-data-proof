@@ -124,7 +124,9 @@
             <div class="form-grid">
               <label>Risk per trade <span>% equity</span><input name="risk_pct" type="number" min="0.01" max="5" step="0.05" value="0.5"></label>
               <label>Max margin per trade <span>% equity</span><input name="max_margin_pct" type="number" min="1" max="100" step="1" value="10"></label>
-              <label>Total portfolio margin cap <span>% of paper capital</span><input name="max_total_margin_pct" type="number" min="5" max="100" step="5" value="40"></label>
+              <label>Total research margin cap <span>% of paper capital · research mode can exceed shadow cap</span><input name="max_total_margin_pct" type="number" min="5" max="100" step="5" value="100"></label>
+              <label>Shadow portfolio margin cap <span>% of capital · realistic comparison only</span><input name="shadow_max_total_margin_pct" type="number" min="5" max="100" step="5" value="40"></label>
+              <label>Shadow max same-symbol / same-side positions <span>1 = only one ETH LONG at a time</span><input name="shadow_max_positions_per_symbol_direction" type="number" min="1" max="5" step="1" value="1"></label>
               <label>Target <span>% from entry</span><input name="target_pct" type="number" min="0.05" step="0.05" value="0.7"></label>
               <label>Stop loss <span>% from entry</span><input name="stop_pct" type="number" min="0.05" step="0.05" value="0.45"></label>
               <label>Taker fee <span>% per side</span><input name="taker_fee_pct" type="number" min="0" step="0.005" value="0.05"></label>
@@ -149,6 +151,7 @@
         <div class="table-scroll"><table><thead><tr><th>STATUS / QUALITY</th><th>LEADER / POSITION</th><th>SYMBOL</th><th>SIDE</th><th>ENTRY / MARK</th><th>NOTIONAL</th><th>MARGIN</th><th>NET PNL / MFE / MAE</th><th>STOP / TARGET</th><th>OPENED</th><th>DETAILS</th></tr></thead><tbody id="paperTrades"><tr><td colspan="11" class="empty-cell">No paper trades have qualified yet. No placeholder trades are generated.</td></tr></tbody></table></div>
       </article>
       <article class="panel" style="margin-top:16px"><div class="panel-heading"><div><div class="section-kicker">CORRELATED FUTURES EXPOSURE</div><h3>Same-symbol loss concentration</h3><p>Leaders holding the same coin and direction can lose together. These estimates expose shared risk without suppressing research signals.</p></div></div><div id="paperRiskClusters"><div class="empty-state">Waiting for portfolio exposure analysis…</div></div></article>
+      <article class="panel" style="margin-top:16px"><div class="panel-heading"><div><div class="section-kicker">CAPITAL-CONSTRAINED SHADOW REPLAY</div><h3>What a limited portfolio would have selected</h3><p>Replays the recorded research entries and exits in time order, using a separate margin cap and a same-coin/same-direction overlap limit. Research trades remain untouched.</p></div><span class="status-tag neutral">COUNTERFACTUAL</span></div><div id="paperShadowPortfolio"><div class="empty-state">Waiting for shadow portfolio calculation…</div></div></article>
     </section>
 
     <section class="page" id="page-market">
@@ -175,5 +178,5 @@
 </div>
 
 <dialog id="traderDialog" class="trader-dialog"><div class="dialog-head"><div><div class="section-kicker">TRADER FORENSICS</div><h2 id="dialogName">Trader</h2><p id="dialogSub"></p></div><button class="icon-btn" id="closeDialog">×</button></div><div id="dialogBody"></div></dialog>
-<script src="/static/app.js?v=4"></script>
+<script src="/static/app.js?v=5"></script>
 </body></html>
