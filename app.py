@@ -843,11 +843,20 @@ def overview_counts() -> dict:
         observations = db.scalar(select(func.count()).select_from(PositionObservation)) or 0
         latest_ids = select(func.max(PositionSnapshot.id).label("id")).group_by(PositionSnapshot.trader_id).subquery()
         latest_rows = db.scalars(select(PositionSnapshot).join(latest_ids, PositionSnapshot.id == latest_ids.c.id)).all()
-        latest_visible_ids = [row.id for row in latest_rows if not row.hidden]
+        fresh_cutoff = now() - timedelta(seconds=900)
         latest_hidden = sum(1 for row in latest_rows if row.hidden)
-        live_rows = db.scalars(select(PositionObservation).where(PositionObservation.snapshot_id.in_(latest_visible_ids))).all() if latest_visible_ids else []
+        latest_visible = [row for row in latest_rows if not row.hidden]
+        latest_stale = sum(1 for row in latest_visible if row.observed_at < fresh_cutoff)
+        latest_fresh_ids = [row.id for row in latest_visible if row.observed_at >= fresh_cutoff]
+        live_rows = db.scalars(select(PositionObservation).where(PositionObservation.snapshot_id.in_(latest_fresh_ids))).all() if latest_fresh_ids else []
         live_positions = len(live_rows)
-        underwater_live = sum(1 for row in live_rows if row.unrealized_pnl is not None and row.unrealized_pnl < 0)
+        underwater_live = 0
+        for row in live_rows:
+            adverse = None
+            if row.entry_price and row.mark_price and row.entry_price > 0:
+                adverse = ((row.entry_price - row.mark_price) / row.entry_price * 100) if row.side == "LONG" else ((row.mark_price - row.entry_price) / row.entry_price * 100)
+            if (row.unrealized_pnl is not None and row.unrealized_pnl < 0) or (adverse is not None and adverse > 0):
+                underwater_live += 1
         open_paper = db.scalar(select(func.count()).select_from(PaperTrade).where(PaperTrade.status == "OPEN")) or 0
         closed_paper = db.scalar(select(func.count()).select_from(PaperTrade).where(PaperTrade.status == "CLOSED")) or 0
         latest = db.scalar(select(func.max(PositionSnapshot.observed_at)))
@@ -855,6 +864,7 @@ def overview_counts() -> dict:
         "traders": traders, "snapshots": snapshots, "observations": observations,
         "live_positions": live_positions, "underwater_live_positions": underwater_live,
         "latest_trader_snapshots_hidden": latest_hidden, "hidden_snapshots": latest_hidden,
+        "stale_visible_trader_snapshots": latest_stale,
         "open_paper_trades": open_paper, "closed_paper_trades": closed_paper,
         "underwater_observations": underwater_live,
         "latest_snapshot": latest.isoformat() if latest else None
@@ -893,6 +903,14 @@ async def api_overview():
         "monitor": {**last_scan, "worker_alive": worker_alive, "interval_seconds": DISCOVERY_INTERVAL, "position_batch_per_cycle": POSITION_BATCH, "quota_design": "One 20-trader leaderboard request plus up to twenty open-position requests per 30-minute cycle; profile/performance/history refreshes are limited to once per trader per 24 hours; market-data calls are separate."},
         "paper": paper_config(),
         "paper_fast_price_monitor": True,
+        "price_feed": {
+            "status": PAPER_PRICE_STREAM_STATE.get("status"),
+            "connected": bool(PAPER_PRICE_STREAM_STATE.get("connected")),
+            "active_symbols": len(PAPER_PRICE_STREAM_STATE.get("subscribed_symbols") or []),
+            "last_price_at": PAPER_PRICE_STREAM_STATE.get("last_price_at"),
+            "last_error": PAPER_PRICE_STREAM_STATE.get("last_error"),
+            "binance_rest": binance_rest_status()
+        },
         "execution_enabled": False,
         "runtime_note": "On Render Free, the web service can spin down after 15 minutes without inbound traffic. The in-process monitor runs only while the instance is awake."
     }
@@ -902,13 +920,14 @@ async def api_traders(limit: int = 100, search: str = ""):
     limit = max(1, min(limit, 300))
     with SessionLocal() as db:
         query = select(Trader).order_by(desc(Trader.copier_pnl), desc(Trader.last_seen_at))
+        q = search.lower().strip()
+        if q:
+            pattern = f"%{q}%"
+            query = query.where((Trader.name.ilike(pattern)) | (Trader.trader_id.ilike(pattern)))
         rows = db.scalars(query.limit(limit)).all()
         cache = {p.trader_id: p for p in db.scalars(select(TraderProfileCache)).all()}
     result = []
-    q = search.lower().strip()
     for t in rows:
-        if q and q not in (t.name or "").lower() and q not in t.trader_id.lower():
-            continue
         profile_cache = cache.get(t.trader_id)
         profile = unwrap_data(parse_json(profile_cache.raw_profile)) if profile_cache else {}
         src = parse_json(t.raw_json)
@@ -2334,8 +2353,8 @@ async def api_paper():
     cfg = paper_config()
     with SessionLocal() as db:
         trades = db.scalars(select(PaperTrade).order_by(desc(PaperTrade.opened_at)).limit(300)).all()
-        # The shadow portfolio replays the complete paper history, separately from
-        # the newest 300 rows shown in the visible ledger.
+        # Portfolio totals and risk clusters must use the complete ledger, not only
+        # the newest 300 rows rendered in the table.
         shadow_trades = db.scalars(
             select(PaperTrade).order_by(PaperTrade.opened_at, PaperTrade.id)
         ).all()
@@ -2345,8 +2364,8 @@ async def api_paper():
         ).all()
         max_gaps = {int(trade_id): float(gap or 0.0) for trade_id, gap in gap_rows}
 
-    open_trades = [trade for trade in trades if trade.status == "OPEN"]
-    closed_trades = [trade for trade in trades if trade.status == "CLOSED"]
+    open_trades = [trade for trade in shadow_trades if trade.status == "OPEN"]
+    closed_trades = [trade for trade in shadow_trades if trade.status == "CLOSED"]
     realized = sum(float(trade.net_pnl or 0.0) for trade in closed_trades)
     unrealized = sum(float(trade.net_pnl or 0.0) for trade in open_trades)
     deployed_margin = sum(float(trade.margin_used or 0.0) for trade in open_trades)
