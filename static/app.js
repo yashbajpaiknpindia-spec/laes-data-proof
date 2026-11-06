@@ -111,6 +111,26 @@ async function loadPaper(){
    (groups.length?'<div class="profile-history"><table><thead><tr><th>SYMBOL / DIRECTION</th><th>OPEN SIGNALS</th><th>NOTIONAL</th><th>STOP RISK</th><th>LIVE NET PNL</th><th>LEADERS</th></tr></thead><tbody>'+
     groups.map(g=>'<tr><td><b>'+esc(g.symbol)+'</b> <span class="'+(g.side==="LONG"?"side-long":"side-short")+'">'+esc(g.side)+'</span></td><td>'+fmt(g.open_count,0)+'</td><td>'+money(g.open_notional)+'</td><td class="negative">'+money(g.estimated_stop_loss_usdt)+'</td><td class="'+(g.current_net_pnl>=0?"positive":"negative")+'">'+money(g.current_net_pnl)+'</td><td>'+esc((g.leaders||[]).join(", "))+'</td></tr>').join("")+
     '</tbody></table></div>':'<div class="empty-state">No overlapping open symbol-direction clusters.</div>');
+  const sh=d.shadow_portfolio||{};
+  const shFields=[
+   ["Shadow capital",money(sh.capital)],
+   ["Margin cap",money(sh.margin_cap)+" · "+fmt(sh.margin_cap_pct,1)+"%"],
+   ["Selected trades",fmt(sh.selected_count,0)],
+   ["Open / closed",fmt(sh.selected_open_count,0)+" / "+fmt(sh.selected_closed_count,0)],
+   ["Margin in use",money(sh.deployed_margin)+" · "+fmt(sh.margin_utilization_pct,1)+"%"],
+   ["Realized net PnL",money(sh.realized_pnl)],
+   ["Unrealized net PnL",money(sh.unrealized_pnl)],
+   ["Shadow equity",money(sh.equity)],
+   ["Free capital",money(sh.free_capital)],
+   ["Closed profit factor",sh.realized_profit_factor===null||sh.realized_profit_factor===undefined?"—":fmt(sh.realized_profit_factor,3)],
+   ["Closed wins / losses",fmt(sh.closed_wins,0)+" / "+fmt(sh.closed_losses,0)],
+   ["Skipped: same coin/direction",fmt(sh.skipped_correlated,0)],
+   ["Skipped: margin cap",fmt(sh.skipped_margin_cap,0)],
+   ["Selected trades with uncertain data",fmt(sh.uncertain_data_quality_count,0)+" · "+fmt(sh.uncertain_data_quality_pct,1)+"%"]
+  ];
+  $("paperShadowPortfolio").innerHTML=
+   '<div class="profile-grid">'+shFields.map(x=>'<div class="profile-metric"><small>'+esc(x[0])+'</small><b>'+esc(x[1])+'</b></div>').join("")+'</div>'+
+   '<div class="sample-warning">'+esc(sh.note||"Counterfactual portfolio replay; it does not alter the full research ledger.")+'</div>';
   if(!d.trades.length){$("paperTrades").innerHTML='<tr><td colspan="11" class="empty-cell">No real opportunity has qualified. No demo trades are generated.</td></tr>';return;}
   $("paperTrades").innerHTML=d.trades.map(t=>{
    const statusText=t.status==="OPEN"?"OPEN":"CLOSED";
