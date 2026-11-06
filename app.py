@@ -509,7 +509,7 @@ def restore_binance_rest_cooldown() -> None:
             )
         if not row or not row.detail:
             return
-        match = re.search(r"REST paused until (\\S+)", row.detail)
+        match = re.search(r"REST paused until (\S+)", row.detail)
         if not match:
             return
         expires_at = datetime.fromisoformat(match.group(1).rstrip("."))
