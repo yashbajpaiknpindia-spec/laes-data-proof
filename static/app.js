@@ -149,7 +149,9 @@ async function loadPaper(){
      t.data_quality_status==="PATH_NOT_RECORDED"?"PATH NOT RECORDED":"";
    const monitor=t.monitoring_status==="RESUMED_AFTER_GAP"?"FEED RESUMED · HISTORICAL GAP RETAINED":
      t.monitoring_status==="INTERRUPTED"?"WAITING FOR 3 FRESH PRICES":"";
-   const funding=t.funding_history_verified===true?"FUNDING VERIFIED":
+   const funding=t.funding_history_verified===true?
+     (t.funding_audit_status==="VERIFIED_ZERO_BEFORE_NEXT_SETTLEMENT"?"NO FUNDING SETTLED":"FUNDING VERIFIED"):
+     t.funding_audit_status==="PENDING_POST_CLOSE_RECONCILIATION"?"FUNDING ESTIMATED · RECONCILE":
      t.funding_audit_status==="LEGACY_FUNDING_UNVERIFIED"?"LEGACY FUNDING UNKNOWN":"FUNDING PENDING";
    return '<tr class="clickable-row" onclick="openPaperTrade('+t.id+')">'+
     '<td><span class="status-tag '+(t.status==="OPEN"?"qualified":"neutral")+'">'+statusText+'</span>'+
