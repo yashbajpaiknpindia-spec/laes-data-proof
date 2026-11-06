@@ -1026,9 +1026,10 @@ async def api_positions(limit: int = 500):
     return list(latest.values())
 
 
-async def fetch_news_items() -> list[dict]:
-    if time.time() - news_cache["fetched_at"] < 1800:
+async def fetch_news_items(force: bool = False) -> list[dict]:
+    if not force and time.time() - news_cache["fetched_at"] < 1800:
         return news_cache["items"]
+    feed_errors = []
     feeds = [
         ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/"),
         ("Cointelegraph", "https://cointelegraph.com/rss"),
@@ -1048,8 +1049,8 @@ async def fetch_news_items() -> list[dict]:
                 if title and link:
                     items.append({"title": title, "url": link, "published_at": pub, "source": source_name})
         except Exception as exc:
-            news_cache["error"] = f"{source_name}: {str(exc)[:150]}"
-    news_cache.update({"fetched_at": time.time(), "items": items, "error": news_cache.get("error")})
+            feed_errors.append(f"{source_name}: {str(exc)[:150]}")
+    news_cache.update({"fetched_at": time.time(), "items": items, "error": "; ".join(feed_errors) or None})
     return items
 
 def rsi_value(closes: list[float], period: int = 14) -> float | None:
@@ -1529,11 +1530,11 @@ async def run_post_exit_recovery_audit() -> dict:
         ).all()
     for trade in trades:
         raw = parse_json(trade.raw_json)
-        if raw.get("post_exit_recovery_audit_version") == 1:
+        if raw.get("post_exit_recovery_audit_version") == 2:
             continue
         quality = raw.get("data_quality_status")
         if quality in {"INFORMATION_CUTOFF", "DATA_INTERRUPTED_REVIEW", "PATH_NOT_RECORDED"}:
-            raw["post_exit_recovery_audit_version"] = 1
+            raw["post_exit_recovery_audit_version"] = 2
             raw["post_exit_recovery_status"] = "SKIPPED_UNVERIFIED_PATH"
             raw["post_exit_old_exit_reason"] = trade.exit_reason
             raw["post_exit_recovery_label"] = f"[RECOVERY AUDIT SKIPPED · {quality} · OLD EXIT: {trade.exit_reason or 'UNKNOWN'}]"
@@ -1560,6 +1561,8 @@ async def run_post_exit_recovery_audit() -> dict:
             directional = 1.0 if trade.side == "LONG" else -1.0
             best = None
             first_entry_cross = None
+            first_net_profit = None
+            worst = None
             for row in rows:
                 if not isinstance(row, (list, tuple)) or len(row) < 7:
                     continue
@@ -1573,6 +1576,14 @@ async def run_post_exit_recovery_audit() -> dict:
                 candidate_net = candidate_gross - estimated_cost
                 if best is None or candidate_net > best["max_net_pnl"]:
                     best = {"max_net_pnl": candidate_net, "max_price": favorable, "at_ms": at_ms, "gross": candidate_gross, "cost": estimated_cost}
+                adverse_price = low if trade.side == "LONG" else high
+                adverse_gross = directional * (adverse_price - trade.entry_price) * trade.quantity
+                adverse_cost = (trade.entry_price + adverse_price) * trade.quantity * ((float(cfg["taker_fee_pct"]) + float(cfg["slippage_pct"])) / 100.0)
+                adverse_net = adverse_gross - adverse_cost
+                if worst is None or adverse_net < worst["min_net_pnl"]:
+                    worst = {"min_net_pnl": adverse_net, "price": adverse_price, "at_ms": at_ms}
+                if candidate_net > 0 and first_net_profit is None:
+                    first_net_profit = at_ms
                 crossed = (high >= trade.entry_price) if trade.side == "LONG" else (low <= trade.entry_price)
                 if crossed and first_entry_cross is None:
                     first_entry_cross = at_ms
@@ -1581,7 +1592,7 @@ async def run_post_exit_recovery_audit() -> dict:
             recovered_to_profit = best["max_net_pnl"] > 0
             recovered_to_entry = first_entry_cross is not None
             raw.update({
-                "post_exit_recovery_audit_version": 1,
+                "post_exit_recovery_audit_version": 2,
                 "post_exit_recovery_status": "RECOVERED_TO_NET_PROFIT" if recovered_to_profit else ("RECOVERED_TO_ENTRY_ONLY" if recovered_to_entry else "NO_ENTRY_RECOVERY"),
                 "post_exit_recovery_market_source": "BINANCE_USDM_MARK_PRICE_1M",
                 "post_exit_recovery_horizon_hours": horizon_hours,
@@ -1590,14 +1601,21 @@ async def run_post_exit_recovery_audit() -> dict:
                 "post_exit_max_price": best["max_price"],
                 "post_exit_max_at": datetime.fromtimestamp(best["at_ms"]/1000, timezone.utc).isoformat(),
                 "post_exit_return_to_entry_at": datetime.fromtimestamp(first_entry_cross/1000, timezone.utc).isoformat() if first_entry_cross else None,
+                "post_exit_minutes_to_entry": round((first_entry_cross - start_ms) / 60000, 2) if first_entry_cross else None,
+                "post_exit_first_net_profit_at": datetime.fromtimestamp(first_net_profit/1000, timezone.utc).isoformat() if first_net_profit else None,
+                "post_exit_minutes_to_net_profit": round((first_net_profit - start_ms) / 60000, 2) if first_net_profit else None,
+                "post_exit_minutes_to_best": round((best["at_ms"] - start_ms) / 60000, 2),
+                "post_exit_observed_minutes": round((int(rows[-1][0]) - start_ms) / 60000, 2) if rows else 0,
+                "post_exit_worst_net_pnl": round(worst["min_net_pnl"], 8) if worst else None,
+                "post_exit_worst_at": datetime.fromtimestamp(worst["at_ms"]/1000, timezone.utc).isoformat() if worst else None,
                 "post_exit_recovery_profit_usdt": round(max(0.0, best["max_net_pnl"]), 8),
                 "post_exit_old_exit_reason": trade.exit_reason,
                 "post_exit_recovery_label": (
-                    f"[RECOVERED AFTER EXIT → +{best['max_net_pnl']:.4f} USDT | old: {trade.exit_reason}]"
+                    f"[AFTER EXIT: NET PROFIT +{best['max_net_pnl']:.4f} USDT · +{(first_net_profit-start_ms)/60000:.0f}m | best +{(best['at_ms']-start_ms)/60000:.0f}m | old: {trade.exit_reason}]"
                     if recovered_to_profit else
-                    f"[RECOVERED TO ENTRY AFTER EXIT | old: {trade.exit_reason}]"
+                    f"[AFTER EXIT: ENTRY RECOVERED +{(first_entry_cross-start_ms)/60000:.0f}m BUT NOT NET PROFIT | old: {trade.exit_reason}]"
                     if recovered_to_entry else
-                    f"[NO RECOVERY IN {horizon_hours:.0f}H | old: {trade.exit_reason}]"
+                    f"[AFTER EXIT: NO ENTRY/NET RECOVERY IN {horizon_hours:.0f}H | old: {trade.exit_reason}]"
                 )
             })
             with SessionLocal() as db:
@@ -1606,12 +1624,12 @@ async def run_post_exit_recovery_audit() -> dict:
                     live.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
                     exists = db.scalar(select(PaperTradeEvent.id).where(
                         PaperTradeEvent.paper_trade_id == trade.id,
-                        PaperTradeEvent.event_type == "POST_EXIT_RECOVERY_AUDIT_V1"
+                        PaperTradeEvent.event_type == "POST_EXIT_RECOVERY_AUDIT_V2"
                     ).limit(1))
                     if not exists:
                         db.add(PaperTradeEvent(
                             paper_trade_id=trade.id,
-                            event_type="POST_EXIT_RECOVERY_AUDIT_V1",
+                            event_type="POST_EXIT_RECOVERY_AUDIT_V2",
                             observed_at=live.closed_at or now(),
                             value=best["max_net_pnl"],
                             detail=raw["post_exit_recovery_label"]
@@ -2355,6 +2373,11 @@ async def api_paper():
     for trade in trades:
         raw = parse_json(trade.raw_json)
         max_gap = max(max_gaps.get(trade.id, 0.0), float(raw.get("max_data_gap_seconds", 0.0) or 0.0))
+        opened_dt = trade.opened_at if trade.opened_at.tzinfo else trade.opened_at.replace(tzinfo=timezone.utc)
+        closed_dt = trade.closed_at or now()
+        if closed_dt.tzinfo is None:
+            closed_dt = closed_dt.replace(tzinfo=timezone.utc)
+        hold_seconds = max(0.0, (closed_dt - opened_dt).total_seconds())
         trade_rows.append({
             "id": trade.id, "trader_id": trade.trader_id, "trader_name": trade.trader_name,
             "leader_position_key": (trade.source_key.split("|", 1)[1] if "|" in trade.source_key else trade.source_key),
@@ -2384,6 +2407,13 @@ async def api_paper():
             "funding_history_verified": raw.get("funding_history_verified"),
             "funding_audit_status": raw.get("funding_audit_status", "LEGACY_FUNDING_UNVERIFIED"),
             "funding_cost_actual": safe_float(raw.get("funding_cost_actual")),
+            "hold_duration_seconds": round(hold_seconds, 2),
+            "hold_duration_hours": round(hold_seconds / 3600, 3),
+            "post_exit_recovery_minutes_to_entry": safe_float(raw.get("post_exit_minutes_to_entry")),
+            "post_exit_recovery_minutes_to_net_profit": safe_float(raw.get("post_exit_minutes_to_net_profit")),
+            "post_exit_recovery_minutes_to_best": safe_float(raw.get("post_exit_minutes_to_best")),
+            "post_exit_recovery_worst_net_pnl": safe_float(raw.get("post_exit_worst_net_pnl")),
+            "post_exit_recovery_observed_minutes": safe_float(raw.get("post_exit_observed_minutes")),
             "opened_at": trade.opened_at.isoformat(),
             "closed_at": trade.closed_at.isoformat() if trade.closed_at else None
         })
@@ -2764,9 +2794,10 @@ async def sync_now():
     return await run_monitor_cycle(force=True)
 
 @app.get("/api/news")
-async def api_news(symbol: str = ""):
-    items = await fetch_news_items()
-    return {"source": "CoinDesk RSS", "items": find_news_for_symbol(symbol, items) if symbol else items[:40], "warning": "Headline timing is context only; LAES does not claim a headline caused a particular price move.", "feed_error": news_cache.get("error")}
+async def api_news(symbol: str = "", refresh: bool = False):
+    items = await fetch_news_items(force=refresh)
+    fetched_at = datetime.fromtimestamp(news_cache["fetched_at"], timezone.utc).isoformat() if news_cache.get("fetched_at") else None
+    return {"source": "CoinDesk / Cointelegraph / The Block RSS", "items": find_news_for_symbol(symbol, items) if symbol else items[:40], "fetched_at": fetched_at, "feed_error": news_cache.get("error"), "warning": "Headline timing is context only; LAES does not claim a headline caused a particular price move."}
 
 @app.get("/api/market/{symbol}")
 async def api_market(symbol: str, refresh: bool = False):
