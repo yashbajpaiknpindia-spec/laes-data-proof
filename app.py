@@ -342,9 +342,9 @@ def migrate_paper_audit_metadata() -> None:
                         trade.closed_at or trade.opened_at or cutoff_utc,
                         f"Historical maximum saved price-path gap: {max_gap:.1f} seconds; INFORMATION_CUTOFF label retained and financial outcome unchanged."
                     ))
-            elif max_gap > 15:
-                # A historical gap remains visible regardless of whether the path
-                # later recovered or the original paper trade eventually closed.
+            elif max_gap > 15 or raw.get("data_quality_status") == "CONTINUOUS_AGAIN":
+                # CONTINUOUS_AGAIN was an old status written after a gap had occurred.
+                # It is not proof that the historical price path was continuous.
                 raw["data_quality_status"] = "DATA_INTERRUPTED_REVIEW"
                 raw["data_quality_reason"] = (
                     "At least one saved price-path interval exceeded 15 seconds. "
