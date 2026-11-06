@@ -726,7 +726,7 @@ async def run_monitor_cycle(force: bool = False) -> dict:
                 except Exception as exc:
                     log_check("trader_profile", False, None, None, f"{trader_id}: {str(exc)[:700]}")
             try:
-                    opportunities = await api_opportunities(limit=100)
+                opportunities = await api_opportunities(limit=100)
                 qualified_count = sum(1 for item in opportunities if item.get("qualified"))
                 market_blocked = sum(1 for item in opportunities if any("live Binance" in reason for reason in item.get("dead_market_reasons", [])))
                 log_check("paper_analysis", True, 200, None, f"observed={len(opportunities)} qualified={qualified_count} live_market_warmup_or_blocked={market_blocked}")
