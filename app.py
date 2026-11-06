@@ -1519,7 +1519,7 @@ async def run_post_exit_recovery_audit() -> dict:
     Binance mark-price recovery metadata in raw_json and PaperTradeEvent.
     """
     cfg = paper_config()
-    horizon_hours = max(1.0, min(24.0, float(cfg.get("post_exit_recovery_audit_hours", 6.0))))
+    horizon_hours = max(1.0, min(24.0, float(cfg.get("post_exit_recovery_audit_hours", 24.0))))
     audited = recovered = 0
     failures = 0
     with SessionLocal() as db:
@@ -1532,18 +1532,9 @@ async def run_post_exit_recovery_audit() -> dict:
         raw = parse_json(trade.raw_json)
         if raw.get("post_exit_recovery_audit_version") == 2:
             continue
-        quality = raw.get("data_quality_status")
-        if quality in {"INFORMATION_CUTOFF", "DATA_INTERRUPTED_REVIEW", "PATH_NOT_RECORDED"}:
-            raw["post_exit_recovery_audit_version"] = 2
-            raw["post_exit_recovery_status"] = "SKIPPED_UNVERIFIED_PATH"
-            raw["post_exit_old_exit_reason"] = trade.exit_reason
-            raw["post_exit_recovery_label"] = f"[RECOVERY AUDIT SKIPPED · {quality} · OLD EXIT: {trade.exit_reason or 'UNKNOWN'}]"
-            with SessionLocal() as db:
-                live = db.get(PaperTrade, trade.id)
-                if live:
-                    live.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
-                    db.commit()
-            continue
+        # The post-exit market path is independently auditable even when the
+        # pre-exit paper path was interrupted or incomplete. Keep the old
+        # data-quality label, but do not skip this separate Binance audit.
         if not trade.closed_at or not trade.exit_price or not trade.entry_price:
             continue
         start_ms = int(trade.closed_at.timestamp() * 1000)
