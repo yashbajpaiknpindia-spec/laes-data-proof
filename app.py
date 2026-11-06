@@ -290,7 +290,12 @@ def paper_config() -> dict:
         "taker_fee_pct": 0.05,
         "slippage_pct": 0.02,
         "max_leverage": 3.0,
-        "min_adverse_pct": 0.30
+        "min_adverse_pct": 0.30,
+        "leader_continuation_enabled": True,
+        "leader_continuation_hard_loss_price_pct": 0.60,
+        "leader_continuation_max_minutes": 30,
+        "leader_reversal_exit_enabled": True,
+        "post_exit_recovery_audit_hours": 6.0
     }
     saved = setting("paper_config", {})
     return {**defaults, **(saved if isinstance(saved, dict) else {})}
@@ -752,6 +757,10 @@ async def monitor_worker() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    try:
+        await run_post_exit_recovery_audit()
+    except Exception as exc:
+        log_check("post_exit_recovery_audit_startup", False, None, None, str(exc)[:900])
     task = asyncio.create_task(monitor_worker())
     price_task = asyncio.create_task(paper_price_worker())
     app.state.monitor_task = task
@@ -1432,6 +1441,164 @@ async def _actual_funding_cost(trade: PaperTrade, at: datetime) -> tuple[float, 
     return total, len(rows)
 
 
+def _leader_state_for_trade(db, trade: PaperTrade) -> tuple[str, str]:
+    """
+    Determine leader state without treating missing/stale/hidden data as a close.
+    Returns (state, detail):
+      OPEN_OBSERVED, CLOSED_CONFIRMED, REVERSED, STALE_OR_UNAVAILABLE
+    """
+    if "|" not in trade.source_key:
+        return "STALE_OR_UNAVAILABLE", "Trade has no leader position key"
+    trader_id, position_key = trade.source_key.split("|", 1)
+    latest = db.scalar(
+        select(PositionSnapshot).where(PositionSnapshot.trader_id == trader_id)
+        .order_by(desc(PositionSnapshot.id)).limit(1)
+    )
+    if latest is None or latest.hidden:
+        return "STALE_OR_UNAVAILABLE", "Latest leader snapshot is unavailable/hidden"
+
+    exact = db.scalar(select(PositionObservation).where(
+        PositionObservation.snapshot_id == latest.id,
+        PositionObservation.trader_id == trader_id,
+        PositionObservation.position_key == position_key
+    ).limit(1))
+    if exact is not None:
+        if exact.side.upper() != trade.side.upper():
+            return "REVERSED", f"Leader side changed to {exact.side}"
+        return "OPEN_OBSERVED", "Exact leader position present in latest visible snapshot"
+
+    # A visible opposite-side position on the same symbol is a strong reversal
+    # signal. We never infer reversal from an empty/hidden snapshot alone.
+    symbol = trade.symbol.upper()
+    opposite = "SHORT" if trade.side.upper() == "LONG" else "LONG"
+    reversed_obs = db.scalar(select(PositionObservation).where(
+        PositionObservation.snapshot_id == latest.id,
+        PositionObservation.trader_id == trader_id,
+        PositionObservation.symbol == symbol,
+        PositionObservation.side == opposite
+    ).limit(1))
+    if reversed_obs is not None:
+        return "REVERSED", f"Visible opposite-side leader position {reversed_obs.position_key}"
+
+    raw = parse_json(trade.raw_json)
+    missing = int(raw.get("leader_missing_visible_snapshots", 0) or 0)
+    if missing >= 2:
+        return "CLOSED_CONFIRMED", "Exact leader position absent from two consecutive visible snapshots"
+    return "STALE_OR_UNAVAILABLE", "Leader position not present in the latest snapshot but closure is not yet confirmed"
+
+
+async def run_post_exit_recovery_audit() -> dict:
+    """
+    One-time, read-only market-path audit for historical clean closed losses.
+    It never rewrites realized PnL, exit price, status, or capital. It only stores
+    Binance mark-price recovery metadata in raw_json and PaperTradeEvent.
+    """
+    cfg = paper_config()
+    horizon_hours = max(1.0, min(24.0, float(cfg.get("post_exit_recovery_audit_hours", 6.0))))
+    audited = recovered = 0
+    failures = 0
+    with SessionLocal() as db:
+        trades = db.scalars(select(PaperTrade).where(
+            PaperTrade.status == "CLOSED",
+            PaperTrade.net_pnl < 0
+        ).order_by(PaperTrade.closed_at)
+        ).all()
+    for trade in trades:
+        raw = parse_json(trade.raw_json)
+        if raw.get("post_exit_recovery_audit_version") == 1:
+            continue
+        quality = raw.get("data_quality_status")
+        if quality in {"INFORMATION_CUTOFF", "DATA_INTERRUPTED_REVIEW", "PATH_NOT_RECORDED"}:
+            raw["post_exit_recovery_audit_version"] = 1
+            raw["post_exit_recovery_status"] = "SKIPPED_UNVERIFIED_PATH"
+            with SessionLocal() as db:
+                live = db.get(PaperTrade, trade.id)
+                if live:
+                    live.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
+                    db.commit()
+            continue
+        if not trade.closed_at or not trade.exit_price or not trade.entry_price:
+            continue
+        start_ms = int(trade.closed_at.timestamp() * 1000)
+        end_ms = start_ms + int(horizon_hours * 3600 * 1000)
+        try:
+            rows, _ = await binance_get("/fapi/v1/markPriceKlines", {
+                "symbol": trade.symbol,
+                "interval": "1m",
+                "startTime": start_ms,
+                "endTime": end_ms,
+                "limit": 1500
+            })
+            if not isinstance(rows, list) or not rows:
+                raise RuntimeError("No Binance mark-price candles returned")
+            directional = 1.0 if trade.side == "LONG" else -1.0
+            best = None
+            first_entry_cross = None
+            for row in rows:
+                if not isinstance(row, (list, tuple)) or len(row) < 7:
+                    continue
+                high = safe_float(row[2]); low = safe_float(row[3]); at_ms = int(row[0])
+                if high is None or low is None:
+                    continue
+                favorable = high if trade.side == "LONG" else low
+                candidate_gross = directional * (favorable - trade.entry_price) * trade.quantity
+                turnover = (trade.entry_price + favorable) * trade.quantity
+                estimated_cost = turnover * ((float(cfg["taker_fee_pct"]) + float(cfg["slippage_pct"])) / 100.0)
+                candidate_net = candidate_gross - estimated_cost
+                if best is None or candidate_net > best["max_net_pnl"]:
+                    best = {"max_net_pnl": candidate_net, "max_price": favorable, "at_ms": at_ms, "gross": candidate_gross, "cost": estimated_cost}
+                crossed = (high >= trade.entry_price) if trade.side == "LONG" else (low <= trade.entry_price)
+                if crossed and first_entry_cross is None:
+                    first_entry_cross = at_ms
+            if best is None:
+                continue
+            recovered_to_profit = best["max_net_pnl"] > 0
+            recovered_to_entry = first_entry_cross is not None
+            raw.update({
+                "post_exit_recovery_audit_version": 1,
+                "post_exit_recovery_status": "RECOVERED_TO_NET_PROFIT" if recovered_to_profit else ("RECOVERED_TO_ENTRY_ONLY" if recovered_to_entry else "NO_ENTRY_RECOVERY"),
+                "post_exit_recovery_market_source": "BINANCE_USDM_MARK_PRICE_1M",
+                "post_exit_recovery_horizon_hours": horizon_hours,
+                "post_exit_max_net_pnl": round(best["max_net_pnl"], 8),
+                "post_exit_max_gross_pnl": round(best["gross"], 8),
+                "post_exit_max_price": best["max_price"],
+                "post_exit_max_at": datetime.fromtimestamp(best["at_ms"]/1000, timezone.utc).isoformat(),
+                "post_exit_return_to_entry_at": datetime.fromtimestamp(first_entry_cross/1000, timezone.utc).isoformat() if first_entry_cross else None,
+                "post_exit_recovery_profit_usdt": round(max(0.0, best["max_net_pnl"]), 8),
+                "post_exit_old_exit_reason": trade.exit_reason,
+                "post_exit_recovery_label": (
+                    f"[RECOVERED AFTER EXIT → +{best['max_net_pnl']:.4f} USDT | old: {trade.exit_reason}]"
+                    if recovered_to_profit else
+                    f"[RECOVERED TO ENTRY AFTER EXIT | old: {trade.exit_reason}]"
+                    if recovered_to_entry else
+                    f"[NO RECOVERY IN {horizon_hours:.0f}H | old: {trade.exit_reason}]"
+                )
+            })
+            with SessionLocal() as db:
+                live = db.get(PaperTrade, trade.id)
+                if live:
+                    live.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
+                    exists = db.scalar(select(PaperTradeEvent.id).where(
+                        PaperTradeEvent.paper_trade_id == trade.id,
+                        PaperTradeEvent.event_type == "POST_EXIT_RECOVERY_AUDIT_V1"
+                    ).limit(1))
+                    if not exists:
+                        db.add(PaperTradeEvent(
+                            paper_trade_id=trade.id,
+                            event_type="POST_EXIT_RECOVERY_AUDIT_V1",
+                            observed_at=live.closed_at or now(),
+                            value=best["max_net_pnl"],
+                            detail=raw["post_exit_recovery_label"]
+                        ))
+                    db.commit()
+            audited += 1
+            recovered += 1 if recovered_to_profit else 0
+        except Exception as exc:
+            failures += 1
+            log_check("post_exit_recovery_audit", False, None, None, f"trade={trade.id} {trade.symbol}: {str(exc)[:500]}")
+    return {"audited": audited, "recovered_to_profit": recovered, "failures": failures}
+
+
 async def evaluate_open_paper_trades(
     prices: dict[str, float] | None = None,
     source: str = "BINANCE_REST",
@@ -1555,6 +1722,10 @@ async def evaluate_open_paper_trades(
             )
             hit_stop = mark <= trade.stop_price if trade.side == "LONG" else mark >= trade.stop_price
             hit_target = mark >= trade.target_price if trade.side == "LONG" else mark <= trade.target_price
+            leader_state, leader_state_detail = _leader_state_for_trade(db, trade)
+            raw["leader_state_at_check"] = leader_state
+            raw["leader_state_detail"] = leader_state_detail
+            raw["leader_state_checked_at"] = ts.isoformat()
             exit_reason = None
             funding_verified = bool(raw.get("funding_history_verified"))
             next_funding_ms = safe_float(raw.get("next_funding_time"))
@@ -1622,27 +1793,70 @@ async def evaluate_open_paper_trades(
                 # after round-trip costs and verified funding, is realized immediately.
                 exit_reason = "PROFIT_HARVEST_NET_POSITIVE"
             elif net <= 0 and not gap_guard and hit_stop:
-                # A safety stop must not be held open solely because the funding API
-                # is temporarily unavailable. Use the conservative estimate already
-                # included in _paper_pnl(), and make the uncertainty explicit.
-                if funding_verified:
-                    exit_reason = "STOP_LOSS"
+                # Leader-aware continuation: if the exact leader position is still
+                # visibly open, do not let our independent paper stop erase the
+                # leader-follow opportunity. The leader itself remains the primary
+                # close signal. A hard adverse-price ceiling remains in force so this
+                # cannot become an unbounded "hold and hope" rule.
+                directional = 1.0 if trade.side == "LONG" else -1.0
+                adverse_from_entry_pct = directional * (trade.entry_price - mark) / max(trade.entry_price, 1e-12) * 100.0
+                hard_loss_pct = float(cfg.get("leader_continuation_hard_loss_price_pct", 0.60))
+                if leader_state == "REVERSED" and bool(cfg.get("leader_reversal_exit_enabled", True)):
+                    exit_reason = "LEADER_POSITION_REVERSED"
+                elif leader_state == "CLOSED_CONFIRMED":
+                    exit_reason = "LEADER_POSITION_CLOSED"
+                elif (
+                    leader_state == "OPEN_OBSERVED"
+                    and bool(cfg.get("leader_continuation_enabled", True))
+                    and adverse_from_entry_pct < hard_loss_pct
+                ):
+                    raw["leader_continuation_active"] = True
+                    raw["leader_continuation_started_at"] = raw.get("leader_continuation_started_at") or ts.isoformat()
+                    raw["leader_continuation_last_checked_at"] = ts.isoformat()
+                    raw["leader_continuation_adverse_pct"] = adverse_from_entry_pct
+                    if not raw.get("leader_continuation_hold_logged"):
+                        db.add(PaperTradeEvent(
+                            paper_trade_id=trade.id,
+                            event_type="LEADER_CONTINUATION_HOLD",
+                            observed_at=ts,
+                            value=net,
+                            detail=(
+                                f"Stop touched while exact leader position remained visibly OPEN. "
+                                f"Paper stop deferred; hard adverse-price ceiling={hard_loss_pct:.2f}%."
+                            )
+                        ))
+                        raw["leader_continuation_hold_logged"] = True
+                    exit_reason = None
                 else:
-                    exit_reason = "STOP_LOSS_FUNDING_ESTIMATED"
-                    raw["funding_audit_status"] = "STOP_EXIT_USING_CONSERVATIVE_ESTIMATE"
-                    funding_event_count_at_exit = 0
-                    if next_funding_ms and ts.timestamp() * 1000 >= next_funding_ms:
-                        funding_event_count_at_exit = 1 + int(
-                            (ts.timestamp() * 1000 - next_funding_ms) // 28800000
+                    if leader_state == "OPEN_OBSERVED":
+                        raw["leader_continuation_hard_stop_triggered"] = True
+                        db.add(PaperTradeEvent(
+                            paper_trade_id=trade.id,
+                            event_type="LEADER_CONTINUATION_HARD_STOP",
+                            observed_at=ts,
+                            value=net,
+                            detail=f"Leader remained open but adverse price reached {adverse_from_entry_pct:.3f}% >= hard ceiling {hard_loss_pct:.3f}%."
+                        ))
+                    # A stale/unknown leader state never gets converted into a fake
+                    # leader close. The existing protective stop remains the fallback.
+                    if funding_verified:
+                        exit_reason = "STOP_LOSS"
+                    else:
+                        exit_reason = "STOP_LOSS_FUNDING_ESTIMATED"
+                        raw["funding_audit_status"] = "STOP_EXIT_USING_CONSERVATIVE_ESTIMATE"
+                        funding_event_count_at_exit = 0
+                        if next_funding_ms and ts.timestamp() * 1000 >= next_funding_ms:
+                            funding_event_count_at_exit = 1 + int(
+                                (ts.timestamp() * 1000 - next_funding_ms) // 28800000
+                            )
+                        raw["funding_estimate_at_exit"] = max(
+                            0.0,
+                            trade.notional
+                            * (safe_float(raw.get("funding_rate_at_entry")) or 0.0)
+                            * funding_event_count_at_exit
+                            * (1 if trade.side == "LONG" else -1)
                         )
-                    raw["funding_estimate_at_exit"] = max(
-                        0.0,
-                        trade.notional
-                        * (safe_float(raw.get("funding_rate_at_entry")) or 0.0)
-                        * funding_event_count_at_exit
-                        * (1 if trade.side == "LONG" else -1)
-                    )
-                    raw["realized_pnl_is_estimate"] = True
+                        raw["realized_pnl_is_estimate"] = True
             elif net <= 0 and not gap_guard and hit_target:
                 # A price target is not a profit exit if fees/funding still leave
                 # net PnL at or below zero. Keep tracking until net turns positive
@@ -2120,7 +2334,17 @@ async def api_paper():
             "leverage": trade.leverage, "stop_price": trade.stop_price, "target_price": trade.target_price,
             "gross_pnl": round(float(trade.gross_pnl or 0.0), 8),
             "estimated_costs": round(float(trade.estimated_costs or 0.0), 8),
-            "net_pnl": round(float(trade.net_pnl or 0.0), 8), "exit_reason": trade.exit_reason,
+            "net_pnl": round(float(trade.net_pnl or 0.0), 8),
+            "exit_reason": trade.exit_reason,
+            "exit_reason_display": raw.get("post_exit_recovery_label") or trade.exit_reason,
+            "post_exit_recovery": {
+                "status": raw.get("post_exit_recovery_status"),
+                "max_net_pnl": safe_float(raw.get("post_exit_max_net_pnl")),
+                "max_price": safe_float(raw.get("post_exit_max_price")),
+                "max_at": raw.get("post_exit_max_at"),
+                "return_to_entry_at": raw.get("post_exit_return_to_entry_at"),
+                "market_source": raw.get("post_exit_recovery_market_source")
+            },
             "mfe_net_pnl": safe_float(raw.get("mfe_net_pnl")),
             "mae_net_pnl": safe_float(raw.get("mae_net_pnl")),
             "mfe_pct": safe_float(raw.get("mfe_pct")), "mae_pct": safe_float(raw.get("mae_pct")),
@@ -2373,7 +2597,16 @@ async def api_paper_trade_detail(trade_id: int):
             "leader_position_key": trade.source_key.split("|", 1)[1] if "|" in trade.source_key else trade.source_key,
             "symbol": trade.symbol, "side": trade.side, "entry_price": trade.entry_price,
             "mark_price": trade.mark_price, "exit_price": trade.exit_price,
-            "exit_reason": trade.exit_reason, "gross_pnl": round(float(trade.gross_pnl or 0.0), 8),
+            "exit_reason": trade.exit_reason,
+            "exit_reason_display": raw.get("post_exit_recovery_label") or trade.exit_reason,
+            "post_exit_recovery": {
+                "status": raw.get("post_exit_recovery_status"),
+                "max_net_pnl": safe_float(raw.get("post_exit_max_net_pnl")),
+                "max_price": safe_float(raw.get("post_exit_max_price")),
+                "max_at": raw.get("post_exit_max_at"),
+                "return_to_entry_at": raw.get("post_exit_return_to_entry_at"),
+                "market_source": raw.get("post_exit_recovery_market_source")
+            }, "gross_pnl": round(float(trade.gross_pnl or 0.0), 8),
             "estimated_costs": round(float(trade.estimated_costs or 0.0), 8),
             "net_pnl": round(float(trade.net_pnl or 0.0), 8),
             "funding_cost_actual": safe_float(raw.get("funding_cost_actual")),
@@ -2478,7 +2711,12 @@ async def api_system():
             **PAPER_PRICE_STREAM_STATE,
             "symbol_last_update": dict(PAPER_SYMBOL_LAST_UPDATE),
             "binance_rest": binance_rest_status(),
-            "rest_policy": "WebSocket-first; at most one bulk premiumIndex fallback per minute; no per-symbol mark-price polling."
+            "rest_policy": "WebSocket-first; at most one bulk premiumIndex fallback per minute; no per-symbol mark-price polling.",
+            "paper_exit_policy": {
+                "leader_continuation_enabled": bool(paper_config().get("leader_continuation_enabled", True)),
+                "leader_continuation_hard_loss_price_pct": float(paper_config().get("leader_continuation_hard_loss_price_pct", 0.60)),
+                "leader_reversal_exit_enabled": bool(paper_config().get("leader_reversal_exit_enabled", True))
+            }
         },
         "runtime": {
             "python_env": os.getenv("PYTHON_VERSION", "Render default"),
