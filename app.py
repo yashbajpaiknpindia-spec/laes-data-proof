@@ -8,6 +8,7 @@ import os
 import re
 import statistics
 import time
+from urllib.parse import quote
 import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone, timedelta
@@ -828,7 +829,12 @@ async def run_monitor_cycle(force: bool = False) -> dict:
                 ).all()
                 ids = [t.trader_id for t in traders]
                 cursor = int(setting("position_rotation_cursor", 0) or 0)
-                if ids:
+                stream_active = bool(KOPYON_STREAM_STATE.get("connected"))
+                if stream_active:
+                    # Kopyon pushes openPositions snapshots/changes for subscribed
+                    # leaders, so do not spend REST requests fetching the same positions.
+                    selected = []
+                elif ids:
                     selected = [ids[(cursor + i) % len(ids)] for i in range(min(POSITION_BATCH, len(ids)))]
                     set_setting("position_rotation_cursor", (cursor + len(selected)) % len(ids))
                 else:
@@ -850,10 +856,8 @@ async def run_monitor_cycle(force: bool = False) -> dict:
                         log_check("trader_profile", True, 200, None, f"{trader_id}: profile/performance/history refreshed")
                 except Exception as exc:
                     log_check("trader_profile", False, None, None, f"{trader_id}: {str(exc)[:700]}")
-            try:
-                await api_opportunities(limit=100)
-            except Exception as analysis_exc:
-                log_check("paper_analysis", False, None, None, str(analysis_exc))
+            # Opportunity analysis runs independently on its own short cadence;
+            # do not tie automatic paper entries to this slower provider discovery loop.
             await evaluate_open_paper_trades()
             last_scan.update({
                 "state": "idle",
@@ -890,15 +894,20 @@ async def monitor_worker() -> None:
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(monitor_worker())
     price_task = asyncio.create_task(paper_price_worker())
+    kopyon_stream_task = asyncio.create_task(kopyon_stream_worker())
+    scanner_task = asyncio.create_task(opportunity_scanner_worker())
+    metadata_task = asyncio.create_task(market_metadata_worker())
     app.state.monitor_task = task
     app.state.paper_price_task = price_task
+    app.state.kopyon_stream_task = kopyon_stream_task
+    app.state.opportunity_scanner_task = scanner_task
+    app.state.market_metadata_task = metadata_task
     yield
-    task.cancel()
-    price_task.cancel()
-    with suppress(asyncio.CancelledError):
-        await task
-    with suppress(asyncio.CancelledError):
-        await price_task
+    for background_task in (task, price_task, kopyon_stream_task, scanner_task, metadata_task):
+        background_task.cancel()
+    for background_task in (task, price_task, kopyon_stream_task, scanner_task, metadata_task):
+        with suppress(asyncio.CancelledError):
+            await background_task
 
 app = FastAPI(title=APP_NAME, version="1.0.0", lifespan=lifespan, docs_url="/api/docs")
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -2283,6 +2292,289 @@ async def paper_price_worker() -> None:
         await asyncio.sleep(reconnect_delay)
         reconnect_delay = min(30.0, reconnect_delay * 2)
 
+
+
+async def _known_trader_ids() -> list[str]:
+    with SessionLocal() as db:
+        return [
+            str(t.trader_id)
+            for t in db.scalars(select(Trader).order_by(Trader.trader_id)).all()
+            if t.trader_id
+        ]
+
+
+async def kopyon_stream_worker() -> None:
+    """
+    Optional Kopyon openPositions stream. This is attempted with the already
+    configured API key; the app never upgrades a plan or creates a subscription.
+    If the key has no stream entitlement, REST rotation remains the fallback.
+    """
+    global KOPYON_STREAM_RETRY_AFTER
+    if not KOPYON_KEY:
+        KOPYON_STREAM_STATE.update({
+            "status": "not_configured", "connected": False,
+            "supported": False, "last_error": "KOPYON_API_KEY is not configured."
+        })
+        return
+
+    retry_delay = 3.0
+    while True:
+        if time.time() < KOPYON_STREAM_RETRY_AFTER:
+            KOPYON_STREAM_STATE["status"] = "not_entitled_or_cooling_down"
+            await asyncio.sleep(min(60.0, max(1.0, KOPYON_STREAM_RETRY_AFTER - time.time())))
+            continue
+
+        try:
+            stream_url = "wss://api.kopyon.com/v5/stream?apiKey=" + quote(KOPYON_KEY, safe="")
+            pending_ids: set[str] = set()
+            last_subscribe_refresh = 0.0
+            last_health_log = 0.0
+            async with websockets.connect(
+                stream_url,
+                ping_interval=25, ping_timeout=25, close_timeout=5,
+                open_timeout=15, max_size=2_097_152, max_queue=4096
+            ) as ws:
+                KOPYON_STREAM_STATE.update({
+                    "status": "connected", "connected": True, "supported": True,
+                    "connected_at": now().isoformat(), "last_error": None,
+                    "retry_after": None,
+                    "reconnect_count": int(KOPYON_STREAM_STATE.get("reconnect_count", 0)) + 1
+                })
+                retry_delay = 3.0
+
+                async def subscribe_new_traders() -> None:
+                    nonlocal last_subscribe_refresh
+                    ids = set(await _known_trader_ids())
+                    new_ids = sorted(ids - pending_ids)
+                    for trader_id in new_ids:
+                        await ws.send(json.dumps({
+                            "type": "subscribe",
+                            "source": "binance-copy-trading",
+                            "topic": "openPositions",
+                            "traderId": trader_id
+                        }))
+                        pending_ids.add(trader_id)
+                        await asyncio.sleep(0.24)
+                    last_subscribe_refresh = time.monotonic()
+                    KOPYON_STREAM_STATE["subscriptions"] = len(pending_ids)
+
+                await subscribe_new_traders()
+                while True:
+                    if time.monotonic() - last_subscribe_refresh >= 60:
+                        await subscribe_new_traders()
+                    try:
+                        message = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
+
+                    packet = json.loads(message)
+                    if not isinstance(packet, dict):
+                        continue
+                    KOPYON_STREAM_STATE["messages_received"] = int(
+                        KOPYON_STREAM_STATE.get("messages_received", 0)
+                    ) + 1
+                    KOPYON_STREAM_STATE["last_message_at"] = now().isoformat()
+
+                    if packet.get("source") not in (None, "binance-copy-trading"):
+                        continue
+                    if packet.get("topic") not in (None, "openPositions"):
+                        continue
+                    trader_id = str(packet.get("traderId") or "")
+                    if not trader_id:
+                        continue
+
+                    msg_type = str(packet.get("type") or "").lower()
+                    data = packet.get("data") if isinstance(packet.get("data"), dict) else {}
+                    fetched_at = packet.get("fetchedAt") or data.get("fetchedAt") or now().isoformat()
+
+                    if msg_type == "hidden" or data.get("hidden") is True:
+                        record_position_snapshot(trader_id, {
+                            "data": {"positions": [], "hidden": True, "fetchedAt": fetched_at}
+                        })
+                        KOPYON_STREAM_STATE["last_snapshot_at"] = now().isoformat()
+                    elif msg_type in ("snapshot", "baseline") and isinstance(data.get("positions"), list):
+                        payload_data = dict(data)
+                        payload_data["fetchedAt"] = fetched_at
+                        record_position_snapshot(trader_id, {"data": payload_data})
+                        KOPYON_STREAM_STATE["last_snapshot_at"] = now().isoformat()
+                    elif msg_type == "error":
+                        message_text = str(packet.get("message") or packet.get("error") or "Kopyon stream returned an error")
+                        lowered = message_text.lower()
+                        if any(token in lowered for token in ("forbidden", "not entitled", "upgrade", "plan required", "unauthorized")):
+                            raise PermissionError("Kopyon stream access is not enabled for this API key/plan.")
+                        KOPYON_STREAM_STATE["last_error"] = message_text[:250]
+
+                    if time.monotonic() - last_health_log >= 60:
+                        last_health_log = time.monotonic()
+                        log_check(
+                            "kopyon_stream", True, 200, None,
+                            f"connected=True subscriptions={len(pending_ids)} messages={KOPYON_STREAM_STATE.get('messages_received', 0)}"
+                        )
+        except asyncio.CancelledError:
+            KOPYON_STREAM_STATE.update({"status": "stopped", "connected": False})
+            raise
+        except PermissionError as exc:
+            # Do not retry a denied stream every few seconds; keep REST fallback.
+            KOPYON_STREAM_RETRY_AFTER = time.time() + 6 * 3600
+            KOPYON_STREAM_STATE.update({
+                "status": "not_entitled", "connected": False, "supported": False,
+                "last_error": str(exc),
+                "retry_after": datetime.fromtimestamp(KOPYON_STREAM_RETRY_AFTER, timezone.utc).isoformat()
+            })
+            log_check("kopyon_stream", False, 403, None, str(exc))
+            await asyncio.sleep(60)
+        except Exception as exc:
+            error_name = type(exc).__name__
+            # websockets may include a URL in some exceptions; never persist the
+            # connection URL because it contains the API key query parameter.
+            generic = f"Kopyon stream disconnected ({error_name})."
+            detail = str(exc).lower()
+            if "403" in detail or "401" in detail or "forbidden" in detail or "unauthorized" in detail:
+                KOPYON_STREAM_RETRY_AFTER = time.time() + 6 * 3600
+                KOPYON_STREAM_STATE.update({
+                    "status": "not_entitled", "connected": False, "supported": False,
+                    "last_error": "Kopyon stream access is not enabled for this API key/plan.",
+                    "retry_after": datetime.fromtimestamp(KOPYON_STREAM_RETRY_AFTER, timezone.utc).isoformat()
+                })
+                log_check("kopyon_stream", False, 403, None, "Stream access not enabled for this API key/plan; using REST fallback.")
+                await asyncio.sleep(60)
+                continue
+            KOPYON_STREAM_STATE.update({
+                "status": "reconnecting", "connected": False,
+                "last_error": generic,
+                "reconnect_count": int(KOPYON_STREAM_STATE.get("reconnect_count", 0)) + 1
+            })
+            log_check("kopyon_stream", False, None, None, generic)
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(60.0, retry_delay * 2)
+
+
+async def market_metadata_worker() -> None:
+    """
+    Refresh one stale symbol at a time. Each metadata pass uses a bounded number
+    of Binance REST calls; the one-second WebSocket remains the source of live marks.
+    """
+    cursor = 0
+    while True:
+        try:
+            if time.time() < BINANCE_REST_BLOCKED_UNTIL:
+                remaining = BINANCE_REST_BLOCKED_UNTIL - time.time()
+                MARKET_REFRESH_STATE.update({
+                    "status": "paused_by_binance_rate_limit",
+                    "last_error": f"REST metadata refresh paused for {remaining:.0f}s; WebSocket marks remain active."
+                })
+                await asyncio.sleep(min(60.0, max(5.0, remaining)))
+                continue
+
+            symbols = await _open_paper_symbols()
+            if not symbols:
+                MARKET_REFRESH_STATE["status"] = "idle_no_visible_positions"
+                await asyncio.sleep(15.0)
+                continue
+
+            symbols = sorted(set(symbols))
+            chosen = None
+            with SessionLocal() as db:
+                for offset in range(len(symbols)):
+                    candidate = symbols[(cursor + offset) % len(symbols)]
+                    cached = db.get(MarketInsight, candidate)
+                    if cached is None or (now() - cached.fetched_at).total_seconds() > 1800:
+                        chosen = candidate
+                        cursor = (cursor + offset + 1) % len(symbols)
+                        break
+
+            if chosen is None:
+                MARKET_REFRESH_STATE["status"] = "all_market_metadata_fresh"
+                await asyncio.sleep(60.0)
+                continue
+
+            MARKET_REFRESH_STATE.update({"status": "refreshing", "last_symbol": chosen, "last_error": None})
+            try:
+                await market_features(chosen, refresh=True)
+                MARKET_REFRESH_STATE["refreshed_count"] = int(MARKET_REFRESH_STATE.get("refreshed_count", 0)) + 1
+                MARKET_REFRESH_STATE["last_refresh_at"] = now().isoformat()
+                MARKET_REFRESH_STATE["status"] = "healthy"
+                log_check("market_metadata_refresh", True, 200, None, f"{chosen}: liquidity/volatility metadata refreshed")
+            except Exception as exc:
+                MARKET_REFRESH_STATE.update({"status": "error", "last_error": str(exc)[:300]})
+                log_check("market_metadata_refresh", False, None, None, f"{chosen}: {str(exc)[:350]}")
+                if time.time() < BINANCE_REST_BLOCKED_UNTIL:
+                    await asyncio.sleep(60.0)
+                    continue
+
+            await asyncio.sleep(15.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            MARKET_REFRESH_STATE.update({"status": "error", "last_error": str(exc)[:300]})
+            log_check("market_metadata_refresh_worker", False, None, None, str(exc)[:350])
+            await asyncio.sleep(15.0)
+
+
+async def run_opportunity_scan() -> dict:
+    async with OPPORTUNITY_SCAN_LOCK:
+        started = time.perf_counter()
+        OPPORTUNITY_SCAN_STATE.update({
+            "status": "running", "started_at": now().isoformat(), "last_error": None
+        })
+        try:
+            rows = _latest_position_contexts(include_hidden_last_known=False)
+            news = await fetch_news_items()
+            candidates = []
+            for row in rows:
+                obs = row["observation"]
+                snap = row["snapshot"]
+                candidates.append(await build_opportunity(
+                    obs, snap.observed_at.isoformat(), row["trader_name"], news
+                ))
+            candidates.sort(
+                key=lambda x: (x["qualified"], x["adverse_pct"] or 0.0),
+                reverse=True
+            )
+            OPPORTUNITY_CACHE[:] = candidates
+            paper_created = sum(1 for item in candidates if (item.get("paper_entry") or {}).get("created"))
+            qualified = sum(1 for item in candidates if item.get("qualified"))
+            underwater = sum(1 for item in candidates if item.get("underwater"))
+            blocked = sum(
+                1 for item in candidates
+                if item.get("qualified") and not (item.get("paper_entry") or {}).get("created")
+            )
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            OPPORTUNITY_SCAN_STATE.update({
+                "status": "healthy", "finished_at": now().isoformat(),
+                "positions_scanned": len(candidates), "underwater": underwater,
+                "qualified": qualified, "paper_entries_created": paper_created,
+                "blocked_entries": blocked, "last_duration_ms": duration_ms,
+                "leader_snapshot_age_max_seconds": max(
+                    (item.get("leader_snapshot_age_seconds") or 0.0 for item in candidates),
+                    default=0.0
+                ),
+                "market_data_unverified": sum(1 for item in candidates if not item.get("market_data_fresh"))
+            })
+            log_check(
+                "opportunity_scanner", True, 200, duration_ms,
+                f"scanned={len(candidates)} underwater={underwater} qualified={qualified} created={paper_created} blocked={blocked}"
+            )
+            return dict(OPPORTUNITY_SCAN_STATE)
+        except Exception as exc:
+            OPPORTUNITY_SCAN_STATE.update({
+                "status": "error", "finished_at": now().isoformat(),
+                "last_error": str(exc)[:700]
+            })
+            log_check("opportunity_scanner", False, None, None, str(exc)[:700])
+            return dict(OPPORTUNITY_SCAN_STATE)
+
+
+async def opportunity_scanner_worker() -> None:
+    while True:
+        try:
+            await run_opportunity_scan()
+            await asyncio.sleep(60.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            OPPORTUNITY_SCAN_STATE.update({"status": "error", "last_error": str(exc)[:500]})
+            await asyncio.sleep(15.0)
 
 
 @app.get("/api/opportunities")
