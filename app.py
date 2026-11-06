@@ -1536,6 +1536,9 @@ def _paper_pnl(trade: PaperTrade, mark: float, cfg: dict, raw: dict | None = Non
     funding_rate_abs = max(rate_candidates) if rate_candidates else 0.0
     funding_events = _funding_settlement_count(trade, raw, at)
     estimated_funding_cost = trade.notional * funding_rate_abs * funding_events
+    raw["funding_estimate_current"] = 0.0 if raw.get("funding_history_verified") else estimated_funding_cost
+    raw["funding_estimate_settlement_count"] = funding_events
+    raw["funding_estimate_rate_abs"] = funding_rate_abs
     funding_cost = safe_float(raw.get("funding_cost_actual")) if raw.get("funding_history_verified") else None
     if funding_cost is None:
         funding_cost = estimated_funding_cost
@@ -2619,7 +2622,9 @@ async def api_paper():
             "max_data_gap_seconds": round(max_gap, 3),
             "funding_history_verified": raw.get("funding_history_verified"),
             "funding_audit_status": raw.get("funding_audit_status", "LEGACY_FUNDING_UNVERIFIED"),
-            "funding_cost_actual": safe_float(raw.get("funding_cost_actual")),
+            "funding_cost_actual": safe_float(raw.get("funding_cost_actual")) if raw.get("funding_history_verified") else None,
+            "funding_cost_last_verified": safe_float(raw.get("funding_cost_actual")) if not raw.get("funding_history_verified") else None,
+            "funding_estimate_current": safe_float(raw.get("funding_estimate_current")),
             "funding_estimate_at_exit": safe_float(raw.get("funding_estimate_at_exit")),
             "funding_source": raw.get("funding_source"),
             "hold_duration_seconds": round(hold_seconds, 2),
@@ -2884,9 +2889,12 @@ async def api_paper_trade_detail(trade_id: int):
             }, "gross_pnl": round(float(trade.gross_pnl or 0.0), 8),
             "estimated_costs": round(float(trade.estimated_costs or 0.0), 8),
             "net_pnl": round(float(trade.net_pnl or 0.0), 8),
-            "funding_cost_actual": safe_float(raw.get("funding_cost_actual")),
+            "funding_cost_actual": safe_float(raw.get("funding_cost_actual")) if raw.get("funding_history_verified") else None,
+            "funding_cost_last_verified": safe_float(raw.get("funding_cost_actual")) if not raw.get("funding_history_verified") else None,
+            "funding_estimate_current": safe_float(raw.get("funding_estimate_current")),
             "funding_estimate_at_exit": safe_float(raw.get("funding_estimate_at_exit")),
             "funding_estimate_settlement_count": safe_float(raw.get("funding_estimate_settlement_count")),
+            "funding_estimate_rate_abs": safe_float(raw.get("funding_estimate_rate_abs")),
             "funding_verified": bool(raw.get("funding_history_verified")),
             "funding_audit_status": raw.get("funding_audit_status", "LEGACY_FUNDING_UNVERIFIED"),
             "funding_source": raw.get("funding_source"),
