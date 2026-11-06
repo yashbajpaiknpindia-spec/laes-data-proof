@@ -1226,15 +1226,42 @@ def rsi_value(closes: list[float], period: int = 14) -> float | None:
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-async def market_features(symbol: str, refresh: bool = False) -> dict:
+async def market_features(symbol: str, refresh: bool = False, allow_stale: bool = False) -> dict:
     with SessionLocal() as db:
         cache = db.get(MarketInsight, symbol)
-        if cache and not refresh and (now() - cache.fetched_at).total_seconds() < 1800:
+        if cache:
+            cache_age = max(0.0, (now() - cache.fetched_at).total_seconds())
             cached = parse_json(cache.raw_json)
             cached_closes = cached.get("closes_1h") if isinstance(cached, dict) else None
-            # Re-fetch older cache rows created before list-valued Binance klines were parsed correctly.
-            if isinstance(cached_closes, list) and len(cached_closes) >= 25 and cached.get("quote_volume_24h_usdt") is not None and cached.get("spread_pct") is not None and cached.get("min_depth_within_1pct_usdt") is not None and cached.get("volume_ratio_recent_6h_vs_prior_24h") is not None:
+            cache_valid = (
+                isinstance(cached_closes, list) and len(cached_closes) >= 25
+                and cached.get("quote_volume_24h_usdt") is not None
+                and cached.get("spread_pct") is not None
+                and cached.get("min_depth_within_1pct_usdt") is not None
+                and cached.get("volume_ratio_recent_6h_vs_prior_24h") is not None
+                and cached.get("atr_24h_pct") is not None
+            )
+            if cache_valid and (cache_age < 1800 or allow_stale) and not refresh:
+                cached["cache_age_seconds"] = round(cache_age, 1)
+                cached["market_data_fresh"] = cache_age <= 1800
+                cached["market_data_status"] = "FRESH" if cache_age <= 1800 else "STALE_CACHE"
                 return cached
+            if allow_stale and not refresh and not cache_valid:
+                return {
+                    "symbol": symbol,
+                    "cache_age_seconds": round(cache_age, 1),
+                    "market_data_fresh": False,
+                    "market_data_status": "INCOMPLETE_CACHE",
+                    "error": "Cached market data is missing required liquidity or volatility fields."
+                }
+        elif allow_stale and not refresh:
+            return {
+                "symbol": symbol,
+                "cache_age_seconds": None,
+                "market_data_fresh": False,
+                "market_data_status": "NO_CACHE",
+                "error": "No stored liquidity / volatility snapshot is available yet."
+            }
     premium, _ = await binance_get("/fapi/v1/premiumIndex", {"symbol": symbol})
     ticker24, _ = await binance_get("/fapi/v1/ticker/24hr", {"symbol": symbol})
     book, _ = await binance_get("/fapi/v1/ticker/bookTicker", {"symbol": symbol})
@@ -1267,6 +1294,8 @@ async def market_features(symbol: str, refresh: bool = False) -> dict:
     min_depth_1pct = min(bid_depth_1pct or 0, ask_depth_1pct or 0) if bid_depth_1pct is not None and ask_depth_1pct is not None else None
     data = {
         "symbol": symbol, "fetched_at": now().isoformat(),
+        "cache_age_seconds": 0.0, "market_data_fresh": True,
+        "market_data_status": "FRESH",
         "mark_price": safe_float(premium.get("markPrice")),
         "index_price": safe_float(premium.get("indexPrice")),
         "funding_rate": safe_float(premium.get("lastFundingRate")),
