@@ -1272,10 +1272,15 @@ def _leader_for_trade(db, trade: PaperTrade) -> PositionObservation | None:
 def _paper_pnl(trade: PaperTrade, mark: float, cfg: dict, raw: dict | None = None, at: datetime | None = None) -> tuple[float,float,float,float]:
     directional = 1 if trade.side == "LONG" else -1
     gross = directional * (mark - trade.entry_price) * trade.quantity
-    fee_cost = trade.notional * (float(cfg["taker_fee_pct"]) / 100) * 2
-    slip_cost = trade.notional * (float(cfg["slippage_pct"]) / 100) * 2
-    # Estimate funding from the rate captured at entry; positive funding charges longs
-    # and credits shorts. Funding is applied at each 8-hour funding timestamp.
+    # Round-trip costs are charged on both actual simulated notionals: entry and
+    # mark-based exit. This is more accurate than charging entry notional twice.
+    entry_notional = max(0.0, float(trade.entry_price) * float(trade.quantity))
+    exit_notional = max(0.0, float(mark) * float(trade.quantity))
+    round_trip_turnover = entry_notional + exit_notional
+    fee_cost = round_trip_turnover * (float(cfg["taker_fee_pct"]) / 100)
+    slip_cost = round_trip_turnover * (float(cfg["slippage_pct"]) / 100)
+    # Estimate funding from the rate captured at entry. When history is not verified,
+    # never assume a funding credit; charge only a conservative positive estimate.
     raw = raw or {}
     funding_rate = safe_float(raw.get("funding_rate_at_entry")) or 0.0
     next_funding_ms = safe_float(raw.get("next_funding_time"))
@@ -1284,7 +1289,10 @@ def _paper_pnl(trade: PaperTrade, mark: float, cfg: dict, raw: dict | None = Non
         elapsed_ms = at.timestamp() * 1000 - next_funding_ms
         if elapsed_ms >= 0:
             funding_events = 1 + int(elapsed_ms // 28800000)
-    estimated_funding_cost = trade.notional * funding_rate * funding_events * directional
+    estimated_funding_cost = max(
+        0.0,
+        trade.notional * funding_rate * funding_events * directional
+    )
     funding_cost = safe_float(raw.get("funding_cost_actual")) if raw.get("funding_history_verified") else None
     if funding_cost is None:
         funding_cost = estimated_funding_cost
@@ -1436,7 +1444,14 @@ async def evaluate_open_paper_trades(prices: dict[str,float] | None = None, sour
                     raw["funding_source"] = "BINANCE_FUNDING_HISTORY"
                     raw["funding_audit_status"] = "VERIFIED"
                     raw["funding_verification_error"] = None
-                    fee_and_slippage = trade.notional * (float(cfg["taker_fee_pct"]) / 100 + float(cfg["slippage_pct"]) / 100) * 2
+                    round_trip_turnover = (
+                        float(trade.entry_price) * float(trade.quantity)
+                        + float(mark) * float(trade.quantity)
+                    )
+                    fee_and_slippage = round_trip_turnover * (
+                        float(cfg["taker_fee_pct"]) / 100
+                        + float(cfg["slippage_pct"]) / 100
+                    )
                     costs = fee_and_slippage + actual_funding
                     net = gross - costs
                     pnl_pct = (net / max(trade.margin_used, 0.000001)) * 100
@@ -1452,13 +1467,46 @@ async def evaluate_open_paper_trades(prices: dict[str,float] | None = None, sour
                     raw["funding_audit_status"] = "PENDING_VERIFICATION"
                     raw["funding_history_checked_at"] = ts.isoformat()
                     raw["funding_verification_error"] = str(funding_exc)[:180]
-                    db.add(PaperTradeEvent(paper_trade_id=trade.id,event_type="FUNDING_CHECK_PENDING",observed_at=ts,value=net,detail="Actual Binance funding history unavailable; positive-profit exit deferred"))
+                    db.add(PaperTradeEvent(paper_trade_id=trade.id,event_type="FUNDING_CHECK_PENDING",observed_at=ts,value=net,detail="Binance funding history unavailable; positive exits wait for verification, while a protective stop may still close using a conservative estimate."))
             if net > 0 and funding_verified:
+                # No minimum profit threshold: every observed positive net amount,
+                # after round-trip costs and verified funding, is realized immediately.
                 exit_reason = "PROFIT_HARVEST_NET_POSITIVE"
-            elif net <= 0 and funding_verified and not gap_guard and hit_stop:
-                exit_reason = "STOP_LOSS"
-            elif net <= 0 and funding_verified and not gap_guard and hit_target:
-                exit_reason = "PREFERRED_TARGET"
+            elif net <= 0 and not gap_guard and hit_stop:
+                # A safety stop must not be held open solely because the funding API
+                # is temporarily unavailable. Use the conservative estimate already
+                # included in _paper_pnl(), and make the uncertainty explicit.
+                if funding_verified:
+                    exit_reason = "STOP_LOSS"
+                else:
+                    exit_reason = "STOP_LOSS_FUNDING_ESTIMATED"
+                    raw["funding_audit_status"] = "STOP_EXIT_USING_CONSERVATIVE_ESTIMATE"
+                    funding_event_count_at_exit = 0
+                    if next_funding_ms and ts.timestamp() * 1000 >= next_funding_ms:
+                        funding_event_count_at_exit = 1 + int(
+                            (ts.timestamp() * 1000 - next_funding_ms) // 28800000
+                        )
+                    raw["funding_estimate_at_exit"] = max(
+                        0.0,
+                        trade.notional
+                        * (safe_float(raw.get("funding_rate_at_entry")) or 0.0)
+                        * funding_event_count_at_exit
+                        * (1 if trade.side == "LONG" else -1)
+                    )
+                    raw["realized_pnl_is_estimate"] = True
+            elif net <= 0 and not gap_guard and hit_target:
+                # A price target is not a profit exit if fees/funding still leave
+                # net PnL at or below zero. Keep tracking until net turns positive
+                # or the protective stop is reached.
+                if not raw.get("net_negative_target_touch_logged"):
+                    db.add(PaperTradeEvent(
+                        paper_trade_id=trade.id,
+                        event_type="TARGET_TOUCHED_NET_NOT_POSITIVE",
+                        observed_at=ts,
+                        value=net,
+                        detail="Price target touched, but net PnL after estimated/verified costs was not positive; position remains open."
+                    ))
+                    raw["net_negative_target_touch_logged"] = True
             # Keep the persisted last path point and ledger aligned with the funding-
             # verified net amount used by the actual simulated exit decision.
             path_row.net_pnl = net
