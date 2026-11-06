@@ -1115,26 +1115,77 @@ async def load_trader_intelligence(trader_id: str):
 @app.get("/api/positions")
 async def api_positions(limit: int = 500):
     limit = max(1, min(limit, 1000))
-    with SessionLocal() as db:
-        observations = db.scalars(select(PositionObservation).order_by(desc(PositionObservation.id)).limit(limit * 3)).all()
-        snapshots = {s.id: s for s in db.scalars(select(PositionSnapshot).where(PositionSnapshot.id.in_([o.snapshot_id for o in observations]))).all()} if observations else {}
-    latest = {}
-    for obs in observations:
-        key = f"{obs.trader_id}|{obs.position_key}"
-        if key not in latest:
-            snap = snapshots.get(obs.snapshot_id)
-            latest[key] = {
-                "trader_id": obs.trader_id, "symbol": obs.symbol, "side": obs.side, "position_key": obs.position_key,
-                "size": obs.size, "entry_price": obs.entry_price, "mark_price": obs.mark_price,
-                "unrealized_pnl": obs.unrealized_pnl, "leverage": obs.leverage, "margin_mode": obs.margin_mode,
-                "liquidation_price": obs.liquidation_price, "roi": obs.roi,
-                "observed_at": snap.observed_at.isoformat() if snap else None,
-                "source_fetched_at": snap.source_fetched_at if snap else None,
-                "hidden": False, "raw": parse_json(obs.raw_json)
-            }
-        if len(latest) >= limit:
-            break
-    return list(latest.values())
+    rows = _latest_position_contexts(include_hidden_last_known=True)
+    result = []
+    now_at = now()
+    for row in rows[:limit]:
+        obs = row["observation"]
+        snap = row["snapshot"]
+        leader_age = float(row["leader_snapshot_age_seconds"])
+        live = live_market_overlay(obs.symbol)
+        live_mark = live.get("price") if live.get("fresh") else None
+        mark = live_mark or obs.mark_price
+        estimated_live_pnl = None
+        if live_mark and obs.entry_price is not None and obs.size is not None:
+            direction = 1.0 if obs.side == "LONG" else -1.0
+            estimated_live_pnl = direction * (float(live_mark) - float(obs.entry_price)) * abs(float(obs.size))
+        adverse = None
+        if obs.entry_price and mark and obs.entry_price > 0:
+            adverse = (
+                (obs.entry_price - mark) / obs.entry_price * 100
+                if obs.side == "LONG"
+                else (mark - obs.entry_price) / obs.entry_price * 100
+            )
+        if row["leader_state"] != "VISIBLE":
+            freshness = "HIDDEN / LAST KNOWN"
+        elif leader_age > 600:
+            freshness = "LEADER SNAPSHOT STALE"
+        elif live.get("fresh"):
+            freshness = "LIVE · BINANCE MARK"
+        else:
+            freshness = "LEADER SNAPSHOT · BINANCE MARK WAITING"
+
+        result.append({
+            "trader_id": obs.trader_id,
+            "trader_name": row["trader_name"],
+            "symbol": obs.symbol,
+            "side": obs.side,
+            "position_key": obs.position_key,
+            "size": obs.size,
+            "entry_price": obs.entry_price,
+            "mark_price": mark,
+            "kopyon_mark_price": obs.mark_price,
+            "live_mark_price": live_mark,
+            "live_mark_at": live.get("updated_at"),
+            "live_mark_age_seconds": round(live["age_seconds"], 1) if live.get("age_seconds") is not None else None,
+            "live_mark_fresh": bool(live.get("fresh")),
+            "unrealized_pnl": estimated_live_pnl if estimated_live_pnl is not None else obs.unrealized_pnl,
+            "kopyon_unrealized_pnl": obs.unrealized_pnl,
+            "live_unrealized_pnl": estimated_live_pnl,
+            "pnl_source": "BINANCE_MARK_ESTIMATE" if estimated_live_pnl is not None else "KOPYON_SNAPSHOT",
+            "adverse_pct": round(adverse, 4) if adverse is not None else None,
+            "leverage": obs.leverage,
+            "margin_mode": obs.margin_mode,
+            "liquidation_price": obs.liquidation_price,
+            "roi": obs.roi,
+            "observed_at": snap.observed_at.isoformat(),
+            "leader_snapshot_age_seconds": round(leader_age, 1),
+            "source_fetched_at": snap.source_fetched_at,
+            "leader_state": row["leader_state"],
+            "freshness": freshness,
+            "hidden": row["leader_state"] != "VISIBLE",
+            "raw": parse_json(obs.raw_json)
+        })
+    summary = {
+        "positions_returned": len(result),
+        "currently_visible_positions": sum(1 for x in result if x["leader_state"] == "VISIBLE"),
+        "hidden_last_known_positions": sum(1 for x in result if x["leader_state"] != "VISIBLE"),
+        "stale_leader_snapshots": sum(1 for x in result if x["leader_snapshot_age_seconds"] > 600),
+        "binance_live_marks": sum(1 for x in result if x["live_mark_fresh"]),
+        "binance_feed_status": PAPER_PRICE_STREAM_STATE.get("status"),
+        "kopyon_stream_status": KOPYON_STREAM_STATE.get("status")
+    }
+    return {"positions": result, "summary": summary}
 
 async def fetch_news_items() -> list[dict]:
     if time.time() - news_cache["fetched_at"] < 1800:
@@ -1818,12 +1869,17 @@ async def evaluate_open_paper_trades(
         db.commit()
 
 async def _open_paper_symbols() -> list[str]:
+    # Subscribe to all current visible leader symbols as well as our open paper
+    # positions. The same live Binance marks power the Live Positions page,
+    # scanner momentum and simulated paper-trade PnL.
+    symbols = _current_visible_position_symbols()
     with SessionLocal() as db:
-        return sorted({
+        symbols.update({
             str(trade.symbol).upper()
             for trade in db.scalars(select(PaperTrade).where(PaperTrade.status == "OPEN")).all()
             if trade.symbol
         })
+    return sorted(symbols)
 
 
 async def _ws_send_symbol_action(ws, action: str, symbols: set[str], request_id: int, pending: dict) -> int:
@@ -1949,6 +2005,11 @@ async def paper_price_worker() -> None:
                                     pending_event_times[symbol] = event_at
                                     last_price_message_at = time.monotonic()
                                     PAPER_SYMBOL_LAST_UPDATE[symbol] = event_at.isoformat()
+                                    PAPER_SYMBOL_LAST_PRICE[symbol] = price
+                                    ticks = PAPER_SYMBOL_PRICE_TICKS.setdefault(symbol, deque(maxlen=900))
+                                    event_epoch = event_at.timestamp()
+                                    if not ticks or event_epoch >= ticks[-1][0]:
+                                        ticks.append((event_epoch, price))
                                     PAPER_PRICE_STREAM_STATE["price_updates_received"] = int(
                                         PAPER_PRICE_STREAM_STATE.get("price_updates_received", 0)
                                     ) + 1
@@ -2613,9 +2674,13 @@ async def api_system():
         "price_feed": {
             **PAPER_PRICE_STREAM_STATE,
             "symbol_last_update": dict(PAPER_SYMBOL_LAST_UPDATE),
+            "subscribed_symbols": sorted(PAPER_PRICE_STREAM_STATE.get("subscribed_symbols") or []),
             "binance_rest": binance_rest_status(),
             "rest_policy": "WebSocket-first; at most one bulk premiumIndex fallback per minute; no per-symbol mark-price polling."
         },
+        "kopyon_stream": dict(KOPYON_STREAM_STATE),
+        "opportunity_scanner": dict(OPPORTUNITY_SCAN_STATE),
+        "market_metadata_refresh": dict(MARKET_REFRESH_STATE),
         "runtime": {
             "python_env": os.getenv("PYTHON_VERSION", "Render default"),
             "mode": os.getenv("LAES_MODE", "paper"),
