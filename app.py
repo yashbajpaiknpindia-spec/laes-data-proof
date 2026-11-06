@@ -2404,6 +2404,25 @@ async def _api_opportunities_locked(limit: int = 100, allow_entry_creation: bool
     return sorted(result, key=lambda x: (x["qualified"], x["adverse_pct"] or 0), reverse=True)
 
 
+def paper_exit_reason_display(trade: PaperTrade, raw: dict) -> str:
+    if raw.get("leader_continuation_hard_stop_triggered"):
+        return "Leader still open — hard adverse-price ceiling hit"
+    if raw.get("leader_continuation_timeout_triggered"):
+        return "Leader still open — continuation time limit expired"
+    reason = trade.exit_reason or ""
+    labels = {
+        "PROFIT_HARVEST_NET_POSITIVE": "Net-positive profit harvest after costs",
+        "PROFIT_HARVEST_NET_POSITIVE_FUNDING_ESTIMATED": "Net-positive profit harvest; conservative funding estimate pending audit",
+        "LEADER_POSITION_CLOSED": "Leader position confirmed closed",
+        "LEADER_POSITION_REVERSED": "Leader position reversed",
+        "LEADER_CONTINUATION_TIMEOUT": "Leader continuation time limit expired",
+        "LEADER_CONTINUATION_DISABLED_STOP": "Protective stop; leader-continuation hold disabled",
+        "STOP_LOSS": "Protective stop",
+        "STOP_LOSS_FUNDING_ESTIMATED": "Protective stop; funding estimate used",
+    }
+    return labels.get(reason, reason.replace("_", " ").title() if reason else "Not closed")
+
+
 @app.get("/api/paper")
 async def api_paper():
     cfg = paper_config()
@@ -2605,7 +2624,8 @@ async def api_paper():
             "estimated_costs": round(float(trade.estimated_costs or 0.0), 8),
             "net_pnl": round(float(trade.net_pnl or 0.0), 8),
             "exit_reason": trade.exit_reason,
-            "exit_reason_display": raw.get("post_exit_recovery_label") or trade.exit_reason,
+            "exit_reason_display": paper_exit_reason_display(trade, raw),
+            "post_exit_recovery_label": raw.get("post_exit_recovery_label"),
             "post_exit_recovery": {
                 "status": raw.get("post_exit_recovery_status"),
                 "max_net_pnl": safe_float(raw.get("post_exit_max_net_pnl")),
@@ -2878,7 +2898,8 @@ async def api_paper_trade_detail(trade_id: int):
             "symbol": trade.symbol, "side": trade.side, "entry_price": trade.entry_price,
             "mark_price": trade.mark_price, "exit_price": trade.exit_price,
             "exit_reason": trade.exit_reason,
-            "exit_reason_display": raw.get("post_exit_recovery_label") or trade.exit_reason,
+            "exit_reason_display": paper_exit_reason_display(trade, raw),
+            "post_exit_recovery_label": raw.get("post_exit_recovery_label"),
             "post_exit_recovery": {
                 "status": raw.get("post_exit_recovery_status"),
                 "max_net_pnl": safe_float(raw.get("post_exit_max_net_pnl")),
