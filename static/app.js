@@ -149,10 +149,10 @@ function paperChartSvg(d){
  if(!times.length)return '<div class="empty-state">No timestamped market candles or trade path are available for this instrument.</div>';
  const t0=Math.min(...times),t1=Math.max(...times),tspan=Math.max(1,t1-t0);
  const prices=[];
- candles.forEach(c=>[c.high,c.low,c.open,c.close].forEach(v=>{if(Number.isFinite(Number(v)))prices.push(Number(v));}));
- path.forEach(p=>{if(Number.isFinite(Number(p.paper_price)))prices.push(Number(p.paper_price));});
- leaderPath.forEach(p=>{if(Number.isFinite(Number(p.mark_price)))prices.push(Number(p.mark_price));});
- [t.entry_price,t.exit_price,t.stop_price,t.target_price,l.entry_price].forEach(v=>{if(Number.isFinite(Number(v)))prices.push(Number(v));});
+ candles.forEach(c=>[c.high,c.low,c.open,c.close].forEach(v=>{if(v!==null&&v!==undefined&&Number.isFinite(Number(v)))prices.push(Number(v));}));
+ path.forEach(p=>{if(p.paper_price!==null&&p.paper_price!==undefined&&Number.isFinite(Number(p.paper_price)))prices.push(Number(p.paper_price));});
+ leaderPath.forEach(p=>{if(p.mark_price!==null&&p.mark_price!==undefined&&Number.isFinite(Number(p.mark_price)))prices.push(Number(p.mark_price));});
+ [t.entry_price,t.exit_price,t.stop_price,t.target_price,l.entry_price].forEach(v=>{if(v!==null&&v!==undefined&&Number.isFinite(Number(v)))prices.push(Number(v));});
  if(!prices.length)return '<div class="empty-state">Price history is not available.</div>';
  let pmin=Math.min(...prices),pmax=Math.max(...prices);if(pmax===pmin){pmax+=Math.abs(pmax)*0.001||1;pmin-=Math.abs(pmin)*0.001||1;}
  const x=v=>6+(Math.max(0,Math.min(1,(v-t0)/tspan))*88);
