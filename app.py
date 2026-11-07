@@ -2783,20 +2783,34 @@ async def api_paper_trade_detail(trade_id: int):
     if not quality_status:
         quality_status = "DATA_INTERRUPTED_REVIEW" if max_gap > 15 else ("PATH_NOT_RECORDED" if not path else "LEGACY_UNCLASSIFIED")
 
+    campaign_trade_details = []
+    for item in campaign_rows:
+        item_raw = parse_json(item.raw_json)
+        campaign_trade_details.append({
+            "id": item.id, "status": item.status, "entry_price": item.entry_price,
+            "exit_price": item.exit_price, "net_pnl": round(float(item.net_pnl or 0.0), 8),
+            "mfe_net_pnl": safe_float(item_raw.get("mfe_net_pnl")),
+            "mae_net_pnl": safe_float(item_raw.get("mae_net_pnl")),
+            "post_exit_status": item_raw.get("post_exit_recovery_status"),
+            "post_exit_max_net_pnl": safe_float(item_raw.get("post_exit_max_net_pnl")),
+            "post_exit_minutes_to_entry": safe_float(item_raw.get("post_exit_minutes_to_entry")),
+            "post_exit_minutes_to_net_profit": safe_float(item_raw.get("post_exit_minutes_to_net_profit")),
+            "post_exit_minutes_to_best": safe_float(item_raw.get("post_exit_minutes_to_best")),
+            "post_exit_max_at": item_raw.get("post_exit_max_at"),
+            "opened_at": item.opened_at.isoformat(),
+            "closed_at": item.closed_at.isoformat() if item.closed_at else None,
+            "exit_reason": item.exit_reason
+        })
     campaign = {
         "trade_count": len(campaign_rows),
         "reentry_count": max(0, len(campaign_rows) - 1),
         "open_count": sum(1 for item in campaign_rows if item.status == "OPEN"),
         "realized_net_pnl": round(sum(float(item.net_pnl or 0.0) for item in campaign_rows if item.status == "CLOSED"), 8),
         "total_net_pnl": round(sum(float(item.net_pnl or 0.0) for item in campaign_rows), 8),
+        "sum_positive_attempt_pnl": round(sum(max(0.0, float(item.net_pnl or 0.0)) for item in campaign_rows), 8),
+        "sum_negative_attempt_pnl": round(sum(min(0.0, float(item.net_pnl or 0.0)) for item in campaign_rows), 8),
         "trade_ids": [item.id for item in campaign_rows],
-        "trades": [{
-            "id": item.id, "status": item.status, "entry_price": item.entry_price,
-            "exit_price": item.exit_price, "net_pnl": round(float(item.net_pnl or 0.0), 8),
-            "opened_at": item.opened_at.isoformat(),
-            "closed_at": item.closed_at.isoformat() if item.closed_at else None,
-            "exit_reason": item.exit_reason
-        } for item in campaign_rows]
+        "trades": campaign_trade_details
     }
 
     leader = None
@@ -2829,6 +2843,34 @@ async def api_paper_trade_detail(trade_id: int):
         else:
             leader_status = "LAST_OBSERVED_STALE_OR_MISSING"
 
+        leader_entry_cross_after_exit_at = None
+        leader_max_favorable_after_exit = None
+        leader_recovery_after_exit = False
+        leader_recovery_after_exit_minutes = None
+        leader_max_pnl_after_exit = None
+        if trade.closed_at and lentry:
+            closed_epoch = trade.closed_at.timestamp()
+            post_exit_leader = [p for p in leader_path if datetime.fromisoformat(p["at"]).timestamp() >= closed_epoch]
+            for p in post_exit_leader:
+                mp = safe_float(p.get("mark_price"))
+                if mp is None:
+                    continue
+                lpnl = safe_float(p.get("unrealized_pnl"))
+                if trade.side == "LONG":
+                    favorable = mp - lentry
+                    crossed = mp >= lentry
+                else:
+                    favorable = lentry - mp
+                    crossed = mp <= lentry
+                if leader_max_favorable_after_exit is None or favorable > leader_max_favorable_after_exit:
+                    leader_max_favorable_after_exit = favorable
+                if lpnl is not None and (leader_max_pnl_after_exit is None or lpnl > leader_max_pnl_after_exit):
+                    leader_max_pnl_after_exit = lpnl
+                if crossed and leader_entry_cross_after_exit_at is None:
+                    leader_entry_cross_after_exit_at = p["at"]
+            if leader_entry_cross_after_exit_at:
+                leader_recovery_after_exit = True
+                leader_recovery_after_exit_minutes = (datetime.fromisoformat(leader_entry_cross_after_exit_at).timestamp() - closed_epoch) / 60.0
         leader = {
             "trader_id": trade.trader_id,
             "trader_name": trader.name if trader else trade.trader_name,
@@ -2839,7 +2881,12 @@ async def api_paper_trade_detail(trade_id: int):
             "leverage": leader_obs.leverage, "margin_mode": leader_obs.margin_mode,
             "observed_at": leader_snapshot.observed_at.isoformat() if leader_snapshot else None,
             "recovery_price": lentry, "our_recovery_profit_pct": recovery_profit_pct,
-            "our_recovery_profit_usdt": recovery_profit_usdt, "status": leader_status
+            "our_recovery_profit_usdt": recovery_profit_usdt, "status": leader_status,
+            "leader_reached_entry_after_exit": leader_recovery_after_exit,
+            "leader_reached_entry_after_exit_at": leader_entry_cross_after_exit_at,
+            "leader_minutes_to_entry_after_exit": round(leader_recovery_after_exit_minutes, 2) if leader_recovery_after_exit_minutes is not None else None,
+            "leader_max_favorable_after_exit": leader_max_favorable_after_exit,
+            "leader_max_pnl_after_exit": leader_max_pnl_after_exit
         }
         recovery = recovery_statistics(
             trade.trader_id,
