@@ -3146,6 +3146,44 @@ async def api_news(symbol: str = "", refresh: bool = False):
     fetched_at = datetime.fromtimestamp(news_cache["fetched_at"], timezone.utc).isoformat() if news_cache.get("fetched_at") else None
     return {"source": "CoinDesk / Cointelegraph / The Block RSS", "items": find_news_for_symbol(symbol, items) if symbol else items[:40], "fetched_at": fetched_at, "feed_error": news_cache.get("error"), "warning": "Headline timing is context only; LAES does not claim a headline caused a particular price move."}
 
+IMPORTANT_MARKET_SYMBOLS = [
+    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","ADAUSDT","AVAXUSDT","LINKUSDT","DOTUSDT",
+    "LTCUSDT","BCHUSDT","UNIUSDT","AAVEUSDT","SUIUSDT","TRXUSDT","TONUSDT","NEARUSDT","APTUSDT","ARBUSDT",
+    "OPUSDT","FILUSDT","ATOMUSDT","ETCUSDT","XLMUSDT","HBARUSDT","ICPUSDT","INJUSDT","SEIUSDT","TIAUSDT",
+    "PEPEUSDT","SHIBUSDT","WIFUSDT","BONKUSDT","FLOKIUSDT","ENAUSDT","WLDUSDT","TAOUSDT","RENDERUSDT","MKRUSDT",
+    "CRVUSDT","JUPUSDT","JTOUSDT","PYTHUSDT","RUNEUSDT","FETUSDT","GRTUSDT","SANDUSDT","MANAUSDT","ALGOUSDT",
+    "EOSUSDT","NEOUSDT","VETUSDT","QNTUSDT","EGLDUSDT","RAYUSDT","CAKEUSDT","ORDIUSDT","1000SHIBUSDT"
+]
+
+@app.get("/api/market/universe")
+async def api_market_universe():
+    symbols = set(IMPORTANT_MARKET_SYMBOLS)
+    with SessionLocal() as db:
+        symbols.update(str(x).upper() for x in db.scalars(select(MarketInsight.symbol)).all())
+    rows = []
+    with SessionLocal() as db:
+        caches = {x.symbol: parse_json(x.raw_json) for x in db.scalars(select(MarketInsight)).all()}
+    for symbol in sorted(symbols):
+        cached = caches.get(symbol, {})
+        live_at = PAPER_SYMBOL_LAST_PRICE_AT.get(symbol)
+        live_fresh = bool(live_at and time.time() - live_at <= 10)
+        price = PAPER_SYMBOL_LAST_PRICE.get(symbol) if live_fresh else safe_float(cached.get("mark_price"))
+        funding = PAPER_SYMBOL_FUNDING_RATE.get(symbol) if live_fresh else safe_float(cached.get("funding_rate"))
+        momentum = safe_float(cached.get("momentum_5m_pct"))
+        history = PAPER_SYMBOL_PRICE_HISTORY.get(symbol, [])
+        cutoff = time.time() - 300
+        baseline = next((p for stamp,p in history if stamp <= cutoff), None)
+        if live_fresh and baseline and baseline > 0 and price and price > 0:
+            momentum = (price / baseline - 1) * 100
+        rows.append({
+            "symbol": symbol, "mark_price": price, "funding_rate": funding,
+            "momentum_5m_pct": momentum,
+            "quote_volume_24h_usdt": safe_float(cached.get("quote_volume_24h_usdt")),
+            "live_fresh": live_fresh, "live_age_seconds": round(time.time()-live_at,1) if live_at else None,
+            "status": "LIVE" if live_fresh else ("CACHED" if cached else "NO_DATA")
+        })
+    return {"source": "Binance USD-M public market data", "count": len(rows), "rows": rows}
+
 @app.get("/api/market/{symbol}")
 async def api_market(symbol: str, refresh: bool = False):
     symbol = symbol.upper()
