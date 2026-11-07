@@ -3092,6 +3092,51 @@ async def api_health():
     except Exception as exc:
         raise HTTPException(503, f"Database unavailable: {str(exc)[:200]}")
 
+@app.get("/api/db/synthetic")
+async def api_db_synthetic():
+    """Application-level DB read/write/read probe used to distinguish DB failure from UI/runtime failure."""
+    started = time.perf_counter()
+    try:
+        def _probe():
+            with engine.begin() as conn:
+                if engine.dialect.name == "postgresql":
+                    conn.execute(text("SET LOCAL statement_timeout = '3000ms'"))
+                one = conn.execute(text("SELECT 1")).scalar_one()
+                db_now = conn.execute(text("SELECT CURRENT_TIMESTAMP")).scalar_one()
+                trader_count = conn.execute(text("SELECT COUNT(*) FROM traders")).scalar_one()
+                conn.execute(text("CREATE TEMP TABLE laes_db_probe (v integer) ON COMMIT DROP"))
+                conn.execute(text("INSERT INTO laes_db_probe(v) VALUES (731)"))
+                probe = conn.execute(text("SELECT v FROM laes_db_probe")).scalar_one()
+                conn.execute(text("DROP TABLE laes_db_probe"))
+                return one, db_now, trader_count, probe
+        one, db_now, trader_count, probe = await asyncio.wait_for(asyncio.to_thread(_probe), timeout=5.0)
+        latency_ms = round((time.perf_counter() - started) * 1000, 1)
+        return {
+            "status": "ok" if one == 1 and probe == 731 else "failed",
+            "database": "connected", "engine": engine.dialect.name,
+            "read_probe": one == 1, "write_read_delete_probe": probe == 731,
+            "trader_count": int(trader_count), "database_time": str(db_now),
+            "latency_ms": latency_ms,
+            "probe": "SELECT 1 + COUNT(traders) + temp write/read/delete"
+        }
+    except asyncio.TimeoutError:
+        raise HTTPException(504, "Database synthetic probe timed out after 5 seconds")
+    except Exception as exc:
+        raise HTTPException(503, f"Database synthetic probe failed: {str(exc)[:300]}")
+
+@app.post("/api/client-error")
+async def api_client_error(request: Request):
+    """Persist browser boot/runtime errors so UI failures are diagnosable from Render logs."""
+    try:
+        body = await request.json()
+        detail = json.dumps({k: body.get(k) for k in ("message", "source", "line", "column", "stack")}, default=str)[:1800]
+        with SessionLocal() as db:
+            db.add(SourceCheck(source="browser_runtime", checked_at=now(), ok=False, http_status=500, detail=detail))
+            db.commit()
+        return {"recorded": True}
+    except Exception as exc:
+        raise HTTPException(503, f"Could not record browser error: {str(exc)[:200]}")
+
 @app.get("/api/system")
 async def api_system():
     metrics = db_metrics()
