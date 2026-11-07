@@ -763,8 +763,26 @@ async def monitor_worker() -> None:
         # WebSocket-fed market price history; this does not add Kopyon calls.
         await run_monitor_cycle()
         last_discovery = time.monotonic()
+        last_recovery_audit = time.monotonic()
+        last_open_leader_refresh = time.monotonic()
         while True:
             await asyncio.sleep(60)
+            if time.monotonic() - last_recovery_audit >= 600:
+                try:
+                    audit = await run_post_exit_recovery_audit(max_trades=5)
+                    log_check("post_exit_recovery_audit", True, 200, None, f"audited={audit.get('audited', 0)} recovered_to_profit={audit.get('recovered_to_profit', 0)} failures={audit.get('failures', 0)}")
+                except Exception as audit_exc:
+                    log_check("post_exit_recovery_audit", False, None, None, str(audit_exc)[:700])
+                last_recovery_audit = time.monotonic()
+            if time.monotonic() - last_open_leader_refresh >= 300:
+                with SessionLocal() as db:
+                    open_leader_ids = sorted({t.trader_id for t in db.scalars(select(PaperTrade).where(PaperTrade.status == "OPEN")).all()})
+                for trader_id in open_leader_ids:
+                    try:
+                        await sync_one_trader_positions(trader_id)
+                    except Exception as leader_exc:
+                        log_check("open_paper_leader_refresh", False, None, None, f"{trader_id}: {str(leader_exc)[:500]}")
+                last_open_leader_refresh = time.monotonic()
             try:
                 opportunities = await scan_paper_opportunities(limit=100, allow_entry_creation=True)
                 qualified_count = sum(1 for item in opportunities if item.get("qualified"))
@@ -1614,7 +1632,7 @@ def _leader_state_for_trade(db, trade: PaperTrade) -> tuple[str, str]:
     return "STALE_OR_UNAVAILABLE", "Leader position not present in the latest snapshot but closure is not yet confirmed"
 
 
-async def run_post_exit_recovery_audit() -> dict:
+async def run_post_exit_recovery_audit(max_trades: int = 5) -> dict:
     """
     One-time, read-only market-path audit for historical clean closed losses.
     It never rewrites realized PnL, exit price, status, or capital. It only stores
@@ -1631,8 +1649,10 @@ async def run_post_exit_recovery_audit() -> dict:
         ).order_by(PaperTrade.closed_at)
         ).all()
     for trade in trades:
+        if audited >= max(1, int(max_trades)):
+            break
         raw = parse_json(trade.raw_json)
-        if raw.get("post_exit_recovery_audit_version") == 3:
+        if raw.get("post_exit_recovery_audit_version") == 4:
             continue
         # The post-exit market path is independently auditable even when the
         # pre-exit paper path was interrupted or incomplete. Keep the old
@@ -1685,7 +1705,7 @@ async def run_post_exit_recovery_audit() -> dict:
             recovered_to_profit = best["max_net_pnl"] > 0
             recovered_to_entry = first_entry_cross is not None
             raw.update({
-                "post_exit_recovery_audit_version": 3,
+                "post_exit_recovery_audit_version": 4,
                 "post_exit_recovery_status": "RECOVERED_TO_NET_PROFIT" if recovered_to_profit else ("RECOVERED_TO_ENTRY_ONLY" if recovered_to_entry else "NO_ENTRY_RECOVERY"),
                 "post_exit_recovery_market_source": "BINANCE_USDM_MARK_PRICE_1M",
                 "post_exit_recovery_horizon_hours": horizon_hours,
@@ -3022,7 +3042,26 @@ async def api_system():
                 counts[table_name] = 0
     return {
         "database": metrics, "counts": counts,
-        "monitor": {**last_scan, "worker_alive": worker_alive, "interval_seconds": DISCOVERY_INTERVAL, "batch": POSITION_BATCH},
+        "monitor": {
+            **last_scan, "worker_alive": worker_alive, "interval_seconds": DISCOVERY_INTERVAL, "batch": POSITION_BATCH,
+            "coverage": {
+                "stored_discovered_traders": db.scalar(select(func.count()).select_from(Trader)) or 0,
+                "rotation_batch": POSITION_BATCH,
+                "rotation_scope": "Stored Kopyon public trader universe; selected by copier PnL/last-seen ranking",
+                "open_paper_leader_refresh_seconds": 300,
+                "underwater_scan_seconds": 60,
+                "fresh_leader_window_seconds": 900
+            }
+        },
+        "data_sources": [
+            {"data": "Public trader discovery", "source": "Kopyon /binance-copy-trading/traders", "request": "leaderboard discovery", "frequency": "every 30 minutes", "batch": 20},
+            {"data": "Leader open positions", "source": "Kopyon /binance-copy-trading/openPositions", "request": "one traderId per request", "frequency": "20 rotating traders per 30 min; open-paper leaders every 5 min", "coverage": "all stored visible traders over rotation, plus priority open-paper leaders"},
+            {"data": "Paper opportunity qualification", "source": "LAES DB + Binance market stream", "request": "latest visible leader snapshots + live mark/momentum", "frequency": "every 60 seconds; page refresh is read-only", "coverage": "all latest visible trader snapshots, subject to 15-minute freshness"},
+            {"data": "Live paper PnL/exit monitoring", "source": "Binance USD-M markPrice WebSocket", "request": "1s mark-price stream per active symbol", "frequency": "continuous while Render process is awake", "coverage": "open paper symbols + symbols in latest visible leader snapshots"},
+            {"data": "Historical candles", "source": "Binance USD-M REST", "request": "klines/markPriceKlines", "frequency": "on demand; cached per symbol", "coverage": "requested trade/symbol only"},
+            {"data": "Funding history", "source": "Binance USD-M REST", "request": "funding history", "frequency": "on trade audit/settlement reconciliation; circuit-breaker protected", "coverage": "paper trades needing verification"},
+            {"data": "News", "source": "CoinDesk / Cointelegraph / The Block RSS", "request": "RSS feeds", "frequency": "15-minute cache/refresh", "coverage": "general crypto headlines + symbol filter when supported"}
+        ],
         "provider": {
             "kopyon_key_configured": bool(KOPYON_KEY), "kopyon_base": KOPYON_ROOT,
             "binance_public_market_data": BINANCE_ROOT, "browser_token_required": False
