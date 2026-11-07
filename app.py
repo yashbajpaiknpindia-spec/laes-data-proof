@@ -797,23 +797,32 @@ async def monitor_worker() -> None:
     finally:
         worker_alive = False
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+async def _startup_recovery_audit() -> None:
+    # Never block HTTP startup on historical recovery work. The web service must
+    # become available first; the audit is read-only background maintenance.
+    await asyncio.sleep(2)
     try:
-        await run_post_exit_recovery_audit()
+        audit = await run_post_exit_recovery_audit(max_trades=5)
+        log_check("post_exit_recovery_audit_startup", True, 200, None, f"audited={audit.get('audited', 0)} recovered_to_profit={audit.get('recovered_to_profit', 0)} failures={audit.get('failures', 0)}")
     except Exception as exc:
         log_check("post_exit_recovery_audit_startup", False, None, None, str(exc)[:900])
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Keep startup deterministic: schema creation/migrations happen at import,
+    # but network-dependent recovery auditing must not delay the HTTP server.
+    recovery_task = asyncio.create_task(_startup_recovery_audit())
     task = asyncio.create_task(monitor_worker())
     price_task = asyncio.create_task(paper_price_worker())
     app.state.monitor_task = task
     app.state.paper_price_task = price_task
+    app.state.recovery_task = recovery_task
     yield
-    task.cancel()
-    price_task.cancel()
-    with suppress(asyncio.CancelledError):
-        await task
-    with suppress(asyncio.CancelledError):
-        await price_task
+    for background_task in (task, price_task, recovery_task):
+        background_task.cancel()
+    for background_task in (task, price_task, recovery_task):
+        with suppress(asyncio.CancelledError):
+            await background_task
 
 app = FastAPI(title=APP_NAME, version="1.0.0", lifespan=lifespan, docs_url="/api/docs")
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -3073,6 +3082,16 @@ async def update_paper_settings(request: Request):
     set_setting("paper_config", cfg)
     return {"saved": True, "config": cfg}
 
+@app.get("/api/health")
+async def api_health():
+    """Cheap liveness/readiness probe. Never runs full DB telemetry."""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1")).scalar_one()
+        return {"status": "ok", "database": "connected", "engine": engine.dialect.name}
+    except Exception as exc:
+        raise HTTPException(503, f"Database unavailable: {str(exc)[:200]}")
+
 @app.get("/api/system")
 async def api_system():
     metrics = db_metrics()
@@ -3087,12 +3106,13 @@ async def api_system():
                 counts[table_name] = db.scalar(select(func.count()).select_from(model)) or 0
             except Exception:
                 counts[table_name] = 0
+        stored_trader_count = counts.get("traders", 0)
     return {
         "database": metrics, "counts": counts,
         "monitor": {
             **last_scan, "worker_alive": worker_alive, "interval_seconds": DISCOVERY_INTERVAL, "batch": POSITION_BATCH,
             "coverage": {
-                "stored_discovered_traders": db.scalar(select(func.count()).select_from(Trader)) or 0,
+                "stored_discovered_traders": stored_trader_count,
                 "rotation_batch": POSITION_BATCH,
                 "rotation_scope": "Stored Kopyon public trader universe; selected by copier PnL/last-seen ranking",
                 "open_paper_leader_refresh_seconds": 300,
