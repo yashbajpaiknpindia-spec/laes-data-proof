@@ -219,6 +219,8 @@ async function refreshPaperTradeDetail(id){
    '<div class="analysis-line"><span>Leader latest mark</span><b>'+fmt(l.mark_price,8)+' · '+date(l.observed_at)+'</b></div>'+
    '<div class="analysis-line"><span>Leader unrealized PnL / adverse move</span><b>'+money(l.unrealized_pnl)+' / '+pct(l.adverse_pct)+'</b></div>'+
    '<div class="analysis-line"><span>Our PnL if leader reaches entry</span><b>'+money(l.our_recovery_profit_usdt)+' · '+pct(l.our_recovery_profit_pct)+'</b></div>'+
+   '<div class="analysis-line"><span>Leader reached its own entry after our exit?</span><b>'+((l.leader_reached_entry_after_exit?'YES · '+fmt(l.leader_minutes_to_entry_after_exit,1)+' min after exit · '+date(l.leader_reached_entry_after_exit_at):'NO in observed leader path')+'</b></div>'+
+   '<div class="analysis-line"><span>Leader best favorable move after our exit</span><b>'+fmt(l.leader_max_favorable_after_exit,8)+' · '+money(l.leader_max_pnl_after_exit)+'</b></div>'+
    '<div class="analysis-line"><span>Comparable recovery sample</span><b>'+fmt(r.probability,1)+'% · '+fmt(r.sample_size,0)+' samples</b></div></div>';
   html+='<div class="analysis-box"><h4>LIVE FUTURES CANDLE CHART · '+esc(t.symbol||'')+' · '+esc(d.candle_interval||'')+'</h4>'+
    paperChartSvg(d)+
@@ -229,6 +231,11 @@ async function refreshPaperTradeDetail(id){
    '<div class="analysis-line"><span>Currently open attempts</span><b>'+fmt(camp.open_count,0)+'</b></div>'+
    '<div class="analysis-line"><span>Realized campaign net PnL</span><b>'+money(camp.realized_net_pnl)+'</b></div>'+
    '<div class="analysis-line"><span>Total campaign net PnL</span><b>'+money(camp.total_net_pnl)+'</b></div>'+
+   '<div class="analysis-line"><span>Positive attempts total</span><b>'+money(camp.sum_positive_attempt_pnl)+'</b></div>'+
+   '<div class="analysis-line"><span>Negative attempts total</span><b>'+money(camp.sum_negative_attempt_pnl)+'</b></div>'+
+   '<div class="profile-history"><table><thead><tr><th>ATTEMPT</th><th>NET</th><th>MFE</th><th>AFTER-EXIT RECOVERY</th><th>EXIT</th></tr></thead><tbody>'+
+   (camp.trades||[]).map(x=>'<tr><td>#'+x.id+'</td><td class="'+(Number(x.net_pnl)>=0?'positive':'negative')+'">'+money(x.net_pnl)+'</td><td>'+money(x.mfe_net_pnl)+'</td><td>'+esc(x.post_exit_status||'Not audited')+(x.post_exit_minutes_to_net_profit!==null&&x.post_exit_minutes_to_net_profit!==undefined?' · +'+fmt(x.post_exit_minutes_to_net_profit,1)+'m':'')+'</td><td>'+esc(x.exit_reason||'OPEN')+'</td></tr>').join('')+
+   '</tbody></table></div>'+
    '<div class="sample-warning">Linked trade IDs: '+esc((camp.trade_ids||[]).join(', '))+'</div></div>';
   html+='<div class="analysis-box"><h4>SWING & LEADER-RECOVERY PROFIT LADDER</h4><div class="profile-history"><table><thead><tr><th>TARGET / MOVE</th><th>PRICE</th><th>GROSS</th><th>ESTIMATED NET</th></tr></thead><tbody>'+
    (lad.length?lad.map(x=>'<tr><td>'+esc(x.target_type==='INTERMEDIATE_SWING_FROM_LATEST_MARK'?'Swing +':'Leader recovery +')+fmt(x.target_pct_from_reference,2)+'%</td><td>'+fmt(x.price,8)+'</td><td class="'+(x.gross_pnl_usdt>=0?'positive':'negative')+'">'+money(x.gross_pnl_usdt)+'</td><td class="'+(x.estimated_net_pnl_usdt>=0?'positive':'negative')+'">'+money(x.estimated_net_pnl_usdt)+'</td></tr>').join(''):'<tr><td colspan="4">No swing or leader recovery targets available.</td></tr>')+
