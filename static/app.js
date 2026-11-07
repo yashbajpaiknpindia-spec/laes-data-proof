@@ -1,3 +1,12 @@
+// LAES client diagnostics: never let one missing DOM hook prevent the entire data boot sequence.
+window.addEventListener("error", e => {
+  try { fetch("/api/client-error",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({message:e.message,source:e.filename,line:e.lineno,column:e.colno,stack:e.error?.stack||""})}); } catch {}
+});
+window.addEventListener("unhandledrejection", e => {
+  try { fetch("/api/client-error",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({message:String(e.reason?.message||e.reason||"Unhandled promise rejection"),stack:e.reason?.stack||""})}); } catch {}
+});
+const bind=(id,event,fn)=>{const el=$(id);if(!el){console.warn("LAES missing DOM hook:",id);return false;}el.addEventListener(event,fn);return true;};
+const click=(id,fn)=>{const el=$(id);if(!el){console.warn("LAES missing DOM hook:",id);return false;}el.onclick=fn;return true;};
 const $=id=>document.getElementById(id);
 const state={page:"overview"};
 let paperDetailTimer=null;
@@ -54,7 +63,7 @@ async function loadTraders(){
  }).join("");
  }catch(e){$("traderGrid").innerHTML='<div class="empty-state">'+esc(e.message)+'</div>';}
 }
-$("traderSearch").addEventListener("input",()=>{clearTimeout(loadTraders.timer);loadTraders.timer=setTimeout(loadTraders,250);});$("reloadTraders").onclick=loadTraders;
+bind("traderSearch","input",()=>{clearTimeout(loadTraders.timer);loadTraders.timer=setTimeout(loadTraders,250);});click("reloadTraders",loadTraders);
 async function openTrader(enc){
  clearInterval(paperDetailTimer);paperDetailTimer=null;
  const id=decodeURIComponent(enc);$("dialogName").textContent="Loading trader…";$("dialogSub").textContent=id;$("dialogBody").innerHTML='<div class="empty-state">Loading profile, performance and closed history from Kopyon…</div>';$("traderDialog").showModal();
@@ -70,7 +79,7 @@ async function openTrader(enc){
  $("dialogBody").innerHTML=html+'</tbody></table></div>';
  }catch(e){$("dialogBody").innerHTML='<div class="notice error">'+esc(e.message)+'</div>';}
 }
-window.openTrader=openTrader;$("closeDialog").onclick=()=>{clearInterval(paperDetailTimer);paperDetailTimer=null;$("traderDialog").close();};
+window.openTrader=openTrader;click("closeDialog",()=>{clearInterval(paperDetailTimer);paperDetailTimer=null;$("traderDialog").close();});
 async function loadPositions(){
  $("positionTable").innerHTML='<tr><td colspan="9" class="empty-cell">Loading real position observations…</td></tr>';
  try{const [rows,traders]=await Promise.all([api("/api/positions?limit=500"),api("/api/traders?limit=300")]);const names=Object.fromEntries(traders.map(t=>[t.trader_id,t.name||t.trader_id]));
@@ -78,7 +87,7 @@ async function loadPositions(){
  $("positionTable").innerHTML=rows.map(p=>{const a=p.entry_price&&p.mark_price?(p.side==="LONG"?(p.entry_price-p.mark_price):(p.mark_price-p.entry_price))/p.entry_price*100:null;const age=p.snapshot_age_seconds===null||p.snapshot_age_seconds===undefined?"":(p.snapshot_age_seconds<3600?Math.round(p.snapshot_age_seconds/60)+"m old":(p.snapshot_age_seconds/3600).toFixed(1)+"h old");return '<tr><td>'+esc(names[p.trader_id]||p.trader_id)+'<br><small>'+esc(p.trader_id)+'</small></td><td><b>'+esc(p.symbol)+'</b></td><td class="'+(p.side==="LONG"?"side-long":"side-short")+'">'+esc(p.side)+'</td><td>'+fmt(p.entry_price,6)+'</td><td>'+fmt(p.mark_price,6)+'</td><td class="'+((p.unrealized_pnl||0)<0?"negative":"positive")+'">'+money(p.unrealized_pnl)+'</td><td class="'+((a||0)>0?"negative":"positive")+'">'+pct(a)+'</td><td>'+(p.leverage?fmt(p.leverage,1)+"×":"—")+' '+esc(p.margin_mode||"")+'</td><td><span class="status-tag '+(p.freshness==="FRESH"?"qualified":"neutral")+'">'+esc(p.freshness||"UNKNOWN")+'</span><br>'+date(p.observed_at)+'<br><small>'+esc(age)+'</small></td></tr>';}).join("");
  }catch(e){$("positionTable").innerHTML='<tr><td colspan="9" class="empty-cell">'+esc(e.message)+'</td></tr>';}
 }
-$("reloadPositions").onclick=loadPositions;
+click("reloadPositions",loadPositions);
 async function loadOpportunities(){
  $("opportunityList").innerHTML='<div class="empty-state">Analyzing actual positions against Binance market data…</div>';
  try{const items=await api("/api/opportunities?limit=100");const qual=items.filter(o=>o.qualified);$("navOppCount").textContent=fmt(qual.length,0);
@@ -91,7 +100,7 @@ async function loadOpportunities(){
  }).join("");
  }catch(e){$("opportunityList").innerHTML='<div class="empty-state">'+esc(e.message)+'</div>';}
 }
-$("refreshOpps").onclick=loadOpportunities;
+click("refreshOpps",loadOpportunities);
 async function loadPaper(){
  if(paperLoadInFlight)return; paperLoadInFlight=true;
  try{
@@ -261,8 +270,8 @@ async function openPaperTrade(id){
  },2000);
 }
 window.openPaperTrade=openPaperTrade;
-$("reloadPaper").onclick=loadPaper;
-$("paperSettings").addEventListener("submit",async e=>{e.preventDefault();const f=new FormData(e.currentTarget),body={};for(const [k,v] of f.entries())body[k]=Number(v);body.auto_enabled=e.currentTarget.elements.auto_enabled.checked;try{await api("/api/paper/settings",{method:"POST",body:JSON.stringify(body)});$("paperSaveStatus").textContent="Saved · paper settings active";await loadPaper();}catch(err){$("paperSaveStatus").textContent=err.message;}});
+click("reloadPaper",loadPaper);
+bind("paperSettings","submit",async e=>{e.preventDefault();const f=new FormData(e.currentTarget),body={};for(const [k,v] of f.entries())body[k]=Number(v);body.auto_enabled=e.currentTarget.elements.auto_enabled.checked;try{await api("/api/paper/settings",{method:"POST",body:JSON.stringify(body)});$("paperSaveStatus").textContent="Saved · paper settings active";await loadPaper();}catch(err){$("paperSaveStatus").textContent=err.message;}});
 function spark(values){if(!values||values.length<2)return'<div class="empty-state">Candle series unavailable</div>';const min=Math.min(...values),max=Math.max(...values),span=max-min||1;const pts=values.map((v,i)=>(i/(values.length-1)*100)+","+(95-(v-min)/span*85)).join(" ");return'<svg viewBox="0 0 100 100" preserveAspectRatio="none"><polyline points="'+pts+'" fill="none" stroke="#a995f3" stroke-width="1.8" vector-effect="non-scaling-stroke"/><line x1="0" y1="95" x2="100" y2="95" stroke="#354454" stroke-width=".6"/></svg>';}
 async function loadMarket(forceRefresh=true){
  const s=$("marketSymbol").value.trim().toUpperCase();
@@ -284,14 +293,14 @@ async function loadMarket(forceRefresh=true){
   $("newsList").innerHTML='<div class="muted-note">Updated: '+esc(n.fetched_at?date(n.fetched_at):"time unavailable")+' · '+esc(n.feed_error||"All feeds fetched without reported errors")+(n.feed_error?' · partial feed failure':'')+'</div>'+(n.items?.length?n.items.map(i=>'<div class="news-item"><a href="'+esc(i.url)+'" target="_blank" rel="noreferrer">'+esc(i.title)+'</a><small>'+esc(i.source)+' · '+esc(i.published_at||"Publication time unavailable")+'</small></div>').join(""):'<div class="empty-state">No matched headlines returned. This is not proof that no news event occurred.</div>');
  }else{$("newsList").innerHTML='<div class="notice error">News feed: '+esc(newsResult.reason?.message||"unavailable")+'</div>';}
 }
-$("loadMarket").onclick=()=>loadMarket(true);$("marketSymbol").addEventListener("keydown",e=>{if(e.key==="Enter")loadMarket(true);});if($("reloadMarketUniverse"))$("reloadMarketUniverse").onclick=loadMarketUniverse;
+click("loadMarket",()=>loadMarket(true));bind("marketSymbol","keydown",e=>{if(e.key==="Enter")loadMarket(true);});click("reloadMarketUniverse",loadMarketUniverse);
 async function loadMarketUniverse(){
  const body=$("marketUniverseTable");if(!body)return;
  try{const d=await api("/api/market/universe");body.innerHTML=(d.rows||[]).map(x=>'<tr><td><b>'+esc(x.symbol)+'</b></td><td>'+fmt(x.mark_price,8)+'</td><td>'+fmt(x.momentum_5m_pct,3)+'%</td><td>'+fmt((x.funding_rate||0)*100,4)+'%</td><td>'+money(x.quote_volume_24h_usdt)+'</td><td><span class="status-tag '+(x.live_fresh?"positive":"neutral")+'">'+esc(x.status||"CACHED")+'</span></td></tr>').join("")||'<tr><td colspan="6" class="empty-cell">No market symbols available yet.</td></tr>';}catch(e){body.innerHTML='<tr><td colspan="6" class="empty-cell">'+esc(e.message)+'</td></tr>'}
 }
 async function loadSystem(){$("tableMetrics").innerHTML='<div class="empty-state">Reading database telemetry…</div>';try{const d=await api("/api/system"),db=d.database||{},m=d.monitor||{};$("dbEngine").textContent=(db.engine||"unknown").toUpperCase();$("dbUsedLarge").textContent=db.used_mb===null||db.used_mb===undefined?"Not reported":fmt(db.used_mb,3)+" MB";$("dbConnection").textContent="Connection: "+db.connection+" · persistent: "+(db.persistent?"yes":"no");$("dbCapacityLarge").textContent=db.capacity_note||"";$("dbBarLarge").style.width=db.configured_capacity_gb&&db.used_mb!==null?Math.min(100,db.used_mb/(db.configured_capacity_gb*1024)*100)+"%":"0%";$("workerState").textContent=m.worker_alive?"Running":"Not active";$("workerInterval").textContent=Math.round((m.interval_seconds||0)/60)+" minutes";$("workerBatch").textContent=(m.batch||0)+" traders / pass";$("workerLastState").textContent=m.state||"—";$("workerError").textContent=m.last_error||"None";$("runtimeCaveat").textContent=d.runtime?.render_free_sleep_warning||"";$("tableMetrics").innerHTML=db.tables?.length?db.tables.map(t=>'<div class="table-metric"><b>'+esc(t.name)+'</b><small>'+(t.bytes===null?"Size unavailable":fmt(t.bytes/1024,1)+" KB")+'</small></div>').join(""):'<div class="empty-state">No table-size breakdown returned.</div>';$("rowCounts").innerHTML=Object.entries(d.counts||{}).map(([k,v])=>'<div class="row-count"><span>'+esc(k.replaceAll("_"," "))+'</span><b>'+fmt(v,0)+'</b></div>').join("");}catch(e){$("tableMetrics").innerHTML='<div class="notice error">'+esc(e.message)+'</div>';}}
-$("reloadSystem").onclick=loadSystem;
-$("scanNow").onclick=async()=>{$("scanNow").disabled=true;$("scanNow").textContent="Scanning…";try{const d=await api("/api/sync/now",{method:"POST"});notice("Monitor pass complete · "+fmt(d.traders_found,0)+" leaders updated · "+fmt(d.positions_checked,0)+" portfolios checked · "+fmt(d.observations_saved,0)+" positions saved.","success");await refreshOverview();bindPaperTabs();loadMarketUniverse();if(state.page==="traders")await loadTraders();if(state.page==="positions")await loadPositions();}catch(e){notice(e.message,"error");}finally{$("scanNow").disabled=false;$("scanNow").textContent="↻ Scan now";}};
+click("reloadSystem",loadSystem);
+click("scanNow",async()=>{$("scanNow").disabled=true;$("scanNow").textContent="Scanning…";try{const d=await api("/api/sync/now",{method:"POST"});notice("Monitor pass complete · "+fmt(d.traders_found,0)+" leaders updated · "+fmt(d.positions_checked,0)+" portfolios checked · "+fmt(d.observations_saved,0)+" positions saved.","success");await refreshOverview();bindPaperTabs();loadMarketUniverse();if(state.page==="traders")await loadTraders();if(state.page==="positions")await loadPositions();}catch(e){notice(e.message,"error");}finally{$("scanNow").disabled=false;$("scanNow").textContent="↻ Scan now";}};
 setInterval(()=>{if(state.page==="market"){loadMarket(true);loadMarketUniverse();}},900000);
 async function boot(){
  await refreshOverview();
@@ -305,4 +314,4 @@ async function boot(){
   if(state.page==="opportunities")await loadOpportunities();
  },60000);
 }
-boot();
+window.addEventListener("load",()=>boot().catch(e=>notice("LAES boot failed: "+e.message,"error")));
