@@ -2846,8 +2846,8 @@ async def api_paper():
         "correlated_exposure_groups": correlated_groups,
         "recovery_audit": {
             "complete": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version") == 7),
-            "pending": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version") != 6),
-            "version5_or_older": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version") != 6),
+            "pending": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version") != 7),
+            "version6_or_older": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version", 0) < 7),
             "blocked": bool(binance_rest_status().get("blocked")),
             "remaining_seconds": binance_rest_status().get("remaining_seconds"),
             "blocked_until": binance_rest_status().get("blocked_until")
