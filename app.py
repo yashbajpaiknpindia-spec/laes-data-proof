@@ -2971,6 +2971,7 @@ def build_new_exit_policy_replay(trades: list[PaperTrade], cfg: dict) -> dict:
             while next_checkpoint < len(checkpoint_hours) and elapsed >= checkpoint_hours[next_checkpoint]:
                 checkpoints.append({"target_hours": checkpoint_hours[next_checkpoint],
                     "observed_at": datetime.fromtimestamp(at_ms / 1000, timezone.utc).isoformat(),
+                    "actual_elapsed_hours": round(elapsed, 3),
                     "mark_price": close, "net_pnl_estimate": p["net_estimate"],
                     "status": "MARK_TO_MARKET_NOT_REALIZED"})
                 next_checkpoint += 1
