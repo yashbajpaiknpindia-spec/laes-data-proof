@@ -796,9 +796,9 @@ async def monitor_worker() -> None:
         last_open_leader_refresh = time.monotonic()
         while True:
             await asyncio.sleep(60)
-            if time.monotonic() - last_recovery_audit >= 600:
+            if time.monotonic() - last_recovery_audit >= 300:
                 try:
-                    audit = await run_post_exit_recovery_audit(max_trades=5)
+                    audit = await run_post_exit_recovery_audit(max_trades=20)
                     audit_ok = audit.get("failures", 0) == 0 and not audit.get("blocked", False)
                     log_check("post_exit_recovery_audit", audit_ok, 429 if audit.get("blocked") else 200 if audit_ok else 207, None, f"attempted={audit.get('attempted', 0)} audited={audit.get('audited', 0)} recovered_to_profit={audit.get('recovered_to_profit', 0)} failures={audit.get('failures', 0)} pending={audit.get('pending', 0)} status={audit.get('status')}")
                 except Exception as audit_exc:
