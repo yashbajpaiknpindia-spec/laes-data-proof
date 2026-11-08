@@ -34,7 +34,7 @@ async function refreshOverview(){
  const d=await api("/api/overview");state.overview=d;const m=d.monitor||{};
  $("mTraders").textContent=fmt(d.traders,0);$("mPositions").textContent=fmt(d.live_positions??0,0);$("mUnderwater").textContent=fmt(d.underwater_live_positions??0,0);$("mPaperOpen").textContent=fmt(d.open_paper_trades,0);
  $("mPositionsFoot").textContent=fmt(d.stale_visible_trader_snapshots??0,0)+" stale leader snapshots excluded · 15m freshness window";
- $("navTraderCount").textContent=fmt(d.traders,0);$("navPaperCount").textContent=fmt(d.open_paper_trades,0);$("navPositionCount").textContent=fmt(d.live_positions??0,0);
+ $("navTraderCount").textContent=fmt(d.traders,0);$("navPaperCount").textContent=fmt(d.open_paper_trades,0);$("navPositionCount").textContent=fmt(d.live_positions??0,0);$("topLeaderCount").textContent=fmt(d.live_positions??0,0);
  $("sideStatus").textContent=m.worker_alive?"Automatic monitor running":"Monitor starting / sleeping";$("sidePulse").className="pulse "+(m.worker_alive?"on":"");
  $("monitorBadge").textContent=m.state||"INITIALIZING";$("monitorBadge").className="pill "+(m.state==="idle"?"ok":m.state==="error"?"warn":"");
  $("lastScan").textContent=m.finished_at?date(m.finished_at):"Waiting for first scan";$("nextScan").textContent="Discovery cadence "+Math.round((m.interval_seconds||1800)/60)+" min · up to "+(m.position_batch_per_cycle||5)+" leaders per pass";
@@ -96,7 +96,7 @@ async function loadPositions(){
 click("reloadPositions",loadPositions);
 async function loadOpportunities(){
  $("opportunityList").innerHTML='<div class="empty-state">Analyzing actual positions against Binance market data…</div>';
- try{const items=await api("/api/opportunities?limit=100");const qual=items.filter(o=>o.qualified);$("navOppCount").textContent=fmt(qual.length,0);
+ try{const items=await api("/api/opportunities?limit=100");const qual=items.filter(o=>o.qualified);$("navOppCount").textContent=fmt(qual.length,0);$("topOppCount").textContent=fmt(items.length,0);
  if(!items.length){$("opportunityList").innerHTML='<div class="empty-state">No observed positions yet. Scanner does not create hypothetical opportunities.</div>';return;}
  $("opportunityList").innerHTML=items.map(o=>{
  const rec=o.recovery||{},hold=o.holding||{},causes=[...(o.likely_causes||[]),...(o.dead_market_reasons||[]).map(reason=>({label:'ENTRY BLOCKED',effect:reason,risk:'adverse'}))];
@@ -121,7 +121,16 @@ async function loadPaper(){
   $("paperOpenTrades").innerHTML=open.length?open.map(t=>row(t,false)).join():'<tr><td colspan="10" class="empty-cell">No open paper positions.</td></tr>';
   $("paperClosedTrades").innerHTML=closed.length?closed.map(t=>row(t,true)).join():'<tr><td colspan="10" class="empty-cell">No closed paper positions.</td></tr>';
   $("paperRiskClusters").innerHTML=(d.risk_clusters||[]).map(x=>'<div class="analysis-line"><span>'+esc(x.symbol)+' '+esc(x.side)+'</span><b>'+fmt(x.count,0)+' positions · '+money(x.net_pnl)+'</b></div>').join("")||'<div class="empty-state">No overlapping symbol/direction cluster currently needs attention.</div>';
-  $("paperShadowPortfolio").innerHTML=renderShadowPortfolio(d.shadow_portfolio);bindPaperTabs();
+  $("paperShadowPortfolio").innerHTML=renderShadowPortfolio(d.shadow_portfolio);
+  bindPaperTabs();
+  // A newly restarted/redeployed paper engine can legitimately have zero OPEN rows
+  // while the completed ledger remains populated. Show the completed ledger first
+  // in that case instead of presenting an apparently empty trading desk.
+  const preferredTab=open.length===0&&closed.length>0?"closed":
+    (document.querySelector(".paper-table-tab.active")?.dataset.paperTab||"open");
+  document.querySelectorAll(".paper-table-tab,.top-live-btn").forEach(x=>x.classList.toggle("active",x.dataset.paperTab===preferredTab));
+  $("paperOpenTable").style.display=preferredTab==="open"?"":"none";
+  $("paperClosedTable").style.display=preferredTab==="closed"?"":"none";
  }catch(e){notice("Paper ledger: "+e.message,"error")}finally{paperLoadInFlight=false}
 }
 function switchPaperTab(tab){
