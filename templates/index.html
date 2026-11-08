@@ -4,7 +4,7 @@
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#0a1018">
   <title>LAES · Intelligence Terminal</title>
-  <link rel="stylesheet" href="/static/style.css?v=6">
+  <link rel="stylesheet" href="/static/style.css?v=7">
 </head>
 <body>
 <div class="app-shell">
@@ -106,145 +106,9 @@
       <div id="opportunityList" class="opportunity-list"><div class="empty-state">The scanner needs observed public positions before it can calculate adverse excursions.</div></div>
     </section>
 
-    <div class="top-live-strip"><div class="top-live-title">LIVE PAPER</div><button class="top-live-btn active" data-paper-tab="open">OPEN POSITIONS <em id="topOpenCount">0</em></button><button class="top-live-btn" data-paper-tab="closed">CLOSED POSITIONS <em id="topClosedCount">0</em></button><button class="top-live-btn" data-goto="positions">LEADER POSITIONS <em id="topLeaderCount">0</em></button><button class="top-live-btn" data-goto="opportunities">OPPORTUNITIES <em id="topOppCount">0</em></button></div>
     <section class="page" id="page-paper">
       <div class="page-intro"><div><div class="section-kicker">SIMULATED EXECUTION · NO REAL ORDERS</div><h2>Paper trading desk</h2><p>Unconstrained research ledger plus a separate capital-constrained shadow replay. No exchange orders are placed.</p></div><span class="paper-state">● PAPER ENGINE ACTIVE</span></div>
-      <div class="paper-metrics">
-        <article class="metric-card"><div class="metric-label">RESEARCH CAPITAL BASE</div><div class="metric-value" id="paperCapital">—</div><div class="metric-foot">Configured paper portfolio capital · USDT</div></article>
-        <article class="metric-card"><div class="metric-label">RESEARCH MARGIN IN USE</div><div class="metric-value violet" id="paperMargin">—</div><div class="metric-foot" id="paperMarginFoot">Current open paper positions</div></article>
-        <article class="metric-card"><div class="metric-label">RESEARCH REALIZED NET PNL</div><div class="metric-value" id="paperRealized">—</div><div class="metric-foot">After estimated fees and slippage</div></article>
-        <article class="metric-card"><div class="metric-label">RESEARCH UNREALIZED NET PNL</div><div class="metric-value" id="paperUnrealized">—</div><div class="metric-foot">Marked to Binance public mark price</div></article>
-        <article class="metric-card"><div class="metric-label">RESEARCH FREE CAPITAL</div><div class="metric-value" id="paperFree">—</div><div class="metric-foot">Capital available for new simulations</div></article>
-        <article class="metric-card"><div class="metric-label">RESEARCH EQUITY</div><div class="metric-value green" id="paperEquity">—</div><div class="metric-foot">Capital + realized + unrealized PnL</div></article>
-      </div>
-      <div class="content-grid">
-        <article class="panel">
-          <div class="panel-heading"><div><div class="section-kicker">PORTFOLIO CONTROLS</div><h3>Paper capital & risk</h3><p>These parameters affect simulation only.</p></div></div>
-          <form id="paperSettings" class="settings-form">
-            <label>Research capital base <span>USDT</span><input name="capital_usdt" type="number" min="0" step="10" value="1000"></label>
-            <div class="form-grid">
-              <label>Risk per trade <span>% equity</span><input name="risk_pct" type="number" min="0.01" max="5" step="0.05" value="0.5"></label>
-              <label>Max margin per trade <span>% equity</span><input name="max_margin_pct" type="number" min="1" max="100" step="1" value="10"></label>
-              <label>Total research margin cap <span>% of paper capital · research mode can exceed shadow cap</span><input name="max_total_margin_pct" type="number" min="5" max="100" step="5" value="100"></label>
-              <label>Shadow portfolio margin cap <span>% of capital · realistic comparison only</span><input name="shadow_max_total_margin_pct" type="number" min="5" max="100" step="5" value="40"></label>
-              <label>Shadow max same-symbol / same-side positions <span>1 = only one ETH LONG at a time</span><input name="shadow_max_positions_per_symbol_direction" type="number" min="1" max="5" step="1" value="1"></label>
-              <label>Target <span>% from entry</span><input name="target_pct" type="number" min="0.05" step="0.05" value="0.7"></label>
-              <label>Stop loss <span>% from entry</span><input name="stop_pct" type="number" min="0.05" step="0.05" value="0.45"></label>
-              <label>Taker fee <span>% per side</span><input name="taker_fee_pct" type="number" min="0" step="0.005" value="0.05"></label>
-              <label>Slippage <span>% per side</span><input name="slippage_pct" type="number" min="0" step="0.005" value="0.02"></label>
-              <label>Leverage ceiling <span>×</span><input name="max_leverage" type="number" min="1" max="5" step="0.5" value="3"></label>
-              <label>Leader adverse threshold <span>% before entry can qualify</span><input name="min_adverse_pct" type="number" min="0.05" step="0.05" value="0.3"></label>
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="theme-color" content="#0a1018">
-  <title>LAES · Intelligence Terminal</title>
-  <link rel="stylesheet" href="/static/style.css?v=5">
-</head>
-<body>
-<div class="app-shell">
-  <aside class="sidebar">
-    <div class="brand"><div class="brand-mark">L</div><div><strong>LAES</strong><small>INTELLIGENCE TERMINAL</small></div></div>
-    <div class="side-status"><span class="pulse" id="sidePulse"></span><span id="sideStatus">Connecting monitor</span></div>
-    <nav class="nav">
-      <button class="nav-item active" data-page="overview"><span>◈</span> Overview</button>
-      <button class="nav-item" data-page="traders"><span>◎</span> Trader universe <em id="navTraderCount">0</em></button>
-      <button class="nav-item" data-page="positions"><span>⌁</span> Live positions <em id="navPositionCount">0</em></button>
-      <button class="nav-item" data-page="opportunities"><span>⌖</span> Opportunity scanner <em id="navOppCount">0</em></button>
-      <button class="nav-item" data-page="paper"><span>▣</span> Paper trading <em id="navPaperCount">0</em></button>
-      <button class="nav-item" data-page="market"><span>◷</span> Market & news</button>
-      <button class="nav-item" data-page="database"><span>▤</span> Database & system</button>
-    </nav>
-    <div class="sidebar-bottom">
-      <div class="execution-lock"><span>●</span><div><b>READ-ONLY SOURCES</b><small>Paper simulation only</small></div></div>
-      <small class="build-label">LAES ENGINE · V1.0</small>
-    </div>
-  </aside>
-
-  <main class="main">
-    <header class="topbar">
-      <div><div class="eyebrow">LEADER-ANCHORED ADVERSE EXCURSION SCALPING</div><h1 id="pageTitle">Overview</h1></div>
-      <div class="top-actions">
-        <div class="source-chip"><span class="source-dot" id="kopyonDot"></span><span>Kopyon</span><b id="kopyonState">Checking</b></div>
-        <div class="source-chip"><span class="source-dot" id="binanceDot"></span><span>Binance</span><b id="binanceState">Checking</b></div>
-        <button class="btn btn-primary" id="scanNow">↻ Scan now</button>
-      </div>
-    </header>
-
-    <div id="notice" class="notice hidden"></div>
-
-    <section class="page active" id="page-overview">
-      <div class="hero">
-        <div><div class="hero-kicker">LIVE RESEARCH SYSTEM <span class="live-badge"><i></i> MONITOR</span></div>
-          <h2>Find leaders under pressure.<br><span>Measure the path back.</span></h2>
-          <p>Publicly exposed Binance copy portfolios · independent market confirmation · paper-only execution model.</p>
-        </div>
-        <div class="hero-meta"><div class="meta-label">LAST MONITOR CYCLE</div><strong id="lastScan">Waiting for first scan</strong><small id="nextScan">Automatic discovery starts at service boot</small></div>
-      </div>
-
-      <div class="metric-grid">
-        <article class="metric-card"><div class="metric-label">DISCOVERED LEADERS</div><div class="metric-value" id="mTraders">—</div><div class="metric-foot" id="mTradersFoot">Live Kopyon leaderboard</div></article>
-        <article class="metric-card"><div class="metric-label">OPEN POSITION OBSERVATIONS</div><div class="metric-value" id="mPositions">—</div><div class="metric-foot" id="mPositionsFoot">Fresh visible leader snapshots · 15-minute freshness</div></article>
-        <article class="metric-card"><div class="metric-label">UNDERWATER POSITIONS</div><div class="metric-value red" id="mUnderwater">—</div><div class="metric-foot">Negative unrealized PnL or adverse entry-to-mark move</div></article>
-        <article class="metric-card"><div class="metric-label">QUALIFIED OPPORTUNITIES</div><div class="metric-value violet" id="mOpportunities">—</div><div class="metric-foot">Adverse excursion + 5m confirmation</div></article>
-        <article class="metric-card"><div class="metric-label">PAPER TRADES OPEN</div><div class="metric-value green" id="mPaperOpen">—</div><div class="metric-foot">Simulated positions, no exchange orders</div></article>
-        <article class="metric-card"><div class="metric-label">RESEARCH EQUITY</div><div class="metric-value" id="mPaperEquity">—</div><div class="metric-foot" id="mPaperPnl">USDT · includes unrealized simulation PnL</div></article>
-      </div>
-
-      <div class="content-grid">
-        <article class="panel wide">
-          <div class="panel-heading"><div><div class="section-kicker">AUTOMATION</div><h3>Monitor activity</h3><p>Discovery and position rotation run server-side; no browser token required.</p></div><span class="pill" id="monitorBadge">INITIALIZING</span></div>
-          <div class="monitor-steps">
-            <div class="monitor-step"><span class="step-icon">01</span><div><b>Discover public leaders</b><small id="stepDiscover">Waiting for provider response</small></div><span class="step-state" id="stepDiscoverState">—</span></div>
-            <div class="monitor-step"><span class="step-icon">02</span><div><b>Rotate open-position checks</b><small id="stepPositions">Up to five leaders per cycle</small></div><span class="step-state" id="stepPositionsState">—</span></div>
-            <div class="monitor-step"><span class="step-icon">03</span><div><b>Analyze market context</b><small>7-day candles, 24-hour trend, volatility and headline context</small></div><span class="step-state" id="stepMarketState">READY</span></div>
-            <div class="monitor-step"><span class="step-icon">04</span><div><b>Paper execution engine</b><small id="stepPaper">Automatic signals are simulated only</small></div><span class="step-state" id="stepPaperState">PAPER</span></div>
-          </div>
-        </article>
-        <article class="panel">
-          <div class="panel-heading"><div><div class="section-kicker">SOURCE HEALTH</div><h3>Data connections</h3><p>Credentials stay on the server.</p></div></div>
-          <div class="connection-row"><div class="connection-icon">K</div><div><b>Kopyon · Copy Trading</b><small>Trader profiles, rankings, positions and closed history</small></div><span class="connection-state" id="healthKopyon">Checking</span></div>
-          <div class="connection-row"><div class="connection-icon">B</div><div><b>Binance · Futures data</b><small>Mark price, funding and historical candles</small></div><span class="connection-state" id="healthBinance">Checking</span></div>
-          <div class="connection-row"><div class="connection-icon">P</div><div><b>PostgreSQL / database</b><small id="healthDatabaseDesc">Persistent research ledger</small></div><span class="connection-state" id="healthDatabase">Checking</span></div>
-        </article>
-      </div>
-
-      <div class="content-grid lower-grid">
-        <article class="panel wide">
-          <div class="panel-heading"><div><div class="section-kicker">LATEST SIGNALS</div><h3>Positions under pressure</h3><p>Only live observed positions are shown. Hidden portfolios are never fabricated.</p></div><button class="btn btn-subtle" data-goto="opportunities">Open scanner →</button></div>
-          <div id="overviewOpps" class="mini-opportunities"><div class="empty-state">Waiting for the first real public position snapshots.</div></div>
-        </article>
-        <article class="panel">
-          <div class="panel-heading"><div><div class="section-kicker">STORAGE</div><h3>Research database</h3><p>Actual database usage, not estimated record counts.</p></div><button class="btn btn-subtle" data-goto="database">Details →</button></div>
-          <div class="storage-usage"><div class="storage-value" id="dbUsed">—</div><div class="storage-caption">Database currently used</div></div>
-          <div class="storage-bar"><span id="dbBar" style="width:0%"></span></div>
-          <div class="inline-foot" id="dbCapacityNote">Checking storage telemetry</div>
-        </article>
-      </div>
-    </section>
-
-    <section class="page" id="page-traders">
-      <div class="page-intro"><div><div class="section-kicker">SOURCE: KOPYON · BINANCE COPY TRADING</div><h2>Trader universe</h2><p>Live leaderboard profiles, copier metrics, drawdown, profit share and position visibility.</p></div><div class="page-actions"><input id="traderSearch" class="search-input" placeholder="Search trader name or ID"><button class="btn btn-subtle" id="reloadTraders">Refresh list</button></div></div>
-      <div class="filter-row"><span id="traderListCount">Loading actual provider records…</span><span class="muted-note">No demo profiles · no synthetic PnL</span></div>
-      <div class="trader-grid" id="traderGrid"><div class="empty-state">Trader universe will populate when Kopyon discovery succeeds.</div></div>
-    </section>
-
-    <section class="page" id="page-positions">
-      <div class="page-intro"><div><div class="section-kicker">OBSERVED POSITION SNAPSHOTS</div><h2>Live positions</h2><p>Current reported position state, observation timestamp, unrealized loss and margin details.</p></div><button class="btn btn-subtle" id="reloadPositions">Refresh positions</button></div>
-      <div class="table-panel"><div class="table-scroll"><table><thead><tr><th>LEADER</th><th>SYMBOL</th><th>DIR.</th><th>ENTRY</th><th>MARK</th><th>UNREALIZED PNL</th><th>ADVERSE %</th><th>LEVERAGE</th><th>VISIBILITY / SEEN</th></tr></thead><tbody id="positionTable"><tr><td colspan="9" class="empty-cell">No real position observations stored yet.</td></tr></tbody></table></div></div>
-      <div class="footnote">An empty position array is not automatically treated as a closed trade. If Kopyon reports hidden=true, previous observations are preserved.</div>
-    </section>
-
-    <section class="page" id="page-opportunities">
-      <div class="page-intro"><div><div class="section-kicker">LEADER-ANCHORED ADVERSE EXCURSION</div><h2>Opportunity scanner</h2><p>Same-side entry candidates after a leader is already underwater, with market confirmation and evidence-based recovery stats.</p></div><button class="btn btn-primary" id="refreshOpps">↻ Analyze positions</button></div>
-      <div class="scanner-legend"><span class="legend-item"><i class="dot red-dot"></i> Underwater leader</span><span class="legend-item"><i class="dot violet-dot"></i> 5m reversal confirmation</span><span class="legend-item"><i class="dot green-dot"></i> Paper trade qualified</span></div>
-      <div id="opportunityList" class="opportunity-list"><div class="empty-state">The scanner needs observed public positions before it can calculate adverse excursions.</div></div>
-    </section>
-
     <div class="top-live-strip"><div class="top-live-title">LIVE PAPER</div><button class="top-live-btn active" data-paper-tab="open">OPEN POSITIONS <em id="topOpenCount">0</em></button><button class="top-live-btn" data-paper-tab="closed">CLOSED POSITIONS <em id="topClosedCount">0</em></button><button class="top-live-btn" data-goto="positions">LEADER POSITIONS <em id="topLeaderCount">0</em></button><button class="top-live-btn" data-goto="opportunities">OPPORTUNITIES <em id="topOppCount">0</em></button></div>
-    <section class="page" id="page-paper">
-      <div class="page-intro"><div><div class="section-kicker">SIMULATED EXECUTION · NO REAL ORDERS</div><h2>Paper trading desk</h2><p>Unconstrained research ledger plus a separate capital-constrained shadow replay. No exchange orders are placed.</p></div><span class="paper-state">● PAPER ENGINE ACTIVE</span></div>
       <div class="paper-metrics">
         <article class="metric-card"><div class="metric-label">RESEARCH CAPITAL BASE</div><div class="metric-value" id="paperCapital">—</div><div class="metric-foot">Configured paper portfolio capital · USDT</div></article>
         <article class="metric-card"><div class="metric-label">RESEARCH MARGIN IN USE</div><div class="metric-value violet" id="paperMargin">—</div><div class="metric-foot" id="paperMarginFoot">Current open paper positions</div></article>
@@ -315,5 +179,5 @@
 </div>
 
 <dialog id="traderDialog" class="trader-dialog"><div class="dialog-head"><div><div class="section-kicker">TRADER FORENSICS</div><h2 id="dialogName">Trader</h2><p id="dialogSub"></p></div><button class="icon-btn" id="closeDialog">×</button></div><div id="dialogBody"></div></dialog>
-<script src="/static/app.js?v=12"></script>
+<script src="/static/app.js?v=13"></script>
 </body></html>

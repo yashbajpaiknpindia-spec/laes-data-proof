@@ -8,7 +8,7 @@ window.addEventListener("unhandledrejection", e => {
 const bind=(id,event,fn)=>{const el=$(id);if(!el){console.warn("LAES missing DOM hook:",id);return false;}el.addEventListener(event,fn);return true;};
 const click=(id,fn)=>{const el=$(id);if(!el){console.warn("LAES missing DOM hook:",id);return false;}el.onclick=fn;return true;};
 const $=id=>document.getElementById(id);
-const state={page:"overview"};
+const state={page:"overview",paperTab:null};
 let paperDetailTimer=null;
 let paperLoadInFlight=false;
 const fmt=(v,d=2)=>v===null||v===undefined||v===""||Number.isNaN(Number(v))?"—":Number(v).toLocaleString(undefined,{maximumFractionDigits:d});
@@ -19,14 +19,32 @@ const duration=h=>h===null||h===undefined?"Unavailable":h<1?Math.round(h*60)+"m"
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 async function api(url,options={}){const r=await fetch(url,{headers:{"Content-Type":"application/json"},...options});let d={};try{d=await r.json()}catch{d={detail:await r.text()}}if(!r.ok)throw new Error(d.detail||"HTTP "+r.status);return d;}
 function notice(s,kind){const n=$("notice");n.textContent=s;n.className="notice "+(kind||"");n.classList.remove("hidden");clearTimeout(notice.timer);notice.timer=setTimeout(()=>n.classList.add("hidden"),9000);}
-function setPage(name){state.page=name;document.querySelectorAll(".page").forEach(x=>x.classList.toggle("active",x.id==="page-"+name));document.querySelectorAll(".nav-item").forEach(x=>x.classList.toggle("active",x.dataset.page===name));const t={overview:"Overview",traders:"Trader universe",positions:"Live positions",opportunities:"Opportunity scanner",paper:"Paper trading desk",market:"Market & news",database:"Database & system"};$("pageTitle").textContent=t[name]||"Overview";if(name==="overview")refreshOverview();if(name==="traders")loadTraders();if(name==="positions")loadPositions();if(name==="opportunities")loadOpportunities();if(name==="paper")loadPaper();if(name==="market")loadMarket(true);if(name==="database")loadSystem();}
-document.querySelectorAll(".nav-item").forEach(b=>b.addEventListener("click",()=>setPage(b.dataset.page)));
+function setPage(name, options={}) {
+ const page=document.getElementById("page-"+name);
+ if(!page){console.warn("LAES unknown page:",name);return false;}
+ state.page=name;
+ document.querySelectorAll(".page").forEach(x=>x.classList.toggle("active",x===page));
+ document.querySelectorAll(".nav-item").forEach(x=>x.classList.toggle("active",x.dataset.page===name));
+ const titles={overview:"Overview",traders:"Trader universe",positions:"Live positions",opportunities:"Opportunity scanner",paper:"Paper trading desk",market:"Market & news",database:"Database & system"};
+ $("pageTitle").textContent=titles[name]||"Overview";
+ if(options.scroll!==false)window.scrollTo({top:0,behavior:"auto"});
+ if(name==="overview")refreshOverview();
+ else if(name==="traders")loadTraders();
+ else if(name==="positions")loadPositions();
+ else if(name==="opportunities")loadOpportunities();
+ else if(name==="paper")loadPaper();
+ else if(name==="market"){loadMarket(false);loadMarketUniverse();}
+ else if(name==="database")loadSystem();
+ return true;
+}
 document.addEventListener("click",e=>{
- const b=e.target.closest("[data-goto]");
- if(!b)return;
- e.preventDefault();
- const target=b.dataset.goto;
- if(target)setPage(target);
+ const target=e.target instanceof Element?e.target:e.target?.parentElement;
+ const paperTab=target?.closest("[data-paper-tab]");
+ if(paperTab){e.preventDefault();switchPaperTab(paperTab.dataset.paperTab);return;}
+ const nav=target?.closest(".nav-item[data-page]");
+ if(nav){e.preventDefault();setPage(nav.dataset.page);return;}
+ const goto=target?.closest("[data-goto]");
+ if(goto){e.preventDefault();const pageName=goto.dataset.goto;if(pageName)setPage(pageName);return;}
 });
 function source(id,dot,ok,label){$(id).textContent=label;$(id).className="connection-state "+(ok===true?"ok":ok===false?"bad":"");$(dot).className="source-dot "+(ok===true?"ok":ok===false?"bad":"");}
 async function refreshOverview(){
@@ -122,12 +140,11 @@ async function loadPaper(){
   $("paperClosedTrades").innerHTML=closed.length?closed.map(t=>row(t,true)).join():'<tr><td colspan="10" class="empty-cell">No closed paper positions.</td></tr>';
   $("paperRiskClusters").innerHTML=(d.risk_clusters||[]).map(x=>'<div class="analysis-line"><span>'+esc(x.symbol)+' '+esc(x.side)+'</span><b>'+fmt(x.count,0)+' positions · '+money(x.net_pnl)+'</b></div>').join("")||'<div class="empty-state">No overlapping symbol/direction cluster currently needs attention.</div>';
   $("paperShadowPortfolio").innerHTML=renderShadowPortfolio(d.shadow_portfolio);
-  bindPaperTabs();
   // A newly restarted/redeployed paper engine can legitimately have zero OPEN rows
   // while the completed ledger remains populated. Show the completed ledger first
   // in that case instead of presenting an apparently empty trading desk.
-  const preferredTab=open.length===0&&closed.length>0?"closed":
-    (document.querySelector(".paper-table-tab.active")?.dataset.paperTab||"open");
+  const preferredTab=state.paperTab||(open.length===0&&closed.length>0?"closed":"open");
+  state.paperTab=preferredTab;
   document.querySelectorAll(".paper-table-tab,.top-live-btn").forEach(x=>x.classList.toggle("active",x.dataset.paperTab===preferredTab));
   $("paperOpenTable").style.display=preferredTab==="open"?"":"none";
   $("paperClosedTable").style.display=preferredTab==="closed"?"":"none";
@@ -135,23 +152,11 @@ async function loadPaper(){
 }
 function switchPaperTab(tab){
  if(tab!=="open"&&tab!=="closed")return;
+ if(state.page!=="paper")setPage("paper",{scroll:false});
+ state.paperTab=tab;
  document.querySelectorAll(".paper-table-tab,.top-live-btn").forEach(x=>x.classList.toggle("active",x.dataset.paperTab===tab));
  if($("paperOpenTable"))$("paperOpenTable").style.display=tab==="open"?"":"none";
  if($("paperClosedTable"))$("paperClosedTable").style.display=tab==="closed"?"":"none";
- if(state.page!=="paper")setPage("paper");
-}
-let paperTabsBound=false;
-function bindPaperTabs(){
- if(paperTabsBound)return;
- paperTabsBound=true;
- document.addEventListener("click",e=>{
-  const b=e.target.closest("[data-paper-tab]");
-  if(!b)return;
-  e.preventDefault();
-  e.stopPropagation();
-  switchPaperTab(b.dataset.paperTab);
-  window.scrollTo({top:0,behavior:"smooth"});
- });
 }
 function paperChartSvg(d){
  const candles=d.candles||[], path=d.path||[], leaderPath=d.leader_path||[], t=d.trade||{}, l=d.leader||{};
@@ -330,9 +335,35 @@ async function loadMarketUniverse(){
  const body=$("marketUniverseTable");if(!body)return;
  try{const d=await api("/api/market/universe");body.innerHTML=(d.rows||[]).map(x=>'<tr><td><b>'+esc(x.symbol)+'</b></td><td>'+fmt(x.mark_price,8)+'</td><td>'+fmt(x.momentum_5m_pct,3)+'%</td><td>'+fmt((x.funding_rate||0)*100,4)+'%</td><td>'+money(x.quote_volume_24h_usdt)+'</td><td><span class="status-tag '+(x.live_fresh?"positive":"neutral")+'">'+esc(x.status||"CACHED")+'</span></td></tr>').join("")||'<tr><td colspan="6" class="empty-cell">No market symbols available yet.</td></tr>';}catch(e){body.innerHTML='<tr><td colspan="6" class="empty-cell">'+esc(e.message)+'</td></tr>'}
 }
-async function loadSystem(){$("tableMetrics").innerHTML='<div class="empty-state">Reading database telemetry…</div>';try{const d=await api("/api/system"),db=d.database||{},m=d.monitor||{};$("dbEngine").textContent=(db.engine||"unknown").toUpperCase();$("dbUsedLarge").textContent=db.used_mb===null||db.used_mb===undefined?"Not reported":fmt(db.used_mb,3)+" MB";$("dbConnection").textContent="Connection: "+db.connection+" · persistent: "+(db.persistent?"yes":"no");$("dbCapacityLarge").textContent=db.capacity_note||"";$("dbBarLarge").style.width=db.configured_capacity_gb&&db.used_mb!==null?Math.min(100,db.used_mb/(db.configured_capacity_gb*1024)*100)+"%":"0%";$("workerState").textContent=m.worker_alive?"Running":"Not active";$("workerInterval").textContent=Math.round((m.interval_seconds||0)/60)+" minutes";$("workerBatch").textContent=(m.batch||0)+" traders / pass";$("workerLastState").textContent=m.state||"—";$("workerError").textContent=m.last_error||"None";$("runtimeCaveat").textContent=d.runtime?.render_free_sleep_warning||"";$("tableMetrics").innerHTML=db.tables?.length?db.tables.map(t=>'<div class="table-metric"><b>'+esc(t.name)+'</b><small>'+(t.bytes===null?"Size unavailable":fmt(t.bytes/1024,1)+" KB")+'</small></div>').join(""):'<div class="empty-state">No table-size breakdown returned.</div>';$("rowCounts").innerHTML=Object.entries(d.counts||{}).map(([k,v])=>'<div class="row-count"><span>'+esc(k.replaceAll("_"," "))+'</span><b>'+fmt(v,0)+'</b></div>').join("");}catch(e){$("tableMetrics").innerHTML='<div class="notice error">'+esc(e.message)+'</div>';}}
+async function loadSystem(){
+ $("tableMetrics").innerHTML='<div class="empty-state">Reading database telemetry…</div>';
+ try{
+  const [systemResult,healthResult,probeResult]=await Promise.allSettled([
+   api("/api/system"),api("/api/health"),api("/api/db/synthetic")
+  ]);
+  if(systemResult.status!=="fulfilled")throw systemResult.reason;
+  const d=systemResult.value,db=d.database||{},m=d.monitor||{};
+  const health=healthResult.status==="fulfilled"?healthResult.value:null;
+  const probe=probeResult.status==="fulfilled"?probeResult.value:null;
+  $("dbEngine").textContent=(db.engine||"unknown").toUpperCase();
+  $("dbUsedLarge").textContent=db.used_mb===null||db.used_mb===undefined?"Not reported":fmt(db.used_mb,3)+" MB";
+  const healthText=health?("API "+(health.status||"unknown")):("API probe failed: "+(healthResult.reason?.message||"unavailable"));
+  const probeText=probe?("DB read/write "+(probe.status||"unknown")+" · "+fmt(probe.latency_ms,0)+" ms"):("DB read/write probe failed: "+(probeResult.reason?.message||"unavailable"));
+  $("dbConnection").textContent="Connection: "+(db.connection||"unknown")+" · persistent: "+(db.persistent?"yes":"no")+" · "+healthText+" · "+probeText;
+  $("dbCapacityLarge").textContent=db.capacity_note||"";
+  $("dbBarLarge").style.width=db.configured_capacity_gb&&db.used_mb!==null?Math.min(100,db.used_mb/(db.configured_capacity_gb*1024)*100)+"%":"0%";
+  $("workerState").textContent=m.worker_alive?"Running":"Not active";
+  $("workerInterval").textContent=Math.round((m.interval_seconds||0)/60)+" minutes";
+  $("workerBatch").textContent=(m.batch||0)+" traders / pass";
+  $("workerLastState").textContent=m.state||"—";
+  $("workerError").textContent=m.last_error||"None";
+  $("runtimeCaveat").textContent=d.runtime?.render_free_sleep_warning||"";
+  $("tableMetrics").innerHTML=db.tables?.length?db.tables.map(t=>'<div class="table-metric"><b>'+esc(t.name)+'</b><small>'+(t.bytes===null?"Size unavailable":fmt(t.bytes/1024,1)+" KB")+'</small></div>').join(""):'<div class="empty-state">No table-size breakdown returned.</div>';
+  $("rowCounts").innerHTML=Object.entries(d.counts||{}).map(([k,v])=>'<div class="row-count"><span>'+esc(k.replaceAll("_"," "))+'</span><b>'+fmt(v,0)+'</b></div>').join("");
+ }catch(e){$("tableMetrics").innerHTML='<div class="notice error">'+esc(e.message)+'</div>';}
+}
 click("reloadSystem",loadSystem);
-click("scanNow",async()=>{$("scanNow").disabled=true;$("scanNow").textContent="Scanning…";try{const d=await api("/api/sync/now",{method:"POST"});notice("Monitor pass complete · "+fmt(d.traders_found,0)+" leaders updated · "+fmt(d.positions_checked,0)+" portfolios checked · "+fmt(d.observations_saved,0)+" positions saved.","success");await refreshOverview();bindPaperTabs();loadMarketUniverse();if(state.page==="traders")await loadTraders();if(state.page==="positions")await loadPositions();}catch(e){notice(e.message,"error");}finally{$("scanNow").disabled=false;$("scanNow").textContent="↻ Scan now";}});
+click("scanNow",async()=>{$("scanNow").disabled=true;$("scanNow").textContent="Scanning…";try{const d=await api("/api/sync/now",{method:"POST"});notice("Monitor pass complete · "+fmt(d.traders_found,0)+" leaders updated · "+fmt(d.positions_checked,0)+" portfolios checked · "+fmt(d.observations_saved,0)+" positions saved.","success");await refreshOverview();if(state.page==="market")loadMarketUniverse();if(state.page==="traders")await loadTraders();if(state.page==="positions")await loadPositions();}catch(e){notice(e.message,"error");}finally{$("scanNow").disabled=false;$("scanNow").textContent="↻ Scan now";}});
 setInterval(()=>{if(state.page==="market"){loadMarket(true);loadMarketUniverse();}},900000);
 async function boot(){
  await refreshOverview();
@@ -346,5 +377,5 @@ async function boot(){
   if(state.page==="opportunities")await loadOpportunities();
  },60000);
 }
-bindPaperTabs();
+
 window.addEventListener("load",()=>boot().catch(e=>notice("LAES boot failed: "+e.message,"error")));
