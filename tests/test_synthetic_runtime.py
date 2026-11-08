@@ -91,7 +91,7 @@ class SyntheticRuntimeAuditTests(unittest.TestCase):
             db.add(app.Trader(trader_id="T3", name="Profit Leader"))
             db.commit()
         trade_id = self._open_trade("T3")
-        app.evaluate_open_paper_trades(prices={"BTCUSDT": 100.20})
+        asyncio.run(app.evaluate_open_paper_trades(prices={"BTCUSDT": 100.20}))
         with app.SessionLocal() as db:
             trade = db.get(app.PaperTrade, trade_id)
             self.assertEqual(trade.status, "CLOSED")
@@ -115,7 +115,7 @@ class SyntheticRuntimeAuditTests(unittest.TestCase):
             db.add(app.Trader(trader_id="T4", name="Cost Leader"))
             db.commit()
         trade_id = self._open_trade("T4")
-        app.evaluate_open_paper_trades(prices={"BTCUSDT": 100.05})
+        asyncio.run(app.evaluate_open_paper_trades(prices={"BTCUSDT": 100.05}))
         with app.SessionLocal() as db:
             trade = db.get(app.PaperTrade, trade_id)
             self.assertEqual(trade.status, "OPEN")
