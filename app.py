@@ -2874,9 +2874,16 @@ def build_new_exit_policy_replay(trades: list[PaperTrade], cfg: dict) -> dict:
         ).order_by(PositionObservation.snapshot_id, PositionObservation.id)).all() if snapshot_ids else []
     obs_by_snapshot: dict[int, list[PositionObservation]] = {}
     snaps_by_trader: dict[str, list[PositionSnapshot]] = {}
+    complete_snapshot_ids: set[int] = set()
     for obs in observations:
         obs_by_snapshot.setdefault(obs.snapshot_id, []).append(obs)
     for snap in snapshots:
+        # A visible HTTP response without a positions list is not a visible-empty
+        # portfolio. Only provider responses with an explicit positions array
+        # may advance the two-consecutive-omissions closure rule.
+        snapshot_payload = unwrap_data(parse_json(snap.raw_json))
+        if not snap.hidden and isinstance(snapshot_payload.get("positions"), list):
+            complete_snapshot_ids.add(snap.id)
         snaps_by_trader.setdefault(snap.trader_id, []).append(snap)
 
     def pnl_at(trade: PaperTrade, raw: dict, mark: float, at: datetime) -> dict:
@@ -2930,13 +2937,6 @@ def build_new_exit_policy_replay(trades: list[PaperTrade], cfg: dict) -> dict:
             and abs((old_exit - checked_at).total_seconds()) <= 300
         )
         timeline = snaps_by_trader.get(trade.trader_id, [])
-        if not baseline_open:
-            for snap in timeline:
-                snap_at = _shadow_dt(snap.observed_at)
-                if snap_at is None or snap_at > old_exit:
-                    break
-                if not snap.hidden and any(o.position_key == leader_key for o in obs_by_snapshot.get(snap.id, [])):
-                    baseline_open = True
         common = {
             "trade_id": trade.id, "trader_id": trade.trader_id, "trader_name": trade.trader_name,
             "symbol": trade.symbol, "side": trade.side, "old_exit_at": old_exit.isoformat(),
@@ -2957,7 +2957,7 @@ def build_new_exit_policy_replay(trades: list[PaperTrade], cfg: dict) -> dict:
         exit_price = exit_at = exit_detected_at = exit_reason = exit_quality = None
         for snap in timeline:
             snap_at = _shadow_dt(snap.observed_at)
-            if snap_at is None or snap_at <= old_exit or snap.hidden:
+            if snap_at is None or snap_at <= old_exit or snap.id not in complete_snapshot_ids:
                 continue
             rows = obs_by_snapshot.get(snap.id, [])
             exact = next((o for o in rows if o.position_key == leader_key), None)
@@ -3023,6 +3023,8 @@ def build_new_exit_policy_replay(trades: list[PaperTrade], cfg: dict) -> dict:
         "old_system_realized_net_pnl": round(old_total, 8), "old_system_closed_trades": len(closed),
         "old_system_profitable_trades": old_wins, "old_system_losing_trades": old_losses,
         "new_system_realized_net_pnl": round(sum(float(x["new_research_realized_net_pnl"]) for x in valued), 8),
+        "new_system_replayed_attempts": len(result_rows),
+        "new_system_exits_observed": len(completed),
         "new_system_replayed_closed_trades": len(valued),
         "new_system_profitable_trades": sum(1 for x in valued if x["new_research_realized_net_pnl"] > 0),
         "new_system_losing_trades": sum(1 for x in valued if x["new_research_realized_net_pnl"] < 0),
