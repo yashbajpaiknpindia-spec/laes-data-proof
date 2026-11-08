@@ -66,8 +66,8 @@ class ClosedTradeForensicsTests(unittest.TestCase):
         self.assertIn('"old_system_realized_net_pnl"', APP)
         self.assertIn('"new_policy_exit_net_pnl_estimate"', APP)
         self.assertIn('RESEARCH REALIZED ACCORDING TO OLD SYSTEM', JS)
-        self.assertIn('RESEARCH REALIZED NET PNL ACCORDING TO NEW SYSTEM', JS)
-        self.assertIn('Stored Kopyon position snapshots', APP)
+        self.assertIn('COUNTERFACTUAL POLICY-EXIT NET ESTIMATE', JS)
+        self.assertIn('Persisted Binance USD-M mark-price 1m OHLC candles', APP)
 
     def test_profit_and_loss_colours_are_bold_and_consistent(self):
         self.assertIn('.pnl-positive{color:var(--green)', CSS)
