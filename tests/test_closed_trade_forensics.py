@@ -19,8 +19,8 @@ class ClosedTradeForensicsTests(unittest.TestCase):
         self.assertIn('id="paperLatestTrades"', HTML)
 
     def test_historical_audit_is_versioned_resumable_and_rate_limit_aware(self):
-        self.assertIn('"post_exit_recovery_audit_version": 6', APP)
-        self.assertIn('pending = [t for t in closed if parse_json(t.raw_json).get("post_exit_recovery_audit_version", 0) != 6]', APP)
+        self.assertIn('"post_exit_recovery_audit_version": 7', APP)
+        self.assertIn('pending = [t for t in closed if parse_json(t.raw_json).get("post_exit_recovery_audit_version", 0) != 7]', APP)
         self.assertIn('cooldown = binance_rest_status()', APP)
         self.assertIn('if cooldown.get("blocked"):', APP)
         self.assertIn('attempted >= max(1, min(20, int(max_trades)))', APP)
@@ -30,19 +30,19 @@ class ClosedTradeForensicsTests(unittest.TestCase):
         self.assertIn('audit_ok = audit.get("failures", 0) == 0 and not audit.get("blocked", False)', APP)
         self.assertIn("pending=", APP)
 
-    def test_replay_requires_leader_open_evidence_at_the_old_exit(self):
-        self.assertIn('raw.get("leader_state_at_check") == "OPEN_OBSERVED"', APP)
-        self.assertIn('abs((old_exit - checked_at).total_seconds()) <= 300', APP)
-        self.assertIn('complete_snapshot_ids', APP)
-        self.assertIn('snapshot_payload.get("positions"), list', APP)
-        self.assertIn('missing >= 2', APP)
-        self.assertIn('snap.hidden', APP)
+    def test_replay_uses_binance_candle_paths_for_every_closed_trade(self):
+        self.assertIn("post_exit_mark_candles", APP)
+        self.assertIn("MISSING_VERIFIED_BINANCE_CANDLES", APP)
+        self.assertIn("PROFIT_HARVEST_NET_POSITIVE", APP)
+        self.assertIn("PROTECTIVE_STOP_AFTER_LEADER_CLOSE_OR_UNKNOWN", APP)
+        self.assertNotIn("EXCLUDED_NO_LEADER_OPEN_EVIDENCE_AT_OLD_EXIT", APP)
+        self.assertIn("omissions do not prove closure", APP)
 
     def test_replay_never_counts_last_observation_open_position_as_realized(self):
-        self.assertIn('"LEADER_STILL_OPEN_AT_LAST_OBSERVATION"', APP)
-        self.assertIn('"new_unrealized_net_pnl": p["net"]', APP)
-        self.assertIn('"new_research_realized_net_pnl": p["net"]', APP)
-        self.assertIn('"new_system_open_leader_trades"', APP)
+        self.assertIn('"OPEN_UNREALIZED_AT_LAST_CANDLE"', APP)
+        self.assertIn('"new_unrealized_net_pnl_estimate": p["net_estimate"]', APP)
+        self.assertIn('"new_policy_net_pnl_estimate": p["net_estimate"]', APP)
+        self.assertIn('"new_policy_open_unrealized_count"', APP)
 
     def test_per_attempt_financial_and_timing_fields_are_returned(self):
         for key in ("attempt_number", "gross_pnl", "estimated_costs", "net_pnl",
@@ -64,7 +64,7 @@ class ClosedTradeForensicsTests(unittest.TestCase):
     def test_new_vs_old_research_pnl_is_visible_and_labelled(self):
         self.assertIn('@app.get("/api/paper/research-replay")', APP)
         self.assertIn('"old_system_realized_net_pnl"', APP)
-        self.assertIn('"new_system_realized_net_pnl"', APP)
+        self.assertIn('"new_policy_exit_net_pnl_estimate"', APP)
         self.assertIn('RESEARCH REALIZED ACCORDING TO OLD SYSTEM', JS)
         self.assertIn('RESEARCH REALIZED NET PNL ACCORDING TO NEW SYSTEM', JS)
         self.assertIn('Stored Kopyon position snapshots', APP)
