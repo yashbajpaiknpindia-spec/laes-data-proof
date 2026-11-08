@@ -27,7 +27,7 @@ jobs:
         run: node --check static/app.js
       - name: Build offline ZIP
         run: |
-          zip -r LAES-offline-release-candidate.zip . \
+          zip -r /tmp/LAES-offline-release-candidate.zip . \
             -x ".git/*" ".env" ".venv/*" "__pycache__/*" "*.pyc" "*.db" ".pytest_cache/*"
       - uses: actions/upload-artifact@v4
         with:
