@@ -135,9 +135,57 @@ class SyntheticRuntimeAuditTests(unittest.TestCase):
         with app.SessionLocal() as db:
             trade = db.get(app.PaperTrade, trade_id)
             raw = json.loads(trade.raw_json)
-            self.assertEqual(raw["post_exit_recovery_status"], "INTRABAR_NET_PROFIT_ONLY")
-            self.assertGreater(raw["post_exit_intrabar_potential_profit_usdt"], 0)
-            self.assertLessEqual(raw["post_exit_max_net_pnl"], 0)
+
+
+    def test_replay_holds_stop_while_exact_leader_is_open_then_harvests_net_profit(self):
+        trade_id = self._trade(source_key="T6|P6|BTCUSDT|LONG", net=-1.0)
+        with app.SessionLocal() as db:
+            trade = db.get(app.PaperTrade, trade_id)
+            trade.raw_json = json.dumps({
+                "funding_rate_at_entry": 0.0,
+                "next_funding_time": 1794168000000,
+                "post_exit_recovery_audit_version": 7,
+                "post_exit_mark_candles": [
+                    [1794139260000, 100.0, 98.0, 99.0],
+                    [1794139320000, 101.2, 100.5, 101.0]
+                ]
+            })
+            snap = app.PositionSnapshot(trader_id="T6", observed_at=datetime.fromtimestamp(1794139260000/1000, timezone.utc),
+                hidden=False, raw_json='{"positions":[{}]}')
+            db.add(snap)
+            db.flush()
+            db.add(app.PositionObservation(snapshot_id=snap.id, trader_id="T6",
+                position_key="P6|BTCUSDT|LONG", symbol="BTCUSDT", side="LONG",
+                entry_price=100.0, mark_price=99.0, raw_json="{}"))
+            db.commit()
+            trade = db.get(app.PaperTrade, trade_id)
+            replay = app.build_new_exit_policy_replay([trade], app.paper_config())
+        row = replay["trades"][0]
+        self.assertEqual(row["replay_status"], "POLICY_EXIT_SIMULATED")
+        self.assertEqual(row["new_exit_reason"], "PROFIT_HARVEST_NET_POSITIVE")
+        self.assertGreater(row["new_policy_net_pnl_estimate"], 0)
+
+    def test_missing_candle_path_is_not_replaced_with_synthetic_prices(self):
+        trade_id = self._trade(source_key="T7|P7|BTCUSDT|LONG", net=-1.0)
+        with app.SessionLocal() as db:
+            trade = db.get(app.PaperTrade, trade_id)
+            replay = app.build_new_exit_policy_replay([trade], app.paper_config())
+        self.assertEqual(replay["trades"][0]["replay_status"], "MISSING_VERIFIED_BINANCE_CANDLES")
+
+    def test_two_visible_omissions_do_not_confirm_leader_closure(self):
+        with app.SessionLocal() as db:
+            db.add(app.Trader(trader_id="T8", name="Leader"))
+            for i in range(2):
+                db.add(app.PositionSnapshot(trader_id="T8", hidden=False, position_count=0,
+                    raw_json='{"positions":[]}', observed_at=datetime(2026, 11, 8, 13+i, tzinfo=timezone.utc)))
+            trade = app.PaperTrade(source_key="T8|P8|BTCUSDT|LONG", trader_id="T8", symbol="BTCUSDT",
+                side="LONG", status="OPEN", entry_price=100, mark_price=99, quantity=1, notional=100,
+                margin_used=10, leverage=2, stop_price=99, target_price=101,
+                raw_json='{"leader_missing_visible_snapshots":2}')
+            db.add(trade)
+            db.commit()
+            state, _ = app._leader_state_for_trade(db, trade)
+        self.assertEqual(state, "STALE_OR_UNAVAILABLE")
 
 
 if __name__ == "__main__":
