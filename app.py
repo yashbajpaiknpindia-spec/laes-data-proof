@@ -319,6 +319,17 @@ def migrate_paper_audit_metadata() -> None:
             .group_by(PaperTradePath.paper_trade_id)
         ).all()
         max_gaps = {int(trade_id): float(gap or 0.0) for trade_id, gap in gap_rows}
+        leader_checks = {}
+        for open_trade in [item for item in trades if item.status == "OPEN"]:
+            leader_state, leader_detail = _leader_state_for_trade(db, open_trade)
+            latest_visible = db.scalar(select(PositionSnapshot).where(
+                PositionSnapshot.trader_id == open_trade.trader_id
+            ).order_by(desc(PositionSnapshot.id)).limit(1))
+            leader_checks[open_trade.id] = {
+                "status": leader_state, "detail": leader_detail,
+                "checked_at": latest_visible.observed_at.isoformat() if latest_visible else None,
+                "source": "LATEST_VISIBLE_KOPYON_SNAPSHOT" if latest_visible else "NO_LEADER_SNAPSHOT"
+            }
 
         for trade in trades:
             raw = parse_json(trade.raw_json)
@@ -2800,9 +2811,10 @@ async def api_paper():
             "post_exit_recovery_audit_status": raw.get("post_exit_recovery_audit_status", "PENDING"),
             "last_leader_check_at": raw.get("last_leader_check_at"),
             "leader_state_checked_at": raw.get("leader_state_checked_at"),
-            "leader_state_detail": raw.get("leader_state_detail"),
-            "leader_status": raw.get("leader_state_at_check") or raw.get("leader_status") or "NOT_CHECKED",
-            "leader_check_source": "KOPYON_VISIBLE_POSITION_SNAPSHOT" if raw.get("leader_state_checked_at") or raw.get("last_leader_check_at") else "NO_STORED_CHECK",
+            "leader_state_detail": leader_checks.get(trade.id, {}).get("detail") or raw.get("leader_state_detail"),
+            "leader_status": leader_checks.get(trade.id, {}).get("status") or raw.get("leader_state_at_check") or raw.get("leader_status") or "NOT_CHECKED",
+            "leader_check_source": leader_checks.get(trade.id, {}).get("source") or ("KOPYON_VISIBLE_POSITION_SNAPSHOT" if raw.get("leader_state_checked_at") or raw.get("last_leader_check_at") else "NO_STORED_CHECK"),
+            "leader_check_at": leader_checks.get(trade.id, {}).get("checked_at") or raw.get("leader_state_checked_at") or raw.get("last_leader_check_at"),
             "opened_at": trade.opened_at.isoformat(),
             "closed_at": trade.closed_at.isoformat() if trade.closed_at else None
         })
@@ -2817,6 +2829,14 @@ async def api_paper():
         "free_capital": round(max(0.0, equity - deployed_margin), 8),
         "open_count": len(open_trades), "closed_count": len(closed_trades),
         "correlated_exposure_groups": correlated_groups,
+        "recovery_audit": {
+            "complete": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version") == 6),
+            "pending": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version") != 6),
+            "version5_or_older": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version") != 6),
+            "blocked": bool(binance_rest_status().get("blocked")),
+            "remaining_seconds": binance_rest_status().get("remaining_seconds"),
+            "blocked_until": binance_rest_status().get("blocked_until")
+        },
         "shadow_portfolio": shadow_portfolio,
         "price_feed": {
             "status": PAPER_PRICE_STREAM_STATE.get("status"),
@@ -3028,6 +3048,12 @@ async def api_paper_research_replay():
     with SessionLocal() as db:
         closed = db.scalars(select(PaperTrade).where(PaperTrade.status == "CLOSED").order_by(PaperTrade.opened_at, PaperTrade.id)).all()
     return build_new_exit_policy_replay(closed, cfg)
+
+
+@app.post("/api/paper/audit/recovery")
+async def api_paper_run_recovery_audit():
+    """Run one bounded, resumable batch of the historical 1m market recovery audit."""
+    return await run_post_exit_recovery_audit(max_trades=5)
 
 
 @app.get("/api/paper/{trade_id}")
