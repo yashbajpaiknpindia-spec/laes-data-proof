@@ -335,7 +335,33 @@ async function loadMarketUniverse(){
  const body=$("marketUniverseTable");if(!body)return;
  try{const d=await api("/api/market/universe");body.innerHTML=(d.rows||[]).map(x=>'<tr><td><b>'+esc(x.symbol)+'</b></td><td>'+fmt(x.mark_price,8)+'</td><td>'+fmt(x.momentum_5m_pct,3)+'%</td><td>'+fmt((x.funding_rate||0)*100,4)+'%</td><td>'+money(x.quote_volume_24h_usdt)+'</td><td><span class="status-tag '+(x.live_fresh?"positive":"neutral")+'">'+esc(x.status||"CACHED")+'</span></td></tr>').join("")||'<tr><td colspan="6" class="empty-cell">No market symbols available yet.</td></tr>';}catch(e){body.innerHTML='<tr><td colspan="6" class="empty-cell">'+esc(e.message)+'</td></tr>'}
 }
-async function loadSystem(){$("tableMetrics").innerHTML='<div class="empty-state">Reading database telemetry…</div>';try{const d=await api("/api/system"),db=d.database||{},m=d.monitor||{};$("dbEngine").textContent=(db.engine||"unknown").toUpperCase();$("dbUsedLarge").textContent=db.used_mb===null||db.used_mb===undefined?"Not reported":fmt(db.used_mb,3)+" MB";$("dbConnection").textContent="Connection: "+db.connection+" · persistent: "+(db.persistent?"yes":"no");$("dbCapacityLarge").textContent=db.capacity_note||"";$("dbBarLarge").style.width=db.configured_capacity_gb&&db.used_mb!==null?Math.min(100,db.used_mb/(db.configured_capacity_gb*1024)*100)+"%":"0%";$("workerState").textContent=m.worker_alive?"Running":"Not active";$("workerInterval").textContent=Math.round((m.interval_seconds||0)/60)+" minutes";$("workerBatch").textContent=(m.batch||0)+" traders / pass";$("workerLastState").textContent=m.state||"—";$("workerError").textContent=m.last_error||"None";$("runtimeCaveat").textContent=d.runtime?.render_free_sleep_warning||"";$("tableMetrics").innerHTML=db.tables?.length?db.tables.map(t=>'<div class="table-metric"><b>'+esc(t.name)+'</b><small>'+(t.bytes===null?"Size unavailable":fmt(t.bytes/1024,1)+" KB")+'</small></div>').join(""):'<div class="empty-state">No table-size breakdown returned.</div>';$("rowCounts").innerHTML=Object.entries(d.counts||{}).map(([k,v])=>'<div class="row-count"><span>'+esc(k.replaceAll("_"," "))+'</span><b>'+fmt(v,0)+'</b></div>').join("");}catch(e){$("tableMetrics").innerHTML='<div class="notice error">'+esc(e.message)+'</div>';}}
+async function loadSystem(){
+ $("tableMetrics").innerHTML='<div class="empty-state">Reading database telemetry…</div>';
+ try{
+  const [systemResult,healthResult,probeResult]=await Promise.allSettled([
+   api("/api/system"),api("/api/health"),api("/api/db/synthetic")
+  ]);
+  if(systemResult.status!=="fulfilled")throw systemResult.reason;
+  const d=systemResult.value,db=d.database||{},m=d.monitor||{};
+  const health=healthResult.status==="fulfilled"?healthResult.value:null;
+  const probe=probeResult.status==="fulfilled"?probeResult.value:null;
+  $("dbEngine").textContent=(db.engine||"unknown").toUpperCase();
+  $("dbUsedLarge").textContent=db.used_mb===null||db.used_mb===undefined?"Not reported":fmt(db.used_mb,3)+" MB";
+  const healthText=health?("API "+(health.status||"unknown")):("API probe failed: "+(healthResult.reason?.message||"unavailable"));
+  const probeText=probe?("DB read/write "+(probe.status||"unknown")+" · "+fmt(probe.latency_ms,0)+" ms"):("DB read/write probe failed: "+(probeResult.reason?.message||"unavailable"));
+  $("dbConnection").textContent="Connection: "+(db.connection||"unknown")+" · persistent: "+(db.persistent?"yes":"no")+" · "+healthText+" · "+probeText;
+  $("dbCapacityLarge").textContent=db.capacity_note||"";
+  $("dbBarLarge").style.width=db.configured_capacity_gb&&db.used_mb!==null?Math.min(100,db.used_mb/(db.configured_capacity_gb*1024)*100)+"%":"0%";
+  $("workerState").textContent=m.worker_alive?"Running":"Not active";
+  $("workerInterval").textContent=Math.round((m.interval_seconds||0)/60)+" minutes";
+  $("workerBatch").textContent=(m.batch||0)+" traders / pass";
+  $("workerLastState").textContent=m.state||"—";
+  $("workerError").textContent=m.last_error||"None";
+  $("runtimeCaveat").textContent=d.runtime?.render_free_sleep_warning||"";
+  $("tableMetrics").innerHTML=db.tables?.length?db.tables.map(t=>'<div class="table-metric"><b>'+esc(t.name)+'</b><small>'+(t.bytes===null?"Size unavailable":fmt(t.bytes/1024,1)+" KB")+'</small></div>').join(""):'<div class="empty-state">No table-size breakdown returned.</div>';
+  $("rowCounts").innerHTML=Object.entries(d.counts||{}).map(([k,v])=>'<div class="row-count"><span>'+esc(k.replaceAll("_"," "))+'</span><b>'+fmt(v,0)+'</b></div>').join("");
+ }catch(e){$("tableMetrics").innerHTML='<div class="notice error">'+esc(e.message)+'</div>';}
+}
 click("reloadSystem",loadSystem);
 click("scanNow",async()=>{$("scanNow").disabled=true;$("scanNow").textContent="Scanning…";try{const d=await api("/api/sync/now",{method:"POST"});notice("Monitor pass complete · "+fmt(d.traders_found,0)+" leaders updated · "+fmt(d.positions_checked,0)+" portfolios checked · "+fmt(d.observations_saved,0)+" positions saved.","success");await refreshOverview();loadMarketUniverse();if(state.page==="traders")await loadTraders();if(state.page==="positions")await loadPositions();}catch(e){notice(e.message,"error");}finally{$("scanNow").disabled=false;$("scanNow").textContent="↻ Scan now";}});
 setInterval(()=>{if(state.page==="market"){loadMarket(true);loadMarketUniverse();}},900000);
