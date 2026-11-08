@@ -1746,7 +1746,7 @@ def _leader_state_for_trade(db, trade: PaperTrade) -> tuple[str, str]:
     raw = parse_json(trade.raw_json)
     missing = int(raw.get("leader_missing_visible_snapshots", 0) or 0)
     if missing >= 2:
-        return "CLOSED_CONFIRMED", "Exact leader position absent from two consecutive visible snapshots"
+        return "STALE_OR_UNAVAILABLE", "Position absent from consecutive visible snapshots; omission is not authoritative closure evidence"
     return "STALE_OR_UNAVAILABLE", "Leader position not present in latest snapshot but closure is not yet confirmed"
 
 
@@ -1757,7 +1757,7 @@ async def run_post_exit_recovery_audit(max_trades: int = 5) -> dict:
         horizon_hours = max(1.0, min(72.0, float(cfg.get("post_exit_recovery_audit_hours", 24.0))))
         with SessionLocal() as db:
             closed = db.scalars(select(PaperTrade).where(PaperTrade.status == "CLOSED").order_by(PaperTrade.closed_at)).all()
-        pending = [t for t in closed if parse_json(t.raw_json).get("post_exit_recovery_audit_version", 0) != 6]
+        pending = [t for t in closed if parse_json(t.raw_json).get("post_exit_recovery_audit_version", 0) != 7]
         cooldown = binance_rest_status()
         if cooldown.get("blocked"):
             return {"audited": 0, "attempted": 0, "recovered_to_profit": 0, "failures": 0,
@@ -1854,8 +1854,18 @@ async def run_post_exit_recovery_audit(max_trades: int = 5) -> dict:
                           "INTRABAR_NET_PROFIT_ONLY" if intrabar_only else
                           "RECOVERED_TO_ENTRY_CLOSE_CONFIRMED" if recovered_entry else "NO_ENTRY_RECOVERY")
                 raw.update({
-                    "post_exit_recovery_audit_version": 6,
+                    "post_exit_recovery_audit_version": 7,
                     "post_exit_recovery_audit_status": "COMPLETE",
+                    "post_exit_mark_candles": [
+                        [int(row[0]), round(float(row[2]), 12), round(float(row[3]), 12), round(float(row[4]), 12)]
+                        for row in rows_all
+                        if isinstance(row, (list, tuple)) and len(row) >= 7
+                        and start_ms <= int(row[0]) <= end_ms
+                        and safe_float(row[2]) is not None and safe_float(row[3]) is not None
+                        and safe_float(row[4]) is not None
+                    ],
+                    "post_exit_candle_interval": "1m",
+                    "post_exit_candle_source_verified": "BINANCE_USDM_MARK_PRICE_1M",
                     "post_exit_recovery_status": status,
                     "post_exit_recovery_market_source": "BINANCE_USDM_MARK_PRICE_1M_CLOSE_CONFIRMED",
                     "post_exit_recovery_horizon_hours": horizon_hours,
@@ -1890,7 +1900,7 @@ async def run_post_exit_recovery_audit(max_trades: int = 5) -> dict:
                         live.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
                         if not db.scalar(select(PaperTradeEvent.id).where(
                             PaperTradeEvent.paper_trade_id == trade.id,
-                            PaperTradeEvent.event_type == "POST_EXIT_RECOVERY_AUDIT_V6"
+                            PaperTradeEvent.event_type == "POST_EXIT_RECOVERY_AUDIT_V7"
                         ).limit(1)):
                             db.add(PaperTradeEvent(paper_trade_id=trade.id, event_type="POST_EXIT_RECOVERY_AUDIT_V6",
                                                    observed_at=live.closed_at or now(), value=best_close["net"],
@@ -1913,7 +1923,7 @@ async def run_post_exit_recovery_audit(max_trades: int = 5) -> dict:
                 log_check("post_exit_recovery_audit", False, None, None, f"trade={trade.id} {trade.symbol}: {str(exc)[:500]}")
         with SessionLocal() as db:
             after = db.scalars(select(PaperTrade).where(PaperTrade.status == "CLOSED")).all()
-        pending_count = sum(1 for t in after if parse_json(t.raw_json).get("post_exit_recovery_audit_version", 0) != 6)
+        pending_count = sum(1 for t in after if parse_json(t.raw_json).get("post_exit_recovery_audit_version", 0) != 7)
         cooldown = binance_rest_status()
         return {"audited": audited, "attempted": attempted, "recovered_to_profit": recovered,
                 "failures": failures, "blocked": bool(cooldown.get("blocked")),
@@ -2835,7 +2845,7 @@ async def api_paper():
         "open_count": len(open_trades), "closed_count": len(closed_trades),
         "correlated_exposure_groups": correlated_groups,
         "recovery_audit": {
-            "complete": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version") == 6),
+            "complete": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version") == 7),
             "pending": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version") != 6),
             "version5_or_older": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version") != 6),
             "blocked": bool(binance_rest_status().get("blocked")),
