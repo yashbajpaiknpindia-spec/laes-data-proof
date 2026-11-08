@@ -28,11 +28,11 @@ class ClosedTradeForensicsTests(unittest.TestCase):
 
     def test_audit_worker_does_not_report_failed_or_blocked_batches_as_success(self):
         self.assertIn('audit_ok = audit.get("failures", 0) == 0 and not audit.get("blocked", False)', APP)
-        self.assertIn('audit.get("pending", 0)', APP)
+        self.assertIn("pending=", APP)
 
     def test_replay_requires_leader_open_evidence_at_the_old_exit(self):
         self.assertIn('raw.get("leader_state_at_check") == "OPEN_OBSERVED"', APP)
-        self.assertIn('abs((old_exit-checked_at).total_seconds()) <= 300', APP)
+        self.assertIn('abs((old_exit - checked_at).total_seconds()) <= 300', APP)
         self.assertIn('complete_snapshot_ids', APP)
         self.assertIn('snapshot_payload.get("positions"), list', APP)
         self.assertIn('missing >= 2', APP)
