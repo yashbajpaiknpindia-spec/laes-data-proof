@@ -32,5 +32,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: LAES-offline-release-candidate
-          path: LAES-offline-release-candidate.zip
+          path: /tmp/LAES-offline-release-candidate.zip
           retention-days: 14
