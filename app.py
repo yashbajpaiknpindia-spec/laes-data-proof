@@ -2524,7 +2524,7 @@ def paper_exit_reason_display(trade: PaperTrade, raw: dict) -> str:
 async def api_paper():
     cfg = paper_config()
     with SessionLocal() as db:
-        trades = db.scalars(select(PaperTrade).order_by(desc(PaperTrade.opened_at)).limit(300)).all()
+        trades = db.scalars(select(PaperTrade).order_by(desc(PaperTrade.opened_at)).limit(1000)).all()
         # Portfolio totals and risk clusters must use the complete ledger, not only
         # the newest 300 rows rendered in the table.
         shadow_trades = db.scalars(
