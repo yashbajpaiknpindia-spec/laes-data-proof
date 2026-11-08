@@ -14,12 +14,12 @@ class DashboardDomRegressionTests(unittest.TestCase):
     """Guard against duplicate page trees and broken dashboard navigation."""
 
     def test_template_has_one_document_shell(self) -> None:
-        self.assertEqual(len(re.findall(r"<!doctype\\s+html>", TEMPLATE, re.I)), 1)
-        self.assertEqual(len(re.findall(r"<html\\b", TEMPLATE, re.I)), 1)
-        self.assertEqual(len(re.findall(r"<body\\b", TEMPLATE, re.I)), 1)
+        self.assertEqual(len(re.findall(r"<!doctype\s+html>", TEMPLATE, re.I)), 1)
+        self.assertEqual(len(re.findall(r"<html\b", TEMPLATE, re.I)), 1)
+        self.assertEqual(len(re.findall(r"<body\b", TEMPLATE, re.I)), 1)
 
     def test_every_element_id_is_unique(self) -> None:
-        ids = re.findall(r'\\bid="([^"]+)"', TEMPLATE)
+        ids = re.findall(r'\bid="([^"]+)"', TEMPLATE)
         duplicates = sorted({value for value in ids if ids.count(value) > 1})
         self.assertEqual(duplicates, [], f"Duplicate DOM IDs: {duplicates}")
 
@@ -47,8 +47,8 @@ class DashboardDomRegressionTests(unittest.TestCase):
         self.assertLess(toolbar, paper_end)
 
     def test_static_javascript_dom_hooks_exist(self) -> None:
-        template_ids = set(re.findall(r'\\bid="([^"]+)"', TEMPLATE))
-        script_ids = set(re.findall(r'\\$\\("([^"]+)"\\)', DASHBOARD_JS))
+        template_ids = set(re.findall(r'\bid="([^"]+)"', TEMPLATE))
+        script_ids = set(re.findall(r'\$\("([^"]+)"\)', DASHBOARD_JS))
         missing = sorted(script_ids - template_ids)
         self.assertEqual(missing, [], f"JavaScript references missing DOM hooks: {missing}")
 
