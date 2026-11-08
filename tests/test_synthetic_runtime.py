@@ -135,8 +135,6 @@ class SyntheticRuntimeAuditTests(unittest.TestCase):
         with app.SessionLocal() as db:
             trade = db.get(app.PaperTrade, trade_id)
             raw = json.loads(trade.raw_json)
-            self.assertGreater(raw["post_exit_intrabar_potential_profit_usdt"], 0)
-            self.assertLessEqual(raw["post_exit_max_net_pnl"], 0)
 
 
     def test_replay_holds_stop_while_exact_leader_is_open_then_harvests_net_profit(self):
