@@ -203,6 +203,7 @@ last_scan: dict[str, Any] = {"state": "starting", "started_at": None, "finished_
 worker_alive = False
 scan_lock = asyncio.Lock()
 opportunity_lock = asyncio.Lock()
+recovery_audit_lock = asyncio.Lock()
 last_manual_sync = 0.0
 news_cache: dict[str, Any] = {"fetched_at": 0.0, "items": [], "error": None}
 
@@ -2795,6 +2796,13 @@ async def api_paper():
             "post_exit_recovery_minutes_to_best": safe_float(raw.get("post_exit_minutes_to_best")),
             "post_exit_recovery_worst_net_pnl": safe_float(raw.get("post_exit_worst_net_pnl")),
             "post_exit_recovery_observed_minutes": safe_float(raw.get("post_exit_observed_minutes")),
+            "post_exit_recovery_audit_version": safe_float(raw.get("post_exit_recovery_audit_version")),
+            "post_exit_recovery_audit_status": raw.get("post_exit_recovery_audit_status", "PENDING"),
+            "last_leader_check_at": raw.get("last_leader_check_at"),
+            "leader_state_checked_at": raw.get("leader_state_checked_at"),
+            "leader_state_detail": raw.get("leader_state_detail"),
+            "leader_status": raw.get("leader_state_at_check") or raw.get("leader_status") or "NOT_CHECKED",
+            "leader_check_source": "KOPYON_VISIBLE_POSITION_SNAPSHOT" if raw.get("leader_state_checked_at") or raw.get("last_leader_check_at") else "NO_STORED_CHECK",
             "opened_at": trade.opened_at.isoformat(),
             "closed_at": trade.closed_at.isoformat() if trade.closed_at else None
         })
@@ -2827,6 +2835,199 @@ async def api_paper():
         },
         "trades": trade_rows
     }
+
+
+def build_new_exit_policy_replay(trades: list[PaperTrade], cfg: dict) -> dict:
+    """Replay closed paper entries using persisted, visible Kopyon leader observations only."""
+    if not trades:
+        return {"summary": {}, "trades": [], "source": "Stored Kopyon position snapshots"}
+    trader_ids = sorted({t.trader_id for t in trades})
+    earliest = min((_shadow_dt(t.opened_at) or now()) for t in trades)
+    with SessionLocal() as db:
+        snapshots = db.scalars(select(PositionSnapshot).where(
+            PositionSnapshot.trader_id.in_(trader_ids),
+            PositionSnapshot.observed_at >= earliest
+        ).order_by(PositionSnapshot.trader_id, PositionSnapshot.observed_at, PositionSnapshot.id)).all()
+        snapshot_ids = [x.id for x in snapshots]
+        observations = db.scalars(select(PositionObservation).where(
+            PositionObservation.snapshot_id.in_(snapshot_ids)
+        ).order_by(PositionObservation.snapshot_id, PositionObservation.id)).all() if snapshot_ids else []
+    obs_by_snapshot: dict[int, list[PositionObservation]] = {}
+    snaps_by_trader: dict[str, list[PositionSnapshot]] = {}
+    for obs in observations:
+        obs_by_snapshot.setdefault(obs.snapshot_id, []).append(obs)
+    for snap in snapshots:
+        snaps_by_trader.setdefault(snap.trader_id, []).append(snap)
+
+    def pnl_at(trade: PaperTrade, raw: dict, mark: float, at: datetime) -> dict:
+        direction = 1.0 if trade.side.upper() == "LONG" else -1.0
+        gross = direction * (mark - float(trade.entry_price)) * float(trade.quantity)
+        turnover = (float(trade.entry_price) + mark) * float(trade.quantity)
+        fee_slippage = turnover * (float(cfg["taker_fee_pct"]) + float(cfg["slippage_pct"])) / 100.0
+        rate = safe_float(raw.get("funding_rate_at_entry"))
+        next_funding = safe_float(raw.get("next_funding_time"))
+        if rate is None or not next_funding:
+            return {"gross": round(gross, 8), "fees_slippage": round(fee_slippage, 8), "funding": None, "net": None}
+        opened = _shadow_dt(trade.opened_at) or at
+        opened_ms = int(opened.timestamp() * 1000)
+        next_ms = next_funding
+        while next_ms <= opened_ms:
+            next_ms += 28800000
+        at_ms = int(at.timestamp() * 1000)
+        settlement_count = 0 if at_ms < next_ms else 1 + int((at_ms - next_ms) // 28800000)
+        funding = float(trade.notional or 0.0) * abs(rate) * settlement_count
+        return {
+            "gross": round(gross, 8), "fees_slippage": round(fee_slippage, 8),
+            "funding": round(funding, 8), "net": round(gross - fee_slippage - funding, 8)
+        }
+
+    result_rows = []
+    closed = [t for t in trades if t.status == "CLOSED"]
+    old_total = sum(float(t.net_pnl or 0.0) for t in closed)
+    old_wins = sum(1 for t in closed if float(t.net_pnl or 0.0) > 0)
+    old_losses = sum(1 for t in closed if float(t.net_pnl or 0.0) < 0)
+    for trade in closed:
+        raw = parse_json(trade.raw_json)
+        old_exit = _shadow_dt(trade.closed_at)
+        if old_exit is None:
+            continue
+        leader_key = trade.source_key.split("|", 1)[1] if "|" in trade.source_key else ""
+        parts = leader_key.split("|")
+        identity = "PROVIDER_POSITION_ID" if len(parts) >= 3 else "SYMBOL_SIDE_FALLBACK"
+        identity_note = (
+            "Provider position ID is present in the stored key."
+            if identity == "PROVIDER_POSITION_ID" else
+            "Provider position ID was not exposed; this match is leader + symbol + side, not a unique position ID."
+        )
+        checked_at = None
+        try:
+            checked_at = _shadow_dt(datetime.fromisoformat(str(raw.get("leader_state_checked_at") or "").replace("Z", "+00:00")))
+        except Exception:
+            pass
+        baseline_open = (
+            raw.get("leader_state_at_check") == "OPEN_OBSERVED"
+            and checked_at is not None
+            and abs((old_exit - checked_at).total_seconds()) <= 300
+        )
+        timeline = snaps_by_trader.get(trade.trader_id, [])
+        if not baseline_open:
+            for snap in timeline:
+                snap_at = _shadow_dt(snap.observed_at)
+                if snap_at is None or snap_at > old_exit:
+                    break
+                if not snap.hidden and any(o.position_key == leader_key for o in obs_by_snapshot.get(snap.id, [])):
+                    baseline_open = True
+        common = {
+            "trade_id": trade.id, "trader_id": trade.trader_id, "trader_name": trade.trader_name,
+            "symbol": trade.symbol, "side": trade.side, "old_exit_at": old_exit.isoformat(),
+            "old_exit_reason": trade.exit_reason, "old_realized_net_pnl": round(float(trade.net_pnl or 0.0), 8),
+            "leader_identity": identity, "leader_identity_note": identity_note,
+            "baseline_leader_open_confirmed": baseline_open
+        }
+        if not baseline_open:
+            result_rows.append({**common, "replay_status": "EXCLUDED_NO_LEADER_OPEN_EVIDENCE_AT_OLD_EXIT"})
+            continue
+
+        missing = 0
+        last_mark = last_mark_at = None
+        checkpoints = []
+        checkpoint_hours = (3, 6, 12, 24, 48, 72)
+        next_checkpoint = 0
+        peak = None
+        exit_price = exit_at = exit_detected_at = exit_reason = exit_quality = None
+        for snap in timeline:
+            snap_at = _shadow_dt(snap.observed_at)
+            if snap_at is None or snap_at <= old_exit or snap.hidden:
+                continue
+            rows = obs_by_snapshot.get(snap.id, [])
+            exact = next((o for o in rows if o.position_key == leader_key), None)
+            if exact is not None:
+                missing = 0
+                if exact.mark_price is not None and float(exact.mark_price) > 0:
+                    last_mark, last_mark_at = float(exact.mark_price), snap_at
+                    p = pnl_at(trade, raw, last_mark, snap_at)
+                    if p["net"] is not None and (peak is None or p["net"] > peak["net"]):
+                        peak = {**p, "mark": last_mark, "at": snap_at.isoformat(), "elapsed_hours": round((snap_at-old_exit).total_seconds()/3600, 3)}
+                    elapsed = (snap_at - old_exit).total_seconds() / 3600
+                    while next_checkpoint < len(checkpoint_hours) and elapsed >= checkpoint_hours[next_checkpoint]:
+                        pcp = pnl_at(trade, raw, last_mark, snap_at)
+                        checkpoints.append({
+                            "target_hours": checkpoint_hours[next_checkpoint], "actual_elapsed_hours": round(elapsed, 3),
+                            "observed_at": snap_at.isoformat(), "leader_mark": last_mark,
+                            "gross_pnl": pcp["gross"], "fees_slippage": pcp["fees_slippage"],
+                            "funding_estimate": pcp["funding"], "net_pnl": pcp["net"]
+                        })
+                        next_checkpoint += 1
+                continue
+            opposite = "SHORT" if trade.side.upper() == "LONG" else "LONG"
+            reversal = next((o for o in rows if o.symbol.upper() == trade.symbol.upper() and o.side.upper() == opposite), None)
+            if reversal is not None and reversal.mark_price is not None and float(reversal.mark_price) > 0:
+                exit_price, exit_at, exit_detected_at = float(reversal.mark_price), snap_at, snap_at
+                exit_reason, exit_quality = "LEADER_REVERSED", "OBSERVED_OPPOSITE_SIDE_LEADER_MARK"
+                break
+            missing += 1
+            if missing >= 2:
+                if last_mark is not None and last_mark_at is not None:
+                    exit_price, exit_at, exit_detected_at = last_mark, last_mark_at, snap_at
+                    exit_reason, exit_quality = "TWO_CONSECUTIVE_VISIBLE_OMISSIONS", "LAST_OBSERVED_LEADER_MARK_PROXY"
+                break
+
+        if exit_price is not None and exit_at is not None:
+            p = pnl_at(trade, raw, exit_price, exit_at)
+            result_rows.append({
+                **common, "replay_status": "CLOSED_BY_NEW_LEADER_POLICY",
+                "new_exit_reason": exit_reason, "new_exit_at": exit_at.isoformat(),
+                "new_exit_detection_at": exit_detected_at.isoformat() if exit_detected_at else None,
+                "new_exit_price": exit_price, "new_exit_price_quality": exit_quality,
+                "new_gross_pnl": p["gross"], "new_fee_slippage_estimate": p["fees_slippage"],
+                "new_funding_estimate": p["funding"], "new_research_realized_net_pnl": p["net"],
+                "hold_after_old_exit_hours": round((exit_at-old_exit).total_seconds()/3600, 3),
+                "peak_after_old_exit": peak, "checkpoints": checkpoints
+            })
+        elif last_mark is not None and last_mark_at is not None:
+            p = pnl_at(trade, raw, last_mark, last_mark_at)
+            result_rows.append({
+                **common, "replay_status": "LEADER_STILL_OPEN_AT_LAST_OBSERVATION",
+                "last_observed_at": last_mark_at.isoformat(), "last_observed_mark": last_mark,
+                "new_unrealized_net_pnl": p["net"], "new_unrealized_gross_pnl": p["gross"],
+                "checkpoints": checkpoints
+            })
+        else:
+            result_rows.append({**common, "replay_status": "NO_POST_EXIT_PRICE_OBSERVATION", "checkpoints": checkpoints})
+
+    completed = [x for x in result_rows if x.get("replay_status") == "CLOSED_BY_NEW_LEADER_POLICY"]
+    valued = [x for x in completed if x.get("new_research_realized_net_pnl") is not None]
+    open_rows = [x for x in result_rows if x.get("replay_status") == "LEADER_STILL_OPEN_AT_LAST_OBSERVATION"]
+    valued_open = [x for x in open_rows if x.get("new_unrealized_net_pnl") is not None]
+    summary = {
+        "old_system_realized_net_pnl": round(old_total, 8), "old_system_closed_trades": len(closed),
+        "old_system_profitable_trades": old_wins, "old_system_losing_trades": old_losses,
+        "new_system_realized_net_pnl": round(sum(float(x["new_research_realized_net_pnl"]) for x in valued), 8),
+        "new_system_replayed_closed_trades": len(valued),
+        "new_system_profitable_trades": sum(1 for x in valued if x["new_research_realized_net_pnl"] > 0),
+        "new_system_losing_trades": sum(1 for x in valued if x["new_research_realized_net_pnl"] < 0),
+        "new_system_closed_but_funding_unpriced": len(completed) - len(valued),
+        "new_system_open_leader_trades": len(open_rows),
+        "new_system_unrealized_net_at_last_observation": round(sum(float(x["new_unrealized_net_pnl"]) for x in valued_open), 8),
+        "eligible_with_leader_open_at_old_exit": sum(1 for x in result_rows if x.get("baseline_leader_open_confirmed")),
+        "excluded_without_leader_open_evidence": sum(1 for x in result_rows if not x.get("baseline_leader_open_confirmed")),
+        "same_cohort_old_system_realized_net_pnl": round(sum(float(x.get("old_realized_net_pnl") or 0.0) for x in completed), 8),
+        "price_source": "Persisted Kopyon leader mark observations only",
+        "identity_caveat": "A stored key without provider position ID is matched by leader + symbol + side only.",
+        "cost_assumption": "Current taker fee and slippage settings are applied; historic per-entry settings were not stored.",
+        "funding_assumption": "Conservative debit from absolute entry funding rate and recorded settlement schedule. Rows without a usable schedule are excluded from new-system realized net PnL.",
+        "exit_assumption": "No fixed continuation timeout. Close on an observed opposite-side leader mark or two consecutive visible omissions. Omission exits use the last observed leader mark as a proxy, not an exchange fill.",
+        "paper_only": True
+    }
+    return {"summary": summary, "trades": result_rows, "source": "Stored Kopyon position snapshots; no invented fills"}
+
+
+@app.get("/api/paper/research-replay")
+async def api_paper_research_replay():
+    cfg = paper_config()
+    with SessionLocal() as db:
+        closed = db.scalars(select(PaperTrade).where(PaperTrade.status == "CLOSED").order_by(PaperTrade.opened_at, PaperTrade.id)).all()
+    return build_new_exit_policy_replay(closed, cfg)
 
 
 @app.get("/api/paper/{trade_id}")
@@ -2901,12 +3102,19 @@ async def api_paper_trade_detail(trade_id: int):
     campaign_trade_details = []
     for item in campaign_rows:
         item_raw = parse_json(item.raw_json)
+        item_opened = _shadow_dt(item.opened_at)
+        item_closed = _shadow_dt(item.closed_at)
+        hold_seconds = max(0.0, (item_closed - item_opened).total_seconds()) if item_opened and item_closed else None
         campaign_trade_details.append({
-            "id": item.id, "status": item.status, "entry_price": item.entry_price,
-            "exit_price": item.exit_price, "net_pnl": round(float(item.net_pnl or 0.0), 8),
+            "id": item.id, "attempt_number": len(campaign_trade_details) + 1,
+            "status": item.status, "entry_price": item.entry_price,
+            "exit_price": item.exit_price, "gross_pnl": round(float(item.gross_pnl or 0.0), 8),
+            "estimated_costs": round(float(item.estimated_costs or 0.0), 8),
+            "net_pnl": round(float(item.net_pnl or 0.0), 8),
             "mfe_net_pnl": safe_float(item_raw.get("mfe_net_pnl")),
             "mae_net_pnl": safe_float(item_raw.get("mae_net_pnl")),
             "post_exit_status": item_raw.get("post_exit_recovery_status"),
+            "post_exit_audit_status": item_raw.get("post_exit_recovery_audit_status", "PENDING"),
             "post_exit_max_net_pnl": safe_float(item_raw.get("post_exit_max_net_pnl")),
             "post_exit_minutes_to_entry": safe_float(item_raw.get("post_exit_minutes_to_entry")),
             "post_exit_minutes_to_net_profit": safe_float(item_raw.get("post_exit_minutes_to_net_profit")),
@@ -2914,6 +3122,8 @@ async def api_paper_trade_detail(trade_id: int):
             "post_exit_max_at": item_raw.get("post_exit_max_at"),
             "opened_at": item.opened_at.isoformat(),
             "closed_at": item.closed_at.isoformat() if item.closed_at else None,
+            "hold_duration_seconds": round(hold_seconds, 2) if hold_seconds is not None else None,
+            "hold_duration_hours": round(hold_seconds / 3600, 3) if hold_seconds is not None else None,
             "exit_reason": item.exit_reason
         })
     campaign = {
@@ -3079,7 +3289,10 @@ async def api_paper_trade_detail(trade_id: int):
                 "fetched_at": time.monotonic(), "candles": [], "error": candle_error
             }
 
+    single_replay = build_new_exit_policy_replay([trade], paper_config())
+    replay_trade = (single_replay.get("trades") or [None])[0]
     return {
+        "new_system_replay": replay_trade,
         "trade": {
             "id": trade.id, "status": trade.status, "trader_id": trade.trader_id,
             "leader_position_key": trade.source_key.split("|", 1)[1] if "|" in trade.source_key else trade.source_key,
