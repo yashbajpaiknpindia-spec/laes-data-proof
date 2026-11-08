@@ -1828,10 +1828,16 @@ async def run_post_exit_recovery_audit(max_trades: int = 5) -> dict:
                 best_intrabar = None
                 first_profit = first_entry = first_intrabar_profit = None
                 worst = None
+                last_valid_ms = None
                 for row in rows_all:
                     if not isinstance(row, (list, tuple)) or len(row) < 7:
                         continue
                     at_ms = int(row[0])
+                    # Never trust a provider/mock response that returns candles
+                    # outside the exact requested post-exit observation window.
+                    if at_ms < start_ms or at_ms > end_ms:
+                        continue
+                    last_valid_ms = at_ms
                     high, low, close = safe_float(row[2]), safe_float(row[3]), safe_float(row[4])
                     if high is None or low is None or close is None:
                         continue
@@ -1880,7 +1886,7 @@ async def run_post_exit_recovery_audit(max_trades: int = 5) -> dict:
                     "post_exit_intrabar_first_net_profit_at": datetime.fromtimestamp(first_intrabar_profit/1000, timezone.utc).isoformat() if first_intrabar_profit else None,
                     "post_exit_intrabar_minutes_to_net_profit": round((first_intrabar_profit-start_ms)/60000, 2) if first_intrabar_profit else None,
                     "post_exit_minutes_to_best": round((best_close["at"]-start_ms)/60000, 2),
-                    "post_exit_observed_minutes": round((int(rows_all[-1][0])-start_ms)/60000, 2),
+                    "post_exit_observed_minutes": round((last_valid_ms-start_ms)/60000, 2),
                     "post_exit_worst_net_pnl": round(worst["net"], 8) if worst else None,
                     "post_exit_worst_at": datetime.fromtimestamp(worst["at"]/1000, timezone.utc).isoformat() if worst else None,
                     "post_exit_recovery_profit_usdt": round(max(0.0, best_close["net"]), 8),
