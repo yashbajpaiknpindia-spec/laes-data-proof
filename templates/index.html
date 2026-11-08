@@ -4,7 +4,7 @@
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#0a1018">
   <title>LAES · Intelligence Terminal</title>
-  <link rel="stylesheet" href="/static/style.css?v=7">
+  <link rel="stylesheet" href="/static/style.css?v=8">
 </head>
 <body>
 <div class="app-shell">
@@ -149,9 +149,28 @@
         </article>
       </div>
       <article class="panel trades-panel"><div class="panel-heading"><div><div class="section-kicker">SIMULATED ORDERS</div><h3>Paper trade ledger</h3><p>Open and completed simulated positions.</p></div><button class="btn btn-subtle" id="reloadPaper">Refresh ledger</button></div>
-        <div class="paper-tab-buttons"><button class="btn btn-primary paper-table-tab active" data-paper-tab="open">Open positions <span id="paperOpenTableCount">0</span></button><button class="btn btn-subtle paper-table-tab" data-paper-tab="closed">Closed positions <span id="paperClosedTableCount">0</span></button></div><div id="paperOpenTable" class="table-scroll"><table><thead><tr><th>STATUS</th><th>LEADER / POSITION</th><th>SYMBOL</th><th>SIDE</th><th>ENTRY / LIVE MARK</th><th>NET PNL / MFE / MAE</th><th>HOLD</th><th>LEADER CHECK</th><th>QUALITY</th><th>DETAILS</th></tr></thead><tbody id="paperOpenTrades"><tr><td colspan="10" class="empty-cell">No open paper positions.</td></tr></tbody></table></div><div id="paperClosedTable" class="table-scroll" style="display:none"><table><thead><tr><th>STATUS</th><th>LEADER / POSITION</th><th>SYMBOL</th><th>SIDE</th><th>ENTRY → EXIT</th><th>NET PNL / MFE / MAE</th><th>HOLD</th><th>EXIT TRIGGER</th><th>AFTER-EXIT RECOVERY</th><th>DETAILS</th></tr></thead><tbody id="paperClosedTrades"><tr><td colspan="10" class="empty-cell">No closed paper positions.</td></tr></tbody></table></div>
+        <div class="paper-tab-buttons">
+          <button class="btn btn-primary paper-table-tab active" data-paper-tab="open">Open positions <span id="paperOpenTableCount">0</span></button>
+          <button class="btn btn-subtle paper-table-tab" data-paper-tab="closed">Closed trades <span id="paperClosedTableCount">0</span></button>
+          <button class="btn btn-subtle paper-table-tab" data-paper-tab="latest" id="latestTradesBtn">Latest trades</button>
+          <button class="btn btn-subtle" id="runRecoveryAudit">Run next recovery audit batch</button>
+          <span class="audit-status" id="recoveryAuditStatus">Historical audit status not loaded</span>
+        </div>
+        <div id="closedTradeFilters" class="closed-trade-filters" style="display:none">
+          <button class="closed-filter active" data-closed-filter="all">All closed <span id="closedAllCount">0</span></button>
+          <button class="closed-filter" data-closed-filter="profitable">Profitable <span id="closedProfitCount">0</span></button>
+          <button class="closed-filter" data-closed-filter="loss">Losses <span id="closedLossCount">0</span></button>
+        </div>
+        <div id="paperOpenTable" class="table-scroll"><table><thead><tr><th>STATUS</th><th>LEADER / POSITION</th><th>SYMBOL</th><th>SIDE</th><th>ENTRY / LIVE MARK</th><th>NET PNL / MFE / MAE</th><th>HOLD</th><th>LEADER CHECK</th><th>QUALITY</th><th>DETAILS</th></tr></thead><tbody id="paperOpenTrades"><tr><td colspan="10" class="empty-cell">No open paper positions.</td></tr></tbody></table></div>
+        <div id="paperClosedTable" class="table-scroll" style="display:none"><table><thead><tr><th>STATUS</th><th>LEADER / POSITION</th><th>SYMBOL</th><th>SIDE</th><th>ENTRY → EXIT</th><th>NET PNL / MFE / MAE</th><th>HOLD</th><th>EXIT TRIGGER</th><th>AFTER-EXIT RECOVERY</th><th>DETAILS</th></tr></thead><tbody id="paperClosedTrades"><tr><td colspan="10" class="empty-cell">No closed paper positions.</td></tr></tbody></table></div>
+        <div id="paperLatestTable" class="table-scroll" style="display:none"><table><thead><tr><th>STATUS</th><th>LEADER / POSITION</th><th>SYMBOL</th><th>SIDE</th><th>ENTRY → EXIT / LIVE MARK</th><th>NET PNL / MFE / MAE</th><th>HOLD</th><th>LEADER / EXIT CHECK</th><th>DATA QUALITY</th><th>DETAILS</th></tr></thead><tbody id="paperLatestTrades"><tr><td colspan="10" class="empty-cell">Loading latest trades…</td></tr></tbody></table></div>
       </article>
       <article class="panel" style="margin-top:16px"><div class="panel-heading"><div><div class="section-kicker">CORRELATED FUTURES EXPOSURE</div><h3>Same-symbol loss concentration</h3><p>Leaders holding the same coin and direction can lose together. These estimates expose shared risk without suppressing research signals.</p></div></div><div id="paperRiskClusters"><div class="empty-state">Waiting for portfolio exposure analysis…</div></div></article>
+      <article class="panel research-replay-panel" style="margin-top:16px">
+        <div class="panel-heading"><div><div class="section-kicker">LEADER-CONTINUATION COUNTERFACTUAL</div><h3>Old exit policy vs new leader-following policy</h3><p>Historical replay from stored Kopyon position observations. No fixed continuation timeout; a position remains followed while the matching leader key is visibly open.</p></div><button class="btn btn-subtle" id="loadResearchReplay">Refresh research replay</button></div>
+        <div id="researchReplaySummary"><div class="empty-state">Load the historical replay to compare recorded old-system PnL with the new exit policy.</div></div>
+        <div class="muted-note" id="researchReplayAssumptions"></div>
+      </article>
       <article class="panel" style="margin-top:16px"><div class="panel-heading"><div><div class="section-kicker">CAPITAL-CONSTRAINED SHADOW REPLAY</div><h3>What a limited portfolio would have selected</h3><p>Replays the recorded research entries and exits in time order, using a separate margin cap and a same-coin/same-direction overlap limit. Research trades remain untouched.</p></div><span class="status-tag neutral">COUNTERFACTUAL</span></div><div id="paperShadowPortfolio"><div class="empty-state">Waiting for shadow portfolio calculation…</div></div></article>
     </section>
 
@@ -179,5 +198,5 @@
 </div>
 
 <dialog id="traderDialog" class="trader-dialog"><div class="dialog-head"><div><div class="section-kicker">TRADER FORENSICS</div><h2 id="dialogName">Trader</h2><p id="dialogSub"></p></div><button class="icon-btn" id="closeDialog">×</button></div><div id="dialogBody"></div></dialog>
-<script src="/static/app.js?v=13"></script>
+<script src="/static/app.js?v=14"></script>
 </body></html>
