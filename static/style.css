@@ -105,3 +105,19 @@ button{touch-action:manipulation}
   .market-grid{gap:7px}
 }
 @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}*,*::before,*::after{transition:none!important;animation:none!important}}
+
+/* Page-isolation and responsive overflow guard */
+.page{min-width:0;width:100%}
+.page:not(.active){display:none!important}
+.page.active{display:block}
+.main{min-width:0;overflow-x:clip}
+.top-live-strip{max-width:100%;min-width:0}
+@media(max-width:780px){
+ .top-live-strip{position:sticky;top:112px;z-index:35}
+ .paper-tab-buttons{position:sticky;top:158px;z-index:20}
+ .page{overflow-x:clip}
+}
+@media(max-width:430px){
+ .top-live-strip{top:108px}
+ .paper-tab-buttons{top:150px}
+}
