@@ -21,7 +21,13 @@ async function api(url,options={}){const r=await fetch(url,{headers:{"Content-Ty
 function notice(s,kind){const n=$("notice");n.textContent=s;n.className="notice "+(kind||"");n.classList.remove("hidden");clearTimeout(notice.timer);notice.timer=setTimeout(()=>n.classList.add("hidden"),9000);}
 function setPage(name){state.page=name;document.querySelectorAll(".page").forEach(x=>x.classList.toggle("active",x.id==="page-"+name));document.querySelectorAll(".nav-item").forEach(x=>x.classList.toggle("active",x.dataset.page===name));const t={overview:"Overview",traders:"Trader universe",positions:"Live positions",opportunities:"Opportunity scanner",paper:"Paper trading desk",market:"Market & news",database:"Database & system"};$("pageTitle").textContent=t[name]||"Overview";if(name==="overview")refreshOverview();if(name==="traders")loadTraders();if(name==="positions")loadPositions();if(name==="opportunities")loadOpportunities();if(name==="paper")loadPaper();if(name==="market")loadMarket(true);if(name==="database")loadSystem();}
 document.querySelectorAll(".nav-item").forEach(b=>b.addEventListener("click",()=>setPage(b.dataset.page)));
-document.querySelectorAll("[data-goto]").forEach(b=>b.addEventListener("click",()=>setPage(b.dataset.goto)));
+document.addEventListener("click",e=>{
+ const b=e.target.closest("[data-goto]");
+ if(!b)return;
+ e.preventDefault();
+ const target=b.dataset.goto;
+ if(target)setPage(target);
+});
 function source(id,dot,ok,label){$(id).textContent=label;$(id).className="connection-state "+(ok===true?"ok":ok===false?"bad":"");$(dot).className="source-dot "+(ok===true?"ok":ok===false?"bad":"");}
 async function refreshOverview(){
  try{
@@ -110,7 +116,7 @@ async function loadPaper(){
   ["topOpenCount","paperOpenTableCount"].forEach(id=>$(id).textContent=open.length);["topClosedCount","paperClosedTableCount"].forEach(id=>$(id).textContent=closed.length);$("navPaperCount").textContent=open.length;
   function row(t,isClosed){
    const rec=t.post_exit_recovery_label||"Pending / audit not completed";
-   return '<tr class="clickable-row" onclick="openPaperTrade('+t.id+')"><td><span class="status-tag '+(isClosed?"neutral":"positive")+'">'+esc(t.status)+'</span></td><td><b>'+esc(t.trader_name||t.trader_id)+'</b><br><small>'+esc(t.leader_position_key||"unlinked")+'</small></td><td><b>'+esc(t.symbol)+'</b></td><td>'+esc(t.side)+'</td><td>'+fmt(t.entry_price,8)+(isClosed?" → "+fmt(t.exit_price,8):" → "+fmt(t.mark_price,8))+'</td><td class="'+(Number(t.net_pnl||0)>=0?"pnl-positive":"pnl-negative")+'">'+money(t.net_pnl)+'<br><small>MFE '+money(t.mfe_net_pnl)+' · MAE '+money(t.mae_net_pnl)+'</small></td><td>'+duration((new Date(isClosed?t.closed_at:Date.now())-new Date(t.opened_at))/3600000)+'</td>'+(isClosed?'<td>'+esc(t.exit_reason_display||t.exit_reason||"—")+'</td><td><small>'+esc(rec)+'</small></td>':'<td>'+esc(t.leader_status||t.last_leader_check_at||"Not recorded")+'</td><td>'+esc(t.data_quality_status||"—")+'</td>')+'<td><button class="btn btn-subtle" type="button" onclick="event.stopPropagation();openPaperTrade('+t.id+')">Full potential</button></td></tr>';
+   return '<tr class="clickable-row" onclick="openPaperTrade('+t.id+')"><td><span class="status-tag '+(isClosed?"neutral":"positive")+'">'+esc(t.status)+'</span></td><td><b>'+esc(t.trader_name||t.trader_id)+'</b><br><small>'+esc(t.leader_position_key||"unlinked")+'</small></td><td><b>'+esc(t.symbol)+'</b></td><td>'+esc(t.side)+'</td><td><b>'+fmt(t.entry_price,8)+'</b><br><small>Entry: '+date(t.opened_at)+'</small>'+(isClosed?"<br><b>Exit: "+fmt(t.exit_price,8)+'</b><br><small>Exit time: '+date(t.closed_at)+'</small>':"<br><small>Live mark: "+fmt(t.mark_price,8)+"</small>")+'</td><td class="'+(Number(t.net_pnl||0)>=0?"pnl-positive":"pnl-negative")+'">'+money(t.net_pnl)+'<br><small>MFE '+money(t.mfe_net_pnl)+' · MAE '+money(t.mae_net_pnl)+'</small></td><td>'+duration((new Date(isClosed?t.closed_at:Date.now())-new Date(t.opened_at))/3600000)+'</td>'+(isClosed?'<td>'+esc(t.exit_reason_display||t.exit_reason||"—")+'</td><td><small>'+esc(rec)+'</small></td>':'<td>'+esc(t.leader_status||t.last_leader_check_at||"Not recorded")+'</td><td>'+esc(t.data_quality_status||"—")+'</td>')+'<td><button class="btn btn-subtle" type="button" onclick="event.stopPropagation();openPaperTrade('+t.id+')">Full potential</button></td></tr>';
   }
   $("paperOpenTrades").innerHTML=open.length?open.map(t=>row(t,false)).join():'<tr><td colspan="10" class="empty-cell">No open paper positions.</td></tr>';
   $("paperClosedTrades").innerHTML=closed.length?closed.map(t=>row(t,true)).join():'<tr><td colspan="10" class="empty-cell">No closed paper positions.</td></tr>';
@@ -118,8 +124,25 @@ async function loadPaper(){
   $("paperShadowPortfolio").innerHTML=renderShadowPortfolio(d.shadow_portfolio);bindPaperTabs();
  }catch(e){notice("Paper ledger: "+e.message,"error")}finally{paperLoadInFlight=false}
 }
+function switchPaperTab(tab){
+ if(tab!=="open"&&tab!=="closed")return;
+ document.querySelectorAll(".paper-table-tab,.top-live-btn").forEach(x=>x.classList.toggle("active",x.dataset.paperTab===tab));
+ if($("paperOpenTable"))$("paperOpenTable").style.display=tab==="open"?"":"none";
+ if($("paperClosedTable"))$("paperClosedTable").style.display=tab==="closed"?"":"none";
+ if(state.page!=="paper")setPage("paper");
+}
+let paperTabsBound=false;
 function bindPaperTabs(){
- document.querySelectorAll("[data-paper-tab]").forEach(b=>b.onclick=()=>{const tab=b.dataset.paperTab;document.querySelectorAll(".paper-table-tab,.top-live-btn").forEach(x=>x.classList.toggle("active",x.dataset.paperTab===tab));if($("paperOpenTable"))$("paperOpenTable").style.display=tab==="open"?"":"none";if($("paperClosedTable"))$("paperClosedTable").style.display=tab==="closed"?"":"none";if(state.page!=="paper")setPage("paper");window.scrollTo({top:0,behavior:"smooth"})});
+ if(paperTabsBound)return;
+ paperTabsBound=true;
+ document.addEventListener("click",e=>{
+  const b=e.target.closest("[data-paper-tab]");
+  if(!b)return;
+  e.preventDefault();
+  e.stopPropagation();
+  switchPaperTab(b.dataset.paperTab);
+  window.scrollTo({top:0,behavior:"smooth"});
+ });
 }
 function paperChartSvg(d){
  const candles=d.candles||[], path=d.path||[], leaderPath=d.leader_path||[], t=d.trade||{}, l=d.leader||{};
@@ -314,4 +337,5 @@ async function boot(){
   if(state.page==="opportunities")await loadOpportunities();
  },60000);
 }
+bindPaperTabs();
 window.addEventListener("load",()=>boot().catch(e=>notice("LAES boot failed: "+e.message,"error")));
