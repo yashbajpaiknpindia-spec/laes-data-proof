@@ -319,7 +319,7 @@ async function refreshPaperTradeDetail(id){
    ['Current feed state',t.monitoring_status||'NOT RECORDED'],
    ['Feed resumed at',date(t.monitoring_resumed_at)],
    ['Last Binance mark',date(t.last_binance_price_at)]
-  ].map(x=>'<div class="profile-metric"><small>'+esc(x[0])+'</small><b>'+esc(x[1])+'</b></div>').join('')+'</div>';
+  ].map(x=>{const pnlMetric=/PnL|MFE|MAE/.test(x[0]);const n=parseFloat(String(x[1]).replace(/[^0-9+-.]/g,""));const cls=pnlMetric?(n>=0?"positive":"negative"):"";return '<div class="profile-metric"><small>'+esc(x[0])+'</small><b class="'+cls+'">'+esc(x[1])+'</b></div>';}).join('')+'</div>';
   html+='<div class="analysis-box"><h4>LINKED LEADER POSITION</h4>'+
    '<div class="analysis-line"><span>Leader name / ID</span><b>'+esc(l.trader_name||d.trader?.name||'—')+' / '+esc(l.trader_id||t.trader_id||'—')+'</b></div>'+
    '<div class="analysis-line"><span>Exact position key</span><b>'+esc(l.position_key||t.leader_position_key||'—')+'</b></div>'+
@@ -335,17 +335,29 @@ async function refreshPaperTradeDetail(id){
    paperChartSvg(d)+
    '<div class="muted-note">Candles are Binance USD-M Futures market data. Purple = our observed price path and entry. Green = Kopyon leader mark observations and recovery price. Vertical lines = linked paper entries/exits. Refreshes while this trade detail remains open.'+
    (d.candle_error?' Candle fetch warning: '+esc(d.candle_error):'')+'</div></div>';
-  html+='<div class="analysis-box"><h4>SAME LEADER POSITION · HARVEST CAMPAIGN</h4>'+
-   '<div class="analysis-line"><span>Paper attempts / re-entries</span><b>'+fmt(camp.trade_count,0)+' / '+fmt(camp.reentry_count,0)+'</b></div>'+
+  const replay=d.new_system_replay||{};
+  html+='<div class="analysis-box research-trade-card"><h4>NEW EXIT POLICY · HISTORICAL RESEARCH REPLAY · NOT AN EXECUTED ORDER</h4>'+
+   '<div class="analysis-line"><span>Research realized according to old system</span><b class="'+(Number(t.net_pnl)>=0?'positive':'negative')+'">'+money(t.net_pnl)+'</b></div>'+
+   '<div class="analysis-line"><span>Research realized net PnL according to new system</span><b class="'+(Number(replay.new_research_realized_net_pnl)>=0?'positive':'negative')+'">'+(replay.new_research_realized_net_pnl===null||replay.new_research_realized_net_pnl===undefined?'Not realized / funding unpriced':money(replay.new_research_realized_net_pnl))+'</b></div>'+
+   '<div class="analysis-line"><span>Replay status</span><b>'+esc(replay.replay_status||'No qualifying replay evidence')+'</b></div>'+
+   '<div class="analysis-line"><span>New policy exit reason / price quality</span><b>'+esc(replay.new_exit_reason||'Still open / excluded')+' · '+esc(replay.new_exit_price_quality||'—')+'</b></div>'+
+   '<div class="analysis-line"><span>New exit time / detection time</span><b>'+date(replay.new_exit_at)+' / '+date(replay.new_exit_detection_at)+'</b></div>'+
+   '<div class="analysis-line"><span>Hold time after old exit</span><b>'+duration(replay.hold_after_old_exit_hours)+'</b></div>'+
+   '<div class="analysis-line"><span>Leader identity confidence</span><b>'+esc(replay.leader_identity||'—')+'</b></div>'+
+   '<div class="sample-warning">'+esc(replay.leader_identity_note||'No leader identity note')+'</div>'+
+   (replay.checkpoints?.length?'<div class="profile-history"><table><thead><tr><th>CHECKPOINT</th><th>OBSERVED TIME</th><th>LEADER MARK</th><th>RESEARCH NET</th></tr></thead><tbody>'+replay.checkpoints.map(cp=>'<tr><td>'+fmt(cp.target_hours,0)+'h target · '+fmt(cp.actual_elapsed_hours,2)+'h actual</td><td>'+date(cp.observed_at)+'</td><td>'+fmt(cp.leader_mark,8)+'</td><td class="'+(Number(cp.net_pnl)>=0?'positive':'negative')+'">'+(cp.net_pnl===null||cp.net_pnl===undefined?'Funding unpriced':money(cp.net_pnl))+'</td></tr>').join('')+'</tbody></table></div>':'<div class="muted-note">No 3h / 6h / later checkpoint was verifiably sampled while this leader key remained visible.</div>')+
+   '</div>';
+  html+='<div class="analysis-box"><h4>SAME LEADER POSITION · CAMPAIGN PNL & ENTRY FORENSICS</h4>'+
+   '<div class="analysis-line"><span>Entry attempts / re-entries</span><b>'+fmt(camp.trade_count,0)+' / '+fmt(camp.reentry_count,0)+'</b></div>'+
    '<div class="analysis-line"><span>Currently open attempts</span><b>'+fmt(camp.open_count,0)+'</b></div>'+
-   '<div class="analysis-line"><span>Realized campaign net PnL</span><b>'+money(camp.realized_net_pnl)+'</b></div>'+
-   '<div class="analysis-line"><span>Total campaign net PnL</span><b>'+money(camp.total_net_pnl)+'</b></div>'+
-   '<div class="analysis-line"><span>Positive attempts total</span><b>'+money(camp.sum_positive_attempt_pnl)+'</b></div>'+
-   '<div class="analysis-line"><span>Negative attempts total</span><b>'+money(camp.sum_negative_attempt_pnl)+'</b></div>'+
-   '<div class="profile-history"><table><thead><tr><th>ATTEMPT</th><th>NET</th><th>MFE</th><th>AFTER-EXIT RECOVERY</th><th>EXIT</th></tr></thead><tbody>'+
-   (camp.trades||[]).map(x=>'<tr><td>#'+x.id+'</td><td class="'+(Number(x.net_pnl)>=0?'positive':'negative')+'">'+money(x.net_pnl)+'</td><td>'+money(x.mfe_net_pnl)+'</td><td>'+esc(x.post_exit_status||'Not audited')+(x.post_exit_minutes_to_net_profit!==null&&x.post_exit_minutes_to_net_profit!==undefined?' · +'+fmt(x.post_exit_minutes_to_net_profit,1)+'m':'')+'</td><td>'+esc(x.exit_reason||'OPEN')+'</td></tr>').join('')+
+   '<div class="analysis-line"><span>Realized campaign net PnL</span><b class="'+(Number(camp.realized_net_pnl)>=0?'positive':'negative')+'">'+money(camp.realized_net_pnl)+'</b></div>'+
+   '<div class="analysis-line"><span>Total campaign net PnL</span><b class="'+(Number(camp.total_net_pnl)>=0?'positive':'negative')+'">'+money(camp.total_net_pnl)+'</b></div>'+
+   '<div class="analysis-line"><span>Positive attempts total</span><b class="positive">'+money(camp.sum_positive_attempt_pnl)+'</b></div>'+
+   '<div class="analysis-line"><span>Negative attempts total</span><b class="negative">'+money(camp.sum_negative_attempt_pnl)+'</b></div>'+
+   '<div class="profile-history"><table><thead><tr><th>ENTRY #</th><th>ENTRY TIME</th><th>EXIT TIME</th><th>HOLD</th><th>GROSS</th><th>COSTS</th><th>NET</th><th>AFTER-EXIT</th></tr></thead><tbody>'+
+   (camp.trades||[]).map(x=>'<tr><td><b>Entry #'+fmt(x.attempt_number,0)+' · Trade #'+x.id+'</b></td><td>'+date(x.opened_at)+'</td><td>'+date(x.closed_at)+'</td><td>'+duration(x.hold_duration_hours)+'</td><td class="'+(Number(x.gross_pnl)>=0?'positive':'negative')+'">'+money(x.gross_pnl)+'</td><td class="negative">'+money(x.estimated_costs)+'</td><td class="'+(Number(x.net_pnl)>=0?'positive':'negative')+'"><b>'+money(x.net_pnl)+'</b></td><td>'+esc(x.post_exit_status||'Pending')+'<br><small>'+date(x.post_exit_max_at)+'</small></td></tr>').join('')+
    '</tbody></table></div>'+
-   '<div class="sample-warning">Linked trade IDs: '+esc((camp.trade_ids||[]).join(', '))+'</div></div>';
+   '<div class="sample-warning">Campaign total is the sum of these actual paper-ledger attempts. Linked trade IDs: '+esc((camp.trade_ids||[]).join(', '))+'</div></div>';
   html+='<div class="analysis-box"><h4>SWING & LEADER-RECOVERY PROFIT LADDER</h4><div class="profile-history"><table><thead><tr><th>TARGET / MOVE</th><th>PRICE</th><th>GROSS</th><th>ESTIMATED NET</th></tr></thead><tbody>'+
    (lad.length?lad.map(x=>'<tr><td>'+esc(x.target_type==='INTERMEDIATE_SWING_FROM_LATEST_MARK'?'Swing +':'Leader recovery +')+fmt(x.target_pct_from_reference,2)+'%</td><td>'+fmt(x.price,8)+'</td><td class="'+(x.gross_pnl_usdt>=0?'positive':'negative')+'">'+money(x.gross_pnl_usdt)+'</td><td class="'+(x.estimated_net_pnl_usdt>=0?'positive':'negative')+'">'+money(x.estimated_net_pnl_usdt)+'</td></tr>').join(''):'<tr><td colspan="4">No swing or leader recovery targets available.</td></tr>')+
    '</tbody></table></div></div>';
