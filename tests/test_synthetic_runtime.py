@@ -131,7 +131,7 @@ class SyntheticRuntimeAuditTests(unittest.TestCase):
             result = asyncio.run(app.run_post_exit_recovery_audit(max_trades=10))
         finally:
             app.binance_get = original
-        self.assertEqual(result["audited"], 1)
+        self.assertEqual(result["audited"], 2)  # V6 audits profitable and losing closed trades
         with app.SessionLocal() as db:
             trade = db.get(app.PaperTrade, trade_id)
             raw = json.loads(trade.raw_json)
