@@ -64,3 +64,8 @@ uvicorn app:app --reload
 \`\`\`
 
 Open http://127.0.0.1:8000. Health endpoint: \`/healthz\`. API documentation: \`/api/docs\`.
+
+
+## Offline release-candidate build
+
+The `repair/offline-release-candidate` branch is an isolated, non-production release candidate. Pushes to that branch run source checks, unit-level exit-policy regression assertions, and create a ZIP artifact containing the application source. This branch is not connected to the Render production service. No deployment is performed by this workflow.

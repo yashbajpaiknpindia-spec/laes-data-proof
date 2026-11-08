@@ -298,8 +298,6 @@ def paper_config() -> dict:
         "max_leverage": 3.0,
         "min_adverse_pct": 0.30,
         "leader_continuation_enabled": True,
-        "leader_continuation_hard_loss_price_pct": 0.60,
-        "leader_continuation_max_minutes": 30,
         "leader_reversal_exit_enabled": True,
         "post_exit_recovery_audit_hours": 6.0
     }
@@ -2009,91 +2007,39 @@ async def evaluate_open_paper_trades(
                     raw["funding_estimate_settlement_count"] = funding_events_est
                     raw["realized_pnl_is_estimate"] = True
             elif net <= 0 and not gap_guard and hit_stop:
-                # Leader-aware continuation: if the exact leader position is still
-                # visibly open, do not let our independent paper stop erase the
-                # leader-follow opportunity. The leader itself remains the primary
-                # close signal. A hard adverse-price ceiling remains in force so this
-                # cannot become an unbounded "hold and hope" rule.
-                directional = 1.0 if trade.side == "LONG" else -1.0
-                adverse_from_entry_pct = directional * (trade.entry_price - mark) / max(trade.entry_price, 1e-12) * 100.0
-                hard_loss_pct = float(cfg.get("leader_continuation_hard_loss_price_pct", 0.60))
-                continuation_max_minutes = max(1.0, float(cfg.get("leader_continuation_max_minutes", 30)))
-                continuation_started_at = None
-                try:
-                    if raw.get("leader_continuation_started_at"):
-                        continuation_started_at = datetime.fromisoformat(
-                            raw["leader_continuation_started_at"].replace("Z", "+00:00")
-                        )
-                        if continuation_started_at.tzinfo is None:
-                            continuation_started_at = continuation_started_at.replace(tzinfo=timezone.utc)
-                except Exception:
-                    continuation_started_at = None
-                continuation_timed_out = bool(
-                    continuation_started_at
-                    and (ts - continuation_started_at).total_seconds() >= continuation_max_minutes * 60
-                )
-                continuation_enabled = bool(cfg.get("leader_continuation_enabled", True))
+                # Evidence-led exit policy: an exact, currently visible leader position
+                # is not force-closed by an arbitrary timer or adverse-price percentage.
+                # Close only when the source confirms closure/reversal. If leader state
+                # is unknown/stale, retain the independent protective stop as fallback.
                 if leader_state == "REVERSED" and bool(cfg.get("leader_reversal_exit_enabled", True)):
                     exit_reason = "LEADER_POSITION_REVERSED"
                 elif leader_state == "CLOSED_CONFIRMED":
                     exit_reason = "LEADER_POSITION_CLOSED"
-                elif (
-                    leader_state == "OPEN_OBSERVED"
-                    and continuation_enabled
-                    and adverse_from_entry_pct < hard_loss_pct
-                    and not continuation_timed_out
-                ):
+                elif leader_state == "OPEN_OBSERVED" and bool(cfg.get("leader_continuation_enabled", True)):
+                    directional = 1.0 if trade.side == "LONG" else -1.0
+                    adverse_from_entry_pct = directional * (trade.entry_price - mark) / max(trade.entry_price, 1e-12) * 100.0
                     raw["leader_continuation_active"] = True
                     raw["leader_continuation_started_at"] = raw.get("leader_continuation_started_at") or ts.isoformat()
                     raw["leader_continuation_last_checked_at"] = ts.isoformat()
                     raw["leader_continuation_adverse_pct"] = adverse_from_entry_pct
+                    raw["leader_continuation_policy"] = "LEADER_STATE_EVIDENCE_NO_FIXED_TIMEOUT_OR_PRICE_CEILING"
                     if not raw.get("leader_continuation_hold_logged"):
                         db.add(PaperTradeEvent(
                             paper_trade_id=trade.id,
-                            event_type="LEADER_CONTINUATION_HOLD",
+                            event_type="LEADER_CONTINUATION_EVIDENCE_HOLD",
                             observed_at=ts,
                             value=net,
                             detail=(
-                                f"Stop touched while exact leader position remained visibly OPEN. "
-                                f"Paper stop deferred for at most {continuation_max_minutes:.0f} minutes; "
-                                f"hard adverse-price ceiling={hard_loss_pct:.2f}%."
+                                "The exact leader position is still visibly OPEN. The paper stop is deferred; "
+                                "no fixed continuation timer or adverse-price ceiling is applied. "
+                                "The position remains subject to confirmed leader closure/reversal, "
+                                "net-positive profit harvest, data-integrity guards and emergency controls."
                             )
                         ))
                         raw["leader_continuation_hold_logged"] = True
                     exit_reason = None
                 else:
-                    if leader_state == "OPEN_OBSERVED":
-                        if adverse_from_entry_pct >= hard_loss_pct:
-                            raw["leader_continuation_hard_stop_triggered"] = True
-                            event_type = "LEADER_CONTINUATION_HARD_STOP"
-                            detail = (
-                                f"Leader remained open but adverse price reached {adverse_from_entry_pct:.3f}% "
-                                f">= hard ceiling {hard_loss_pct:.3f}%."
-                            )
-                            reason_base = "LEADER_CONTINUATION_HARD_STOP"
-                        elif continuation_timed_out:
-                            raw["leader_continuation_timeout_triggered"] = True
-                            event_type = "LEADER_CONTINUATION_TIMEOUT"
-                            detail = (
-                                f"Leader remained open, but the {continuation_max_minutes:.0f}-minute "
-                                f"continuation window expired at {adverse_from_entry_pct:.3f}% adverse."
-                            )
-                            reason_base = "LEADER_CONTINUATION_TIMEOUT"
-                        else:
-                            event_type = "LEADER_CONTINUATION_DISABLED_STOP"
-                            detail = "Leader remained open, but leader-continuation holding is disabled; protective stop applied."
-                            reason_base = "LEADER_CONTINUATION_DISABLED_STOP"
-                        db.add(PaperTradeEvent(
-                            paper_trade_id=trade.id,
-                            event_type=event_type,
-                            observed_at=ts,
-                            value=net,
-                            detail=detail
-                        ))
-                    else:
-                        reason_base = "STOP_LOSS"
-                    # A stale/unknown leader state never gets converted into a fake
-                    # leader close. The existing protective stop remains the fallback.
+                    reason_base = "STOP_LOSS"
                     if funding_verified:
                         exit_reason = reason_base
                     else:
@@ -2114,7 +2060,6 @@ async def evaluate_open_paper_trades(
                             exit_reason = reason_base + "_FUNDING_ESTIMATED"
                         raw["funding_estimate_settlement_count"] = funding_event_count_at_exit
                         raw["realized_pnl_is_estimate"] = True
-
             elif net <= 0 and not gap_guard and hit_target:
                 # A price target is not a profit exit if fees/funding still leave
                 # net PnL at or below zero. Keep tracking until net turns positive
@@ -2436,15 +2381,12 @@ async def _api_opportunities_locked(limit: int = 100, allow_entry_creation: bool
 def paper_exit_reason_display(trade: PaperTrade, raw: dict) -> str:
     if raw.get("leader_continuation_hard_stop_triggered"):
         return "Leader still open — hard adverse-price ceiling hit"
-    if raw.get("leader_continuation_timeout_triggered"):
-        return "Leader still open — continuation time limit expired"
     reason = trade.exit_reason or ""
     labels = {
         "PROFIT_HARVEST_NET_POSITIVE": "Net-positive profit harvest after costs",
         "PROFIT_HARVEST_NET_POSITIVE_FUNDING_ESTIMATED": "Net-positive profit harvest; conservative funding estimate pending audit",
         "LEADER_POSITION_CLOSED": "Leader position confirmed closed",
         "LEADER_POSITION_REVERSED": "Leader position reversed",
-        "LEADER_CONTINUATION_TIMEOUT": "Leader continuation time limit expired",
         "LEADER_CONTINUATION_DISABLED_STOP": "Protective stop; leader-continuation hold disabled",
         "STOP_LOSS": "Protective stop",
         "STOP_LOSS_FUNDING_ESTIMATED": "Protective stop; funding estimate used",
@@ -3055,7 +2997,7 @@ async def api_paper_trade_detail(trade_id: int):
 async def update_paper_settings(request: Request):
     body = await request.json()
     cfg = paper_config()
-    for key in ["capital_usdt", "risk_pct", "max_margin_pct", "max_total_margin_pct", "research_unconstrained", "shadow_max_total_margin_pct", "shadow_max_positions_per_symbol_direction", "target_pct", "stop_pct", "taker_fee_pct", "slippage_pct", "max_leverage", "min_adverse_pct", "leader_continuation_hard_loss_price_pct", "leader_continuation_max_minutes"]:
+    for key in ["capital_usdt", "risk_pct", "max_margin_pct", "max_total_margin_pct", "research_unconstrained", "shadow_max_total_margin_pct", "shadow_max_positions_per_symbol_direction", "target_pct", "stop_pct", "taker_fee_pct", "slippage_pct", "max_leverage", "min_adverse_pct"]:
         if key in body:
             val = safe_float(body[key])
             if val is None or val < 0:
@@ -3077,8 +3019,6 @@ async def update_paper_settings(request: Request):
     cfg["slippage_pct"] = min(float(cfg["slippage_pct"]), 2.0)
     cfg["max_leverage"] = min(max(float(cfg["max_leverage"]), 1.0), 5.0)
     cfg["min_adverse_pct"] = min(max(float(cfg["min_adverse_pct"]), 0.05), 20.0)
-    cfg["leader_continuation_hard_loss_price_pct"] = min(max(float(cfg.get("leader_continuation_hard_loss_price_pct", 0.60)), 0.05), 10.0)
-    cfg["leader_continuation_max_minutes"] = min(max(int(float(cfg.get("leader_continuation_max_minutes", 30))), 1), 240)
     set_setting("paper_config", cfg)
     return {"saved": True, "config": cfg}
 
@@ -3185,8 +3125,6 @@ async def api_system():
             "rest_policy": "WebSocket-first; at most one bulk premiumIndex fallback per minute; no per-symbol mark-price polling.",
             "paper_exit_policy": {
                 "leader_continuation_enabled": bool(paper_config().get("leader_continuation_enabled", True)),
-                "leader_continuation_hard_loss_price_pct": float(paper_config().get("leader_continuation_hard_loss_price_pct", 0.60)),
-                "leader_continuation_max_minutes": float(paper_config().get("leader_continuation_max_minutes", 30)),
                 "leader_reversal_exit_enabled": bool(paper_config().get("leader_reversal_exit_enabled", True))
             }
         },
