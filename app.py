@@ -1166,7 +1166,7 @@ async def market_features(symbol: str, refresh: bool = False) -> dict:
     premium, _ = await binance_get("/fapi/v1/premiumIndex", {"symbol": symbol})
     ticker24, _ = await binance_get("/fapi/v1/ticker/24hr", {"symbol": symbol})
     book, _ = await binance_get("/fapi/v1/ticker/bookTicker", {"symbol": symbol})
-    depth, _ = await binance_get("/fapi/v1/depth", {"symbol": symbol, "limit": 20})
+    depth, _ = await binance_get("/fapi/v1/depth", {"symbol": symbol, "limit": 100})
     klines, _ = await binance_get("/fapi/v1/klines", {"symbol": symbol, "interval": "1h", "limit": 168})
     micro, _ = await binance_get("/fapi/v1/klines", {"symbol": symbol, "interval": "5m", "limit": 3})
     if not isinstance(klines, list):
@@ -1193,6 +1193,52 @@ async def market_features(symbol: str, refresh: bool = False) -> dict:
     bid_depth_1pct = sum((safe_float(level[0]) or 0) * (safe_float(level[1]) or 0) for level in (depth.get("bids") or []) if len(level) >= 2 and safe_float(level[0]) is not None and safe_float(level[0]) >= depth_mark * 0.99) if isinstance(depth, dict) else None
     ask_depth_1pct = sum((safe_float(level[0]) or 0) * (safe_float(level[1]) or 0) for level in (depth.get("asks") or []) if len(level) >= 2 and safe_float(level[0]) is not None and safe_float(level[0]) <= depth_mark * 1.01) if isinstance(depth, dict) else None
     min_depth_1pct = min(bid_depth_1pct or 0, ask_depth_1pct or 0) if bid_depth_1pct is not None and ask_depth_1pct is not None else None
+
+    # Estimate execution for the maximum paper notional. This is deliberately
+    # conservative: a paper signal is considered liquid only if the sampled
+    # order book can absorb the whole simulated position inside 1% with a bounded
+    # VWAP slippage. The calculation is not an order and does not reserve liquidity.
+    paper_cfg = paper_config()
+    paper_capital = max(0.0, float(paper_cfg.get("capital_usdt", 1000.0)))
+    paper_max_notional = min(
+        paper_capital * float(paper_cfg.get("max_margin_pct", 10.0)) / 100.0
+        * float(paper_cfg.get("max_leverage", 3.0)),
+        paper_capital * 0.25
+    )
+    def _book_execution(levels: Any, required_notional: float) -> dict:
+        if not isinstance(levels, list) or required_notional <= 0:
+            return {"covered": False, "filled_notional": 0.0, "vwap": None, "slippage_pct": None}
+        remaining = required_notional
+        filled = 0.0
+        quote = 0.0
+        for level in levels:
+            if not isinstance(level, (list, tuple)) or len(level) < 2:
+                continue
+            px = safe_float(level[0]); qty = safe_float(level[1])
+            if not px or not qty or px <= 0 or qty <= 0:
+                continue
+            level_notional = px * qty
+            take = min(remaining, level_notional)
+            quote += take
+            filled += take
+            remaining -= take
+            if remaining <= 1e-9:
+                break
+        vwap = quote / filled if filled > 0 else None
+        return {
+            "covered": remaining <= 1e-9,
+            "filled_notional": filled,
+            "vwap": vwap,
+            "slippage_pct": ((vwap / depth_mark - 1) * 100 if vwap and depth_mark else None)
+        }
+    exec_side = "asks"  # populated below; build_opportunity evaluates both directions.
+    long_exec = _book_execution(depth.get("asks") if isinstance(depth, dict) else None, paper_max_notional)
+    short_exec = _book_execution(depth.get("bids") if isinstance(depth, dict) else None, paper_max_notional)
+    max_exec_slippage = max(
+        safe_float(long_exec.get("slippage_pct")) or 999.0,
+        safe_float(short_exec.get("slippage_pct")) or 999.0
+    )
+
     data = {
         "symbol": symbol, "fetched_at": now().isoformat(),
         "mark_price": safe_float(premium.get("markPrice")),
@@ -1208,6 +1254,16 @@ async def market_features(symbol: str, refresh: bool = False) -> dict:
         "bid_depth_within_1pct_usdt": bid_depth_1pct,
         "ask_depth_within_1pct_usdt": ask_depth_1pct,
         "min_depth_within_1pct_usdt": min_depth_1pct,
+        "paper_max_notional_usdt": paper_max_notional,
+        "paper_long_book_covered": bool(long_exec.get("covered")),
+        "paper_short_book_covered": bool(short_exec.get("covered")),
+        "paper_long_book_filled_notional_usdt": long_exec.get("filled_notional"),
+        "paper_short_book_filled_notional_usdt": short_exec.get("filled_notional"),
+        "paper_long_vwap": long_exec.get("vwap"),
+        "paper_short_vwap": short_exec.get("vwap"),
+        "paper_long_vwap_slippage_pct": long_exec.get("slippage_pct"),
+        "paper_short_vwap_slippage_pct": short_exec.get("slippage_pct"),
+        "paper_max_vwap_slippage_pct": max_exec_slippage,
         "seven_day_return_pct": seven_return, "twenty_four_hour_return_pct": day_return,
         "atr_24h_pct": atr_pct, "rsi_1h": rsi_value(closes),
         "momentum_5m_pct": mom5, "closes_1h": closes[-30:],
@@ -1343,7 +1399,17 @@ async def build_opportunity(
         dead_market_reasons.append("spread above 0.10% or unavailable")
     depth_usdt = safe_float(market.get("min_depth_within_1pct_usdt"))
     if depth_usdt is None or depth_usdt < 10000:
-        dead_market_reasons.append("top-20 order-book depth within 1% below $10K or unavailable")
+        dead_market_reasons.append("order-book depth within 1% below $10K or unavailable")
+    if obs.side == "LONG":
+        if not market.get("paper_long_book_covered", False):
+            dead_market_reasons.append("full simulated LONG notional is not covered by sampled asks within 1%")
+        if (safe_float(market.get("paper_long_vwap_slippage_pct")) or 999.0) > 0.10:
+            dead_market_reasons.append("full simulated LONG VWAP slippage exceeds 0.10%")
+    else:
+        if not market.get("paper_short_book_covered", False):
+            dead_market_reasons.append("full simulated SHORT notional is not covered by sampled bids within 1%")
+        if (safe_float(market.get("paper_short_vwap_slippage_pct")) or 999.0) > 0.10:
+            dead_market_reasons.append("full simulated SHORT VWAP slippage exceeds 0.10%")
     volume_ratio = safe_float(market.get("volume_ratio_recent_6h_vs_prior_24h"))
     if volume_ratio is None or volume_ratio < 0.30:
         dead_market_reasons.append("recent 6h volume below 30% of prior 24h hourly baseline or unavailable")
@@ -1595,9 +1661,14 @@ async def _actual_funding_cost(trade: PaperTrade, at: datetime) -> tuple[float, 
 
 def _leader_state_for_trade(db, trade: PaperTrade) -> tuple[str, str]:
     """
-    Determine leader state without treating missing/stale/hidden data as a close.
-    Returns (state, detail):
-      OPEN_OBSERVED, CLOSED_CONFIRMED, REVERSED, STALE_OR_UNAVAILABLE
+    Determine leader state using the strongest available evidence.
+    Priority:
+      1) exact current visible position
+      2) visible opposite-side position (reversal)
+      3) authoritative HistoryPosition close for this exact position id
+      4) two consecutive visible omissions
+      5) stale/unavailable
+    Hidden snapshots are never interpreted as closure.
     """
     if "|" not in trade.source_key:
         return "STALE_OR_UNAVAILABLE", "Trade has no leader position key"
@@ -1619,8 +1690,6 @@ def _leader_state_for_trade(db, trade: PaperTrade) -> tuple[str, str]:
             return "REVERSED", f"Leader side changed to {exact.side}"
         return "OPEN_OBSERVED", "Exact leader position present in latest visible snapshot"
 
-    # A visible opposite-side position on the same symbol is a strong reversal
-    # signal. We never infer reversal from an empty/hidden snapshot alone.
     symbol = trade.symbol.upper()
     opposite = "SHORT" if trade.side.upper() == "LONG" else "LONG"
     reversed_obs = db.scalar(select(PositionObservation).where(
@@ -1632,126 +1701,189 @@ def _leader_state_for_trade(db, trade: PaperTrade) -> tuple[str, str]:
     if reversed_obs is not None:
         return "REVERSED", f"Visible opposite-side leader position {reversed_obs.position_key}"
 
+    # HistoryPosition is provider-side closed-position evidence. Match the exact
+    # position id when one is available; never use an unrelated historical trade.
+    position_id = position_key.split("|", 1)[0] if "|" in position_key else ""
+    if position_id:
+        history_close = db.scalar(
+            select(HistoryPosition).where(
+                HistoryPosition.trader_id == trader_id,
+                HistoryPosition.position_id == position_id,
+                HistoryPosition.symbol == symbol,
+                HistoryPosition.side == trade.side.upper(),
+                HistoryPosition.status.in_(["CLOSED", "CLOSE", "closed", "close"])
+            ).order_by(desc(HistoryPosition.closed_at_ms), desc(HistoryPosition.id)).limit(1)
+        )
+        if history_close is not None and history_close.closed_at_ms:
+            return "CLOSED_CONFIRMED", (
+                f"Provider HistoryPosition confirms exact leader position {position_id} closed "
+                f"at {history_close.closed_at_ms}"
+            )
+
     raw = parse_json(trade.raw_json)
     missing = int(raw.get("leader_missing_visible_snapshots", 0) or 0)
     if missing >= 2:
         return "CLOSED_CONFIRMED", "Exact leader position absent from two consecutive visible snapshots"
-    return "STALE_OR_UNAVAILABLE", "Leader position not present in the latest snapshot but closure is not yet confirmed"
+    return "STALE_OR_UNAVAILABLE", "Leader position not present in latest snapshot but closure is not yet confirmed"
 
 
 async def run_post_exit_recovery_audit(max_trades: int = 5) -> dict:
     """
-    One-time, read-only market-path audit for historical clean closed losses.
-    It never rewrites realized PnL, exit price, status, or capital. It only stores
-    Binance mark-price recovery metadata in raw_json and PaperTradeEvent.
+    Read-only post-exit audit for closed losing paper trades.
+    IMPORTANT: candle HIGH/LOW is only an intrabar potential signal. A recovery is
+    classified as realized/close-confirmed only when the Binance 1m candle CLOSE
+    itself produces positive net PnL after the same fee/slippage model.
     """
     cfg = paper_config()
     horizon_hours = max(1.0, min(24.0, float(cfg.get("post_exit_recovery_audit_hours", 24.0))))
-    audited = recovered = 0
-    failures = 0
+    audited = recovered = failures = 0
     with SessionLocal() as db:
         trades = db.scalars(select(PaperTrade).where(
             PaperTrade.status == "CLOSED",
             PaperTrade.net_pnl < 0
-        ).order_by(PaperTrade.closed_at)
-        ).all()
+        ).order_by(PaperTrade.closed_at)).all()
+
     for trade in trades:
         if audited >= max(1, int(max_trades)):
             break
         raw = parse_json(trade.raw_json)
-        if raw.get("post_exit_recovery_audit_version") == 4:
+        if raw.get("post_exit_recovery_audit_version") == 5:
             continue
-        # The post-exit market path is independently auditable even when the
-        # pre-exit paper path was interrupted or incomplete. Keep the old
-        # data-quality label, but do not skip this separate Binance audit.
         if not trade.closed_at or not trade.exit_price or not trade.entry_price:
             continue
-        start_ms = int(trade.closed_at.timestamp() * 1000)
+        closed_at = trade.closed_at
+        if closed_at.tzinfo is None:
+            closed_at = closed_at.replace(tzinfo=timezone.utc)
+        start_ms = int(closed_at.timestamp() * 1000)
         end_ms = start_ms + int(horizon_hours * 3600 * 1000)
+
         try:
             rows, _ = await binance_get("/fapi/v1/markPriceKlines", {
-                "symbol": trade.symbol,
-                "interval": "1m",
-                "startTime": start_ms,
-                "endTime": end_ms,
-                "limit": 1500
+                "symbol": trade.symbol, "interval": "1m",
+                "startTime": start_ms, "endTime": end_ms, "limit": 1500
             })
             if not isinstance(rows, list) or not rows:
                 raise RuntimeError("No Binance mark-price candles returned")
+
             directional = 1.0 if trade.side == "LONG" else -1.0
-            best = None
-            first_entry_cross = None
-            first_net_profit = None
-            worst = None
+            best_close = None
+            best_intrabar = None
+            first_entry_close = None
+            first_net_profit_close = None
+            first_net_profit_intrabar = None
+            worst_close = None
+
             for row in rows:
                 if not isinstance(row, (list, tuple)) or len(row) < 7:
                     continue
-                high = safe_float(row[2]); low = safe_float(row[3]); at_ms = int(row[0])
-                if high is None or low is None:
+                open_ms = int(row[0])
+                high = safe_float(row[2]); low = safe_float(row[3]); close = safe_float(row[4])
+                if high is None or low is None or close is None:
                     continue
-                favorable = high if trade.side == "LONG" else low
-                candidate_gross = directional * (favorable - trade.entry_price) * trade.quantity
-                turnover = (trade.entry_price + favorable) * trade.quantity
-                estimated_cost = turnover * ((float(cfg["taker_fee_pct"]) + float(cfg["slippage_pct"])) / 100.0)
-                candidate_net = candidate_gross - estimated_cost
-                if best is None or candidate_net > best["max_net_pnl"]:
-                    best = {"max_net_pnl": candidate_net, "max_price": favorable, "at_ms": at_ms, "gross": candidate_gross, "cost": estimated_cost}
-                adverse_price = low if trade.side == "LONG" else high
-                adverse_gross = directional * (adverse_price - trade.entry_price) * trade.quantity
-                adverse_cost = (trade.entry_price + adverse_price) * trade.quantity * ((float(cfg["taker_fee_pct"]) + float(cfg["slippage_pct"])) / 100.0)
-                adverse_net = adverse_gross - adverse_cost
-                if worst is None or adverse_net < worst["min_net_pnl"]:
-                    worst = {"min_net_pnl": adverse_net, "price": adverse_price, "at_ms": at_ms}
-                if candidate_net > 0 and first_net_profit is None:
-                    first_net_profit = at_ms
-                crossed = (high >= trade.entry_price) if trade.side == "LONG" else (low <= trade.entry_price)
-                if crossed and first_entry_cross is None:
-                    first_entry_cross = at_ms
-            if best is None:
+
+                def candidate(price: float) -> tuple[float, float, float]:
+                    gross = directional * (price - trade.entry_price) * trade.quantity
+                    turnover = (trade.entry_price + price) * trade.quantity
+                    cost = turnover * ((float(cfg["taker_fee_pct"]) + float(cfg["slippage_pct"])) / 100.0)
+                    return gross - cost, gross, cost
+
+                # Candle CLOSE is the authoritative post-exit recovery signal.
+                close_net, close_gross, close_cost = candidate(close)
+                high_favorable = high if trade.side == "LONG" else low
+                intrabar_net, intrabar_gross, intrabar_cost = candidate(high_favorable)
+
+                if best_close is None or close_net > best_close["max_net_pnl"]:
+                    best_close = {
+                        "max_net_pnl": close_net, "max_price": close,
+                        "at_ms": open_ms, "gross": close_gross, "cost": close_cost
+                    }
+                if best_intrabar is None or intrabar_net > best_intrabar["max_net_pnl"]:
+                    best_intrabar = {
+                        "max_net_pnl": intrabar_net, "max_price": high_favorable,
+                        "at_ms": open_ms, "gross": intrabar_gross, "cost": intrabar_cost
+                    }
+
+                if close_net > 0 and first_net_profit_close is None:
+                    first_net_profit_close = open_ms
+                if intrabar_net > 0 and first_net_profit_intrabar is None:
+                    first_net_profit_intrabar = open_ms
+
+                crossed_close = (close >= trade.entry_price) if trade.side == "LONG" else (close <= trade.entry_price)
+                if crossed_close and first_entry_close is None:
+                    first_entry_close = open_ms
+
+                if worst_close is None or close_net < worst_close["min_net_pnl"]:
+                    worst_close = {"min_net_pnl": close_net, "at_ms": open_ms}
+
+            if best_close is None or best_intrabar is None:
                 continue
-            recovered_to_profit = best["max_net_pnl"] > 0
-            recovered_to_entry = first_entry_cross is not None
+
+            recovered_to_profit = best_close["max_net_pnl"] > 0
+            recovered_to_entry = first_entry_close is not None
+            intrabar_only = (not recovered_to_profit) and best_intrabar["max_net_pnl"] > 0
+            status = (
+                "RECOVERED_TO_NET_PROFIT_CLOSE_CONFIRMED" if recovered_to_profit
+                else "INTRABAR_NET_PROFIT_ONLY" if intrabar_only
+                else "RECOVERED_TO_ENTRY_CLOSE_CONFIRMED" if recovered_to_entry
+                else "NO_ENTRY_RECOVERY"
+            )
+
+            close_profit_minutes = (
+                (first_net_profit_close - start_ms) / 60000 if first_net_profit_close else None
+            )
+            intrabar_profit_minutes = (
+                (first_net_profit_intrabar - start_ms) / 60000 if first_net_profit_intrabar else None
+            )
             raw.update({
-                "post_exit_recovery_audit_version": 4,
-                "post_exit_recovery_status": "RECOVERED_TO_NET_PROFIT" if recovered_to_profit else ("RECOVERED_TO_ENTRY_ONLY" if recovered_to_entry else "NO_ENTRY_RECOVERY"),
-                "post_exit_recovery_market_source": "BINANCE_USDM_MARK_PRICE_1M",
+                "post_exit_recovery_audit_version": 5,
+                "post_exit_recovery_status": status,
+                "post_exit_recovery_market_source": "BINANCE_USDM_MARK_PRICE_1M_CLOSE_CONFIRMED",
                 "post_exit_recovery_horizon_hours": horizon_hours,
-                "post_exit_max_net_pnl": round(best["max_net_pnl"], 8),
-                "post_exit_max_gross_pnl": round(best["gross"], 8),
-                "post_exit_max_price": best["max_price"],
-                "post_exit_max_at": datetime.fromtimestamp(best["at_ms"]/1000, timezone.utc).isoformat(),
-                "post_exit_return_to_entry_at": datetime.fromtimestamp(first_entry_cross/1000, timezone.utc).isoformat() if first_entry_cross else None,
-                "post_exit_minutes_to_entry": round((first_entry_cross - start_ms) / 60000, 2) if first_entry_cross else None,
-                "post_exit_first_net_profit_at": datetime.fromtimestamp(first_net_profit/1000, timezone.utc).isoformat() if first_net_profit else None,
-                "post_exit_minutes_to_net_profit": round((first_net_profit - start_ms) / 60000, 2) if first_net_profit else None,
-                "post_exit_minutes_to_best": round((best["at_ms"] - start_ms) / 60000, 2),
-                "post_exit_observed_minutes": round((int(rows[-1][0]) - start_ms) / 60000, 2) if rows else 0,
-                "post_exit_worst_net_pnl": round(worst["min_net_pnl"], 8) if worst else None,
-                "post_exit_worst_at": datetime.fromtimestamp(worst["at_ms"]/1000, timezone.utc).isoformat() if worst else None,
-                "post_exit_recovery_profit_usdt": round(max(0.0, best["max_net_pnl"]), 8),
+                "post_exit_max_net_pnl": round(best_close["max_net_pnl"], 8),
+                "post_exit_max_gross_pnl": round(best_close["gross"], 8),
+                "post_exit_max_price": best_close["max_price"],
+                "post_exit_max_at": datetime.fromtimestamp(best_close["at_ms"]/1000, timezone.utc).isoformat(),
+                "post_exit_intrabar_max_net_pnl": round(best_intrabar["max_net_pnl"], 8),
+                "post_exit_intrabar_max_price": best_intrabar["max_price"],
+                "post_exit_intrabar_max_at": datetime.fromtimestamp(best_intrabar["at_ms"]/1000, timezone.utc).isoformat(),
+                "post_exit_return_to_entry_at": datetime.fromtimestamp(first_entry_close/1000, timezone.utc).isoformat() if first_entry_close else None,
+                "post_exit_minutes_to_entry": round((first_entry_close - start_ms) / 60000, 2) if first_entry_close else None,
+                "post_exit_first_net_profit_at": datetime.fromtimestamp(first_net_profit_close/1000, timezone.utc).isoformat() if first_net_profit_close else None,
+                "post_exit_minutes_to_net_profit": round(close_profit_minutes, 2) if close_profit_minutes is not None else None,
+                "post_exit_intrabar_first_net_profit_at": datetime.fromtimestamp(first_net_profit_intrabar/1000, timezone.utc).isoformat() if first_net_profit_intrabar else None,
+                "post_exit_intrabar_minutes_to_net_profit": round(intrabar_profit_minutes, 2) if intrabar_profit_minutes is not None else None,
+                "post_exit_minutes_to_best": round((best_close["at_ms"] - start_ms) / 60000, 2),
+                "post_exit_observed_minutes": round((int(rows[-1][0]) - start_ms) / 60000, 2),
+                "post_exit_worst_net_pnl": round(worst_close["min_net_pnl"], 8) if worst_close else None,
+                "post_exit_worst_at": datetime.fromtimestamp(worst_close["at_ms"]/1000, timezone.utc).isoformat() if worst_close else None,
+                "post_exit_recovery_profit_usdt": round(max(0.0, best_close["max_net_pnl"]), 8),
+                "post_exit_intrabar_potential_profit_usdt": round(max(0.0, best_intrabar["max_net_pnl"]), 8),
                 "post_exit_old_exit_reason": trade.exit_reason,
                 "post_exit_recovery_label": (
-                    f"[AFTER EXIT: NET PROFIT +{best['max_net_pnl']:.4f} USDT · +{(first_net_profit-start_ms)/60000:.0f}m | best +{(best['at_ms']-start_ms)/60000:.0f}m | old: {trade.exit_reason}]"
+                    f"[AFTER EXIT: CLOSE-CONFIRMED NET PROFIT +{best_close['max_net_pnl']:.4f} USDT · +{close_profit_minutes:.0f}m | best +{(best_close['at_ms']-start_ms)/60000:.0f}m | old: {trade.exit_reason}]"
                     if recovered_to_profit else
-                    f"[AFTER EXIT: ENTRY RECOVERED +{(first_entry_cross-start_ms)/60000:.0f}m BUT NOT NET PROFIT | old: {trade.exit_reason}]"
+                    f"[AFTER EXIT: INTRABAR-ONLY POTENTIAL +{best_intrabar['max_net_pnl']:.4f} USDT; NO PROFITABLE 1m CLOSE | old: {trade.exit_reason}]"
+                    if intrabar_only else
+                    f"[AFTER EXIT: ENTRY RECOVERED ON CLOSE +{(first_entry_close-start_ms)/60000:.0f}m BUT NOT NET PROFIT | old: {trade.exit_reason}]"
                     if recovered_to_entry else
                     f"[AFTER EXIT: NO ENTRY/NET RECOVERY IN {horizon_hours:.0f}H | old: {trade.exit_reason}]"
                 )
             })
+
             with SessionLocal() as db:
                 live = db.get(PaperTrade, trade.id)
                 if live:
                     live.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
                     exists = db.scalar(select(PaperTradeEvent.id).where(
                         PaperTradeEvent.paper_trade_id == trade.id,
-                        PaperTradeEvent.event_type == "POST_EXIT_RECOVERY_AUDIT_V3"
+                        PaperTradeEvent.event_type == "POST_EXIT_RECOVERY_AUDIT_V5"
                     ).limit(1))
                     if not exists:
                         db.add(PaperTradeEvent(
                             paper_trade_id=trade.id,
-                            event_type="POST_EXIT_RECOVERY_AUDIT_V3",
+                            event_type="POST_EXIT_RECOVERY_AUDIT_V5",
                             observed_at=live.closed_at or now(),
-                            value=best["max_net_pnl"],
+                            value=best_close["max_net_pnl"],
                             detail=raw["post_exit_recovery_label"]
                         ))
                     db.commit()
@@ -1839,7 +1971,10 @@ async def evaluate_open_paper_trades(
                 raw["leader_status"] = "STALE_OR_NOT_OBSERVED"
             # Persist a compact 5-second path, while the live row itself is updated every second.
             last_path = db.scalar(select(PaperTradePath).where(PaperTradePath.paper_trade_id==trade.id).order_by(desc(PaperTradePath.id)).limit(1))
-            should_sample = last_path is None or (ts-last_path.observed_at).total_seconds() >= float(cfg.get("path_sample_seconds",5))
+            last_path_at = last_path.observed_at if last_path else None
+            if last_path_at is not None and last_path_at.tzinfo is None:
+                last_path_at = last_path_at.replace(tzinfo=timezone.utc)
+            should_sample = last_path_at is None or (ts-last_path_at).total_seconds() >= float(cfg.get("path_sample_seconds",5))
             if should_sample:
                 db.add(path_row)
             raw.setdefault("mfe_net_pnl", net)
