@@ -73,12 +73,15 @@ async function refreshOverview(){
  if(!d.kopyon?.configured)notice("KOPYON_API_KEY is not visible to this running service. Add it to laes-data-proof-python, not the retired Elixir service.","error");
  if(!d.database?.persistent)notice("The running service is not connected to persistent PostgreSQL. Check DATABASE_URL on laes-data-proof-python.","error");
  if(state.page==="overview"){
-  try{const p=await api("/api/paper");$("mPaperEquity").textContent=money(p.equity);$("mPaperPnl").textContent="Realized "+money(p.realized_pnl)+" · Unrealized "+money(p.unrealized_pnl);}catch{}
+  try{const p=await api("/api/paper");$("mPaperEquity").textContent=money(p.equity);$("mPaperPnl").innerHTML='Realized <b class="'+(Number(p.realized_pnl)>=0?"positive":"negative")+'">'+money(p.realized_pnl)+'</b> · Unrealized <b class="'+(Number(p.unrealized_pnl)>=0?"positive":"negative")+'">'+money(p.unrealized_pnl)+'</b>';}catch{}
   try{const o=await api("/api/opportunities?limit=100");const q=o.filter(x=>x.qualified);$("mOpportunities").textContent=fmt(q.length,0);$("navOppCount").textContent=fmt(q.length,0);renderMini(o.slice(0,5));}catch(e){$("overviewOpps").innerHTML='<div class="empty-state">'+esc(e.message)+'</div>';}
  }
  }catch(e){notice("Dashboard status unavailable: "+e.message,"error");}
 }
-function renderMini(items){if(!items.length){$("overviewOpps").innerHTML='<div class="empty-state">No qualifying or underwater positions observed yet. Only live provider snapshots appear here.</div>';return;}$("overviewOpps").innerHTML=items.map(o=>'<div class="mini-opp"><div><b>'+esc(o.symbol)+' · '+esc(o.side)+' · '+esc(o.trader_name)+'</b><small>'+esc(o.status)+' · adverse '+pct(o.adverse_pct)+' · observed '+date(o.observed_at)+'</small></div><strong>'+money(o.unrealized_pnl)+'</strong><span class="status-tag '+(o.qualified?"qualified":"")+'">'+(o.qualified?"PAPER READY":"WATCH")+'</span></div>').join("");}
+function renderMini(items){
+ if(!items.length){$("overviewOpps").innerHTML='<div class="empty-state">No qualifying or underwater positions observed yet. Only live provider snapshots appear here.</div>';return;}
+ $("overviewOpps").innerHTML=items.map(o=>'<div class="mini-opp"><div><b>'+esc(o.symbol)+' · '+esc(o.side)+' · '+esc(o.trader_name)+'</b><small>'+esc(o.status)+' · adverse '+pct(o.adverse_pct)+' · observed '+date(o.observed_at)+'</small></div><strong class="'+(Number(o.unrealized_pnl)>=0?"positive":"negative")+'">'+money(o.unrealized_pnl)+'</strong><span class="status-tag '+(o.qualified?"qualified":"")+'">'+(o.qualified?"PAPER READY":"WATCH")+'</span></div>').join("");
+}
 async function loadTraders(){
  $("traderGrid").innerHTML='<div class="empty-state">Loading discovered public trader records…</div>';
  try{const q=encodeURIComponent($("traderSearch").value||"");const rows=await api("/api/traders?limit=250&search="+q);$("traderListCount").textContent=rows.length+" live traders stored";
@@ -98,7 +101,7 @@ async function openTrader(enc){
  const d=await api("/api/traders/"+encodeURIComponent(id)),t=d.trader,p=d.profile||{},hs=d.history_summary||{};$("dialogName").textContent=t.name||id;$("dialogSub").textContent=id+" · "+(t.portfolio_type||"Portfolio")+" · visibility: "+t.visibility;
  const metrics=[["ROI",pct((t.roi||0)*100)],["Max drawdown",pct((t.max_drawdown||0)*100)],["Copier PnL",money(t.copier_pnl)],["Sharpe",fmt(t.sharpe_ratio)],["AUM",money(t.aum)],["Profit share",pct((p.profitShare||0)*100)],["Copiers",fmt(p.copiers??t.raw?.copiers,0)],["Margin balance",p.sourceDetails?.marginBalance?money(p.sourceDetails.marginBalance):"Not reported"]];
  let html=p.bio?'<p class="profile-bio">'+esc(p.bio)+'</p>':"";
- html+='<div class="profile-grid">'+metrics.map(m=>'<div class="profile-metric"><small>'+esc(m[0])+'</small><b>'+esc(m[1])+'</b></div>').join("")+'</div>';
+ html+='<div class="profile-grid">'+metrics.map(m=>{const isPnl=m[0]==="Copier PnL";const amount=parseFloat(String(m[1]).replace(/[^0-9+-.]/g,""));return '<div class="profile-metric"><small>'+esc(m[0])+'</small><b class="'+(isPnl?(amount>=0?"positive":"negative"):"")+'">'+esc(m[1])+'</b></div>';}).join("")+'</div>';
  html+='<div class="analysis-box"><h4>TRADER USUAL HOLDING BEHAVIOUR</h4><div class="analysis-line"><span>Completed history rows</span><b>'+fmt(hs.records,0)+'</b></div><div class="analysis-line"><span>Median holding time</span><b>'+duration(hs.median_hold_hours)+'</b></div><div class="analysis-line"><span>Average holding time</span><b>'+duration(hs.avg_hold_hours)+'</b></div><div class="analysis-line"><span>Closed-history win rate</span><b>'+pct(hs.win_rate_closed_history===null?null:hs.win_rate_closed_history*100)+'</b></div><div class="analysis-line"><span>Average net PnL</span><b>'+money(hs.avg_net_pnl)+'</b></div></div>';
  html+='<div class="panel-heading" style="margin-top:15px"><div><h3>Closed position history</h3><p>Fetched from Kopyon; history rows alone do not reveal historical MAE/MFE.</p></div></div><div class="profile-history"><table><thead><tr><th>SYMBOL</th><th>SIDE</th><th>OPENED</th><th>CLOSED</th><th>ROI</th><th>NET PNL</th></tr></thead><tbody>';
  html+=d.history?.length?d.history.map(h=>'<tr><td>'+esc(h.symbol)+'</td><td>'+esc(h.side)+'</td><td>'+date(h.opened_at)+'</td><td>'+date(h.closed_at)+'</td><td>'+pct((h.roi||0)*100)+'</td><td class="'+((h.net_pnl||0)>=0?"positive":"negative")+'">'+money(h.net_pnl)+'</td></tr>').join(""):'<tr><td colspan="6" class="empty-cell">No closed history returned.</td></tr>';
@@ -134,6 +137,8 @@ async function loadPaper(){
   const open=d.trades.filter(t=>t.status==="OPEN"),closed=d.trades.filter(t=>t.status==="CLOSED");
   $("paperCapital").textContent=money(d.capital);$("paperMargin").textContent=money(d.deployed_margin)+" / "+money(d.margin_cap);
   $("paperRealized").textContent=money(d.realized_pnl);$("paperUnrealized").textContent=money(d.unrealized_pnl);$("paperFree").textContent=money(d.free_capital);$("paperEquity").textContent=money(d.equity);
+  $("paperRealized").classList.toggle("positive",Number(d.realized_pnl)>=0);$("paperRealized").classList.toggle("negative",Number(d.realized_pnl)<0);
+  $("paperUnrealized").classList.toggle("positive",Number(d.unrealized_pnl)>=0);$("paperUnrealized").classList.toggle("negative",Number(d.unrealized_pnl)<0);
   ["topOpenCount","paperOpenTableCount"].forEach(id=>$(id).textContent=open.length);["topClosedCount","paperClosedTableCount"].forEach(id=>$(id).textContent=closed.length);$("navPaperCount").textContent=open.length;
   const audit=d.recovery_audit||{};
   if($("recoveryAuditStatus")){
@@ -153,7 +158,7 @@ function renderPaperTables(d){
   const status=t.leader_status||"NOT_CHECKED";
   const labels={OPEN_OBSERVED:"OPEN · exact key observed",CLOSED_CONFIRMED:"CLOSED · confirmed",REVERSED:"REVERSED",STALE_OR_UNAVAILABLE:"STALE / unavailable",HIDDEN_OR_UNAVAILABLE:"HIDDEN / unavailable",NOT_CHECKED:"No stored check"};
   const cls=status==="OPEN_OBSERVED"?"positive":status==="REVERSED"||status==="CLOSED_CONFIRMED"?"negative":"";
-  const at=t.leader_state_checked_at||t.last_leader_check_at;
+  const at=t.leader_check_at||t.leader_state_checked_at||t.last_leader_check_at;
   return '<b class="'+cls+'">'+esc(labels[status]||status)+'</b><br><small>'+esc(at?date(at):"Timestamp not stored")+'</small><br><small>'+esc(t.leader_state_detail||t.leader_check_source||"")+'</small>';
  }
  function row(t,isClosed){
@@ -212,7 +217,7 @@ async function loadResearchReplay(){
    '<section class="replay-side"><h4>RESEARCH REALIZED ACCORDING TO OLD SYSTEM</h4>'+val("Recorded old-policy realized net",x.old_system_realized_net_pnl)+
    '<div class="replay-stats">'+stat("Closed trades",x.old_system_closed_trades)+stat("Profitable",x.old_system_profitable_trades)+stat("Loss-making",x.old_system_losing_trades)+'</div></section>'+
    '<section class="replay-side"><h4>RESEARCH REALIZED NET PNL ACCORDING TO NEW SYSTEM</h4>'+val("New leader-following replay net",x.new_system_realized_net_pnl)+
-   '<div class="replay-stats">'+stat("Replayed closed",x.new_system_replayed_closed_trades)+stat("Profitable",x.new_system_profitable_trades)+stat("Loss-making",x.new_system_losing_trades)+stat("Leader still open",x.new_system_open_leader_trades)+stat("Excluded · no funding schedule",x.new_system_closed_but_funding_unpriced)+stat("No leader-open evidence",x.excluded_without_leader_open_evidence)+'</div>'+
+   '<div class="replay-stats">'+stat("Replayed attempts",x.new_system_replayed_attempts)+stat("Closed by policy",x.new_system_exits_observed)+stat("Priced closed",x.new_system_replayed_closed_trades)+stat("Profitable",x.new_system_profitable_trades)+stat("Loss-making",x.new_system_losing_trades)+stat("Leader still open",x.new_system_open_leader_trades)+stat("Excluded · no funding schedule",x.new_system_closed_but_funding_unpriced)+stat("No leader-open evidence",x.excluded_without_leader_open_evidence)+'</div>'+
    '<div class="analysis-line"><span>Same replayed cohort · old policy PnL</span><b class="'+(Number(x.same_cohort_old_system_realized_net_pnl)>=0?"positive":"negative")+'">'+money(x.same_cohort_old_system_realized_net_pnl)+'</b></div>'+
    '<div class="analysis-line"><span>Open positions · mark-to-last unrealized</span><b class="'+(Number(x.new_system_unrealized_net_at_last_observation)>=0?"positive":"negative")+'">'+money(x.new_system_unrealized_net_at_last_observation)+'</b></div></section></div>'+
    '<div class="profile-history"><table><thead><tr><th>TRADE</th><th>SYMBOL</th><th>OLD NET</th><th>NEW RESEARCH NET</th><th>HOLD AFTER OLD EXIT</th><th>NEW EXIT / STATUS</th></tr></thead><tbody>'+
