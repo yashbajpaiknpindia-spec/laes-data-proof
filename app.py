@@ -2975,10 +2975,6 @@ def build_new_exit_policy_replay(trades: list[PaperTrade], cfg: dict) -> dict:
                     "mark_price": close, "net_pnl_estimate": p["net_estimate"],
                     "status": "MARK_TO_MARKET_NOT_REALIZED"})
                 next_checkpoint += 1
-            if p["net_estimate"] is not None and p["net_estimate"] > 0:
-                exit_result = {"at_ms": at_ms, "price": close, "reason": "PROFIT_HARVEST_NET_POSITIVE",
-                    "quality": "BINANCE_MARK_PRICE_1M_CLOSE", "leader_state": "NOT_REQUIRED_FOR_PROFIT_HARVEST", "pnl": p}
-                break
             state = "UNKNOWN"
             for snap in timeline:
                 snap_at = _shadow_dt(snap.observed_at)
@@ -3006,6 +3002,10 @@ def build_new_exit_policy_replay(trades: list[PaperTrade], cfg: dict) -> dict:
                     "reason": "PROTECTIVE_STOP_AFTER_LEADER_CLOSE_OR_UNKNOWN",
                     "quality": "BINANCE_MARK_PRICE_1M_OHLC_STOP_TOUCH_ESTIMATE",
                     "leader_state": state, "pnl": stop_pnl}
+                break
+            if p["net_estimate"] is not None and p["net_estimate"] > 0:
+                exit_result = {"at_ms": at_ms, "price": close, "reason": "PROFIT_HARVEST_NET_POSITIVE",
+                    "quality": "BINANCE_MARK_PRICE_1M_CLOSE", "leader_state": "NOT_REQUIRED_FOR_PROFIT_HARVEST", "pnl": p}
                 break
         if exit_result:
             p = exit_result["pnl"]
