@@ -104,7 +104,7 @@ class SyntheticRuntimeAuditTests(unittest.TestCase):
                 source_key=f"{trader_id}|P3|BTCUSDT|LONG", trader_id=trader_id,
                 symbol="BTCUSDT", side="LONG", status="OPEN", entry_price=100,
                 mark_price=100, quantity=10, notional=1000, margin_used=100, leverage=2,
-                stop_price=99.5, target_price=100.7, raw_json="{}"
+                stop_price=99.5, target_price=100.7, raw_json=json.dumps({"funding_history_verified": True, "funding_cost_actual": 0.0})
             )
             db.add(trade)
             db.commit()
