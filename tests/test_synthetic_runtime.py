@@ -23,11 +23,11 @@ class SyntheticRuntimeAuditTests(unittest.TestCase):
 
     def _trade(self, source_key="T5|P5|BTCUSDT|LONG", net=-1.0):
         with app.SessionLocal() as db:
-            trader = app.Trader(trader_id="T1", name="Synthetic Leader")
+            trader = app.Trader(trader_id=source_key.split("|", 1)[0], name="Synthetic Leader")
             db.add(trader)
             db.commit()
             t = app.PaperTrade(
-                source_key=source_key, trader_id="T1", trader_name="Synthetic Leader",
+                source_key=source_key, trader_id=source_key.split("|", 1)[0], trader_name="Synthetic Leader",
                 symbol="BTCUSDT", side="LONG", status="CLOSED",
                 entry_price=100.0, mark_price=99.0, quantity=10.0,
                 notional=1000.0, margin_used=100.0, leverage=2.0,
@@ -79,7 +79,7 @@ class SyntheticRuntimeAuditTests(unittest.TestCase):
                 source_key="T2|P2|BTCUSDT|LONG", trader_id="T2", symbol="BTCUSDT",
                 side="LONG", status="OPEN", entry_price=100, mark_price=95, quantity=10,
                 notional=1000, margin_used=100, leverage=2, stop_price=99.5,
-                target_price=100.7, raw_json="{}"
+                target_price=100.7, raw_json=json.dumps({"funding_history_verified": True, "funding_cost_actual": 0.0})
             )
             db.add(trade)
             db.commit()
