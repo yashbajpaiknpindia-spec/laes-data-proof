@@ -21,7 +21,7 @@ class SyntheticRuntimeAuditTests(unittest.TestCase):
     def tearDownClass(cls):
         app.Base.metadata.drop_all(app.engine)
 
-    def _trade(self, source_key="P1|BTCUSDT|LONG", net=-1.0):
+    def _trade(self, source_key="T5|P5|BTCUSDT|LONG", net=-1.0):
         with app.SessionLocal() as db:
             trader = app.Trader(trader_id="T1", name="Synthetic Leader")
             db.add(trader)
@@ -35,7 +35,7 @@ class SyntheticRuntimeAuditTests(unittest.TestCase):
                 estimated_costs=0.1, net_pnl=net, exit_price=99.0,
                 exit_reason="TEST_EXIT", opened_at=datetime(2026, 11, 8, tzinfo=timezone.utc),
                 closed_at=datetime(2026, 11, 8, 12, tzinfo=timezone.utc),
-                raw_json="{}"
+                raw_json=json.dumps({"funding_history_verified": True, "funding_cost_actual": 0.0})
             )
             db.add(t)
             db.commit()
