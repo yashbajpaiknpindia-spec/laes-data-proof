@@ -799,7 +799,8 @@ async def monitor_worker() -> None:
             if time.monotonic() - last_recovery_audit >= 600:
                 try:
                     audit = await run_post_exit_recovery_audit(max_trades=5)
-                    log_check("post_exit_recovery_audit", True, 200, None, f"audited={audit.get('audited', 0)} recovered_to_profit={audit.get('recovered_to_profit', 0)} failures={audit.get('failures', 0)}")
+                    audit_ok = audit.get("failures", 0) == 0 and not audit.get("blocked", False)
+                    log_check("post_exit_recovery_audit", audit_ok, 429 if audit.get("blocked") else 200 if audit_ok else 207, None, f"attempted={audit.get('attempted', 0)} audited={audit.get('audited', 0)} recovered_to_profit={audit.get('recovered_to_profit', 0)} failures={audit.get('failures', 0)} pending={audit.get('pending', 0)} status={audit.get('status')}")
                 except Exception as audit_exc:
                     log_check("post_exit_recovery_audit", False, None, None, str(audit_exc)[:700])
                 last_recovery_audit = time.monotonic()
@@ -832,7 +833,8 @@ async def _startup_recovery_audit() -> None:
     await asyncio.sleep(2)
     try:
         audit = await run_post_exit_recovery_audit(max_trades=5)
-        log_check("post_exit_recovery_audit_startup", True, 200, None, f"audited={audit.get('audited', 0)} recovered_to_profit={audit.get('recovered_to_profit', 0)} failures={audit.get('failures', 0)}")
+        audit_ok = audit.get("failures", 0) == 0 and not audit.get("blocked", False)
+        log_check("post_exit_recovery_audit_startup", audit_ok, 429 if audit.get("blocked") else 200 if audit_ok else 207, None, f"attempted={audit.get('attempted', 0)} audited={audit.get('audited', 0)} recovered_to_profit={audit.get('recovered_to_profit', 0)} failures={audit.get('failures', 0)} pending={audit.get('pending', 0)} status={audit.get('status')}")
     except Exception as exc:
         log_check("post_exit_recovery_audit_startup", False, None, None, str(exc)[:900])
 
@@ -1749,141 +1751,177 @@ def _leader_state_for_trade(db, trade: PaperTrade) -> tuple[str, str]:
 
 
 async def run_post_exit_recovery_audit(max_trades: int = 5) -> dict:
-    """
-    Read-only post-exit audit for closed losing paper trades.
-    Candle HIGH/LOW is intrabar potential only. A recovery is classified as
-    confirmed only when a Binance 1m CLOSE itself produces positive net PnL.
-    """
-    cfg = paper_config()
-    horizon_hours = max(1.0, min(24.0, float(cfg.get("post_exit_recovery_audit_hours", 24.0))))
-    audited = recovered = failures = 0
-    with SessionLocal() as db:
-        trades = db.scalars(select(PaperTrade).where(
-            PaperTrade.status == "CLOSED", PaperTrade.net_pnl < 0
-        ).order_by(PaperTrade.closed_at)).all()
-
-    for trade in trades:
-        if audited >= max(1, int(max_trades)):
-            break
-        raw = parse_json(trade.raw_json)
-        if raw.get("post_exit_recovery_audit_version") == 5:
-            continue
-        if not trade.closed_at or not trade.exit_price or not trade.entry_price:
-            continue
-        closed_at = trade.closed_at
-        if closed_at.tzinfo is None:
-            closed_at = closed_at.replace(tzinfo=timezone.utc)
-        start_ms = int(closed_at.timestamp() * 1000)
-        end_ms = start_ms + int(horizon_hours * 3600 * 1000)
-        try:
-            rows, _ = await binance_get("/fapi/v1/markPriceKlines", {
-                "symbol": trade.symbol, "interval": "1m",
-                "startTime": start_ms, "endTime": end_ms, "limit": 1500
-            })
-            if not isinstance(rows, list) or not rows:
-                raise RuntimeError("No Binance mark-price candles returned")
-            directional = 1.0 if trade.side == "LONG" else -1.0
-            best_close = best_intrabar = None
-            first_entry_close = first_net_profit_close = first_net_profit_intrabar = None
-            worst_close = None
-            for row in rows:
-                if not isinstance(row, (list, tuple)) or len(row) < 7:
-                    continue
-                at_ms = int(row[0])
-                high, low, close = safe_float(row[2]), safe_float(row[3]), safe_float(row[4])
-                if high is None or low is None or close is None:
-                    continue
-                def candidate(price: float) -> tuple[float, float, float]:
-                    gross = directional * (price - trade.entry_price) * trade.quantity
-                    turnover = (trade.entry_price + price) * trade.quantity
-                    cost = turnover * ((float(cfg["taker_fee_pct"]) + float(cfg["slippage_pct"])) / 100.0)
-                    return gross - cost, gross, cost
-                close_net, close_gross, close_cost = candidate(close)
-                favorable = high if trade.side == "LONG" else low
-                intrabar_net, intrabar_gross, intrabar_cost = candidate(favorable)
-                if best_close is None or close_net > best_close["max_net_pnl"]:
-                    best_close = {"max_net_pnl": close_net, "max_price": close, "at_ms": at_ms, "gross": close_gross, "cost": close_cost}
-                if best_intrabar is None or intrabar_net > best_intrabar["max_net_pnl"]:
-                    best_intrabar = {"max_net_pnl": intrabar_net, "max_price": favorable, "at_ms": at_ms, "gross": intrabar_gross, "cost": intrabar_cost}
-                if close_net > 0 and first_net_profit_close is None:
-                    first_net_profit_close = at_ms
-                if intrabar_net > 0 and first_net_profit_intrabar is None:
-                    first_net_profit_intrabar = at_ms
-                crossed_close = (close >= trade.entry_price) if trade.side == "LONG" else (close <= trade.entry_price)
-                if crossed_close and first_entry_close is None:
-                    first_entry_close = at_ms
-                if worst_close is None or close_net < worst_close["min_net_pnl"]:
-                    worst_close = {"min_net_pnl": close_net, "at_ms": at_ms}
-            if best_close is None or best_intrabar is None:
+    """Resumable read-only audit. Never bypasses the Binance REST circuit breaker."""
+    async with recovery_audit_lock:
+        cfg = paper_config()
+        horizon_hours = max(1.0, min(72.0, float(cfg.get("post_exit_recovery_audit_hours", 24.0))))
+        with SessionLocal() as db:
+            closed = db.scalars(select(PaperTrade).where(PaperTrade.status == "CLOSED").order_by(PaperTrade.closed_at)).all()
+        pending = [t for t in closed if parse_json(t.raw_json).get("post_exit_recovery_audit_version", 0) != 6]
+        cooldown = binance_rest_status()
+        if cooldown.get("blocked"):
+            return {"audited": 0, "attempted": 0, "recovered_to_profit": 0, "failures": 0,
+                    "blocked": True, "blocked_until": cooldown.get("blocked_until"),
+                    "remaining_seconds": cooldown.get("remaining_seconds"), "pending": len(pending),
+                    "status": "WAITING_FOR_BINANCE_REST_COOLDOWN"}
+        attempted = audited = recovered = failures = 0
+        for trade in pending:
+            if attempted >= max(1, min(20, int(max_trades))):
+                break
+            if binance_rest_status().get("blocked"):
+                break
+            raw = parse_json(trade.raw_json)
+            closed_at = _shadow_dt(trade.closed_at)
+            if not closed_at or not trade.exit_price or not trade.entry_price:
                 continue
+            attempted += 1
+            start_ms = int(closed_at.timestamp() * 1000)
+            end_ms = start_ms + int(horizon_hours * 3600000)
+            try:
+                rows_all = []
+                cursor = start_ms
+                while cursor < end_ms:
+                    rows, _ = await binance_get("/fapi/v1/markPriceKlines", {
+                        "symbol": trade.symbol, "interval": "1m",
+                        "startTime": cursor, "endTime": end_ms, "limit": 1500
+                    })
+                    if not isinstance(rows, list) or not rows:
+                        break
+                    rows_all.extend(rows)
+                    next_cursor = int(rows[-1][0]) + 60000
+                    if next_cursor <= cursor or len(rows) < 1500:
+                        break
+                    cursor = next_cursor
+                if not rows_all:
+                    raise RuntimeError("No Binance post-exit mark-price candles returned")
+                direction = 1.0 if trade.side == "LONG" else -1.0
+                entry_rate = abs(safe_float(raw.get("funding_rate_at_entry")) or 0.0)
+                next_funding = safe_float(raw.get("next_funding_time"))
+                opened = _shadow_dt(trade.opened_at) or closed_at
+                opened_ms = int(opened.timestamp() * 1000)
+                def pnl_at(price, at_ms):
+                    gross = direction * (price - trade.entry_price) * trade.quantity
+                    turnover = (trade.entry_price + price) * trade.quantity
+                    costs = turnover * (float(cfg["taker_fee_pct"]) + float(cfg["slippage_pct"])) / 100.0
+                    if next_funding:
+                        next_ms = next_funding
+                        while next_ms <= opened_ms:
+                            next_ms += 28800000
+                        count = 0 if at_ms < next_ms else 1 + int((at_ms - next_ms) // 28800000)
+                    else:
+                        count = max(0, int((at_ms - opened_ms) // 28800000))
+                    funding = float(trade.notional or 0.0) * entry_rate * count
+                    return gross - costs - funding, gross, costs + funding, funding
+                best_close = None
+                best_intrabar = None
+                first_profit = first_entry = first_intrabar_profit = None
+                worst = None
+                for row in rows_all:
+                    if not isinstance(row, (list, tuple)) or len(row) < 7:
+                        continue
+                    at_ms = int(row[0])
+                    high, low, close = safe_float(row[2]), safe_float(row[3]), safe_float(row[4])
+                    if high is None or low is None or close is None:
+                        continue
+                    net, gross, costs, funding = pnl_at(close, at_ms)
+                    favorable = high if trade.side == "LONG" else low
+                    intra_net, _, _, _ = pnl_at(favorable, at_ms)
+                    if best_close is None or net > best_close["net"]:
+                        best_close = {"net": net, "gross": gross, "costs": costs, "funding": funding, "price": close, "at": at_ms}
+                    if best_intrabar is None or intra_net > best_intrabar["net"]:
+                        best_intrabar = {"net": intra_net, "price": favorable, "at": at_ms}
+                    if net > 0 and first_profit is None:
+                        first_profit = at_ms
+                    if intra_net > 0 and first_intrabar_profit is None:
+                        first_intrabar_profit = at_ms
+                    if ((trade.side == "LONG" and close >= trade.entry_price) or
+                        (trade.side == "SHORT" and close <= trade.entry_price)) and first_entry is None:
+                        first_entry = at_ms
+                    if worst is None or net < worst["net"]:
+                        worst = {"net": net, "at": at_ms}
+                if best_close is None or best_intrabar is None:
+                    raise RuntimeError("No valid OHLC mark candles returned")
+                recovered_profit = best_close["net"] > 0
+                intrabar_only = not recovered_profit and best_intrabar["net"] > 0
+                recovered_entry = first_entry is not None
+                status = ("RECOVERED_TO_NET_PROFIT_CLOSE_CONFIRMED" if recovered_profit else
+                          "INTRABAR_NET_PROFIT_ONLY" if intrabar_only else
+                          "RECOVERED_TO_ENTRY_CLOSE_CONFIRMED" if recovered_entry else "NO_ENTRY_RECOVERY")
+                raw.update({
+                    "post_exit_recovery_audit_version": 6,
+                    "post_exit_recovery_audit_status": "COMPLETE",
+                    "post_exit_recovery_status": status,
+                    "post_exit_recovery_market_source": "BINANCE_USDM_MARK_PRICE_1M_CLOSE_CONFIRMED",
+                    "post_exit_recovery_horizon_hours": horizon_hours,
+                    "post_exit_max_net_pnl": round(best_close["net"], 8),
+                    "post_exit_max_gross_pnl": round(best_close["gross"], 8),
+                    "post_exit_max_price": best_close["price"],
+                    "post_exit_max_at": datetime.fromtimestamp(best_close["at"]/1000, timezone.utc).isoformat(),
+                    "post_exit_max_funding_estimate": round(best_close["funding"], 8),
+                    "post_exit_intrabar_max_net_pnl": round(best_intrabar["net"], 8),
+                    "post_exit_intrabar_max_price": best_intrabar["price"],
+                    "post_exit_intrabar_max_at": datetime.fromtimestamp(best_intrabar["at"]/1000, timezone.utc).isoformat(),
+                    "post_exit_return_to_entry_at": datetime.fromtimestamp(first_entry/1000, timezone.utc).isoformat() if first_entry else None,
+                    "post_exit_minutes_to_entry": round((first_entry-start_ms)/60000, 2) if first_entry else None,
+                    "post_exit_first_net_profit_at": datetime.fromtimestamp(first_profit/1000, timezone.utc).isoformat() if first_profit else None,
+                    "post_exit_minutes_to_net_profit": round((first_profit-start_ms)/60000, 2) if first_profit else None,
+                    "post_exit_intrabar_first_net_profit_at": datetime.fromtimestamp(first_intrabar_profit/1000, timezone.utc).isoformat() if first_intrabar_profit else None,
+                    "post_exit_intrabar_minutes_to_net_profit": round((first_intrabar_profit-start_ms)/60000, 2) if first_intrabar_profit else None,
+                    "post_exit_minutes_to_best": round((best_close["at"]-start_ms)/60000, 2),
+                    "post_exit_observed_minutes": round((int(rows_all[-1][0])-start_ms)/60000, 2),
+                    "post_exit_worst_net_pnl": round(worst["net"], 8) if worst else None,
+                    "post_exit_worst_at": datetime.fromtimestamp(worst["at"]/1000, timezone.utc).isoformat() if worst else None,
+                    "post_exit_recovery_profit_usdt": round(max(0.0, best_close["net"]), 8),
+                    "post_exit_intrabar_potential_profit_usdt": round(max(0.0, best_intrabar["net"]), 8),
+                    "post_exit_cost_assumption": "Current configured taker fee and slippage; historic settings were not stored.",
+                    "post_exit_funding_assumption": "Conservative debit at absolute entry funding rate; not a verified exchange funding settlement history.",
+                    "post_exit_old_exit_reason": trade.exit_reason,
+                    "post_exit_recovery_label": f"Post-exit peak {best_close['net']:+.4f} USDT at +{(best_close['at']-start_ms)/60000:.0f}m; source Binance mark-price 1m close; old exit {trade.exit_reason}"
+                })
+                with SessionLocal() as db:
+                    live = db.get(PaperTrade, trade.id)
+                    if live:
+                        live.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
+                        if not db.scalar(select(PaperTradeEvent.id).where(
+                            PaperTradeEvent.paper_trade_id == trade.id,
+                            PaperTradeEvent.event_type == "POST_EXIT_RECOVERY_AUDIT_V6"
+                        ).limit(1)):
+                            db.add(PaperTradeEvent(paper_trade_id=trade.id, event_type="POST_EXIT_RECOVERY_AUDIT_V6",
+                                                   observed_at=live.closed_at or now(), value=best_close["net"],
+                                                   detail=raw["post_exit_recovery_label"]))
+                        db.commit()
+                audited += 1
+                recovered += int(recovered_profit)
+            except Exception as exc:
+                failures += 1
+                with SessionLocal() as db:
+                    live = db.get(PaperTrade, trade.id)
+                    if live:
+                        latest = parse_json(live.raw_json)
+                        latest["post_exit_audit_last_attempt_at"] = now().isoformat()
+                        latest["post_exit_audit_last_error"] = str(exc)[:500]
+                        live.raw_json = json.dumps(latest, separators=(",", ":"), default=str)
+                        db.commit()
+                if binance_rest_status().get("blocked"):
+                    break
+                log_check("post_exit_recovery_audit", False, None, None, f"trade={trade.id} {trade.symbol}: {str(exc)[:500]}")
+        with SessionLocal() as db:
+            after = db.scalars(select(PaperTrade).where(PaperTrade.status == "CLOSED")).all()
+        pending_count = sum(1 for t in after if parse_json(t.raw_json).get("post_exit_recovery_audit_version", 0) != 6)
+        cooldown = binance_rest_status()
+        return {"audited": audited, "attempted": attempted, "recovered_to_profit": recovered,
+                "failures": failures, "blocked": bool(cooldown.get("blocked")),
+                "blocked_until": cooldown.get("blocked_until"), "remaining_seconds": cooldown.get("remaining_seconds"),
+                "pending": pending_count,
+                "status": "WAITING_FOR_BINANCE_REST_COOLDOWN" if cooldown.get("blocked") else "COMPLETE" if pending_count == 0 else "PARTIAL"}
 
-            recovered_to_profit = best_close["max_net_pnl"] > 0
-            recovered_to_entry = first_entry_close is not None
-            intrabar_only = (not recovered_to_profit) and best_intrabar["max_net_pnl"] > 0
-            status = (
-                "RECOVERED_TO_NET_PROFIT_CLOSE_CONFIRMED" if recovered_to_profit else
-                "INTRABAR_NET_PROFIT_ONLY" if intrabar_only else
-                "RECOVERED_TO_ENTRY_CLOSE_CONFIRMED" if recovered_to_entry else
-                "NO_ENTRY_RECOVERY"
-            )
-            close_profit_minutes = ((first_net_profit_close - start_ms) / 60000) if first_net_profit_close else None
-            intrabar_profit_minutes = ((first_net_profit_intrabar - start_ms) / 60000) if first_net_profit_intrabar else None
-            raw.update({
-                "post_exit_recovery_audit_version": 5,
-                "post_exit_recovery_status": status,
-                "post_exit_recovery_market_source": "BINANCE_USDM_MARK_PRICE_1M_CLOSE_CONFIRMED",
-                "post_exit_recovery_horizon_hours": horizon_hours,
-                "post_exit_max_net_pnl": round(best_close["max_net_pnl"], 8),
-                "post_exit_max_gross_pnl": round(best_close["gross"], 8),
-                "post_exit_max_price": best_close["max_price"],
-                "post_exit_max_at": datetime.fromtimestamp(best_close["at_ms"]/1000, timezone.utc).isoformat(),
-                "post_exit_intrabar_max_net_pnl": round(best_intrabar["max_net_pnl"], 8),
-                "post_exit_intrabar_max_price": best_intrabar["max_price"],
-                "post_exit_intrabar_max_at": datetime.fromtimestamp(best_intrabar["at_ms"]/1000, timezone.utc).isoformat(),
-                "post_exit_return_to_entry_at": datetime.fromtimestamp(first_entry_close/1000, timezone.utc).isoformat() if first_entry_close else None,
-                "post_exit_minutes_to_entry": round((first_entry_close-start_ms)/60000, 2) if first_entry_close else None,
-                "post_exit_first_net_profit_at": datetime.fromtimestamp(first_net_profit_close/1000, timezone.utc).isoformat() if first_net_profit_close else None,
-                "post_exit_minutes_to_net_profit": round(close_profit_minutes, 2) if close_profit_minutes is not None else None,
-                "post_exit_intrabar_first_net_profit_at": datetime.fromtimestamp(first_net_profit_intrabar/1000, timezone.utc).isoformat() if first_net_profit_intrabar else None,
-                "post_exit_intrabar_minutes_to_net_profit": round(intrabar_profit_minutes, 2) if intrabar_profit_minutes is not None else None,
-                "post_exit_minutes_to_best": round((best_close["at_ms"]-start_ms)/60000, 2),
-                "post_exit_observed_minutes": round((int(rows[-1][0])-start_ms)/60000, 2),
-                "post_exit_worst_net_pnl": round(worst_close["min_net_pnl"], 8) if worst_close else None,
-                "post_exit_worst_at": datetime.fromtimestamp(worst_close["at_ms"]/1000, timezone.utc).isoformat() if worst_close else None,
-                "post_exit_recovery_profit_usdt": round(max(0.0, best_close["max_net_pnl"]), 8),
-                "post_exit_intrabar_potential_profit_usdt": round(max(0.0, best_intrabar["max_net_pnl"]), 8),
-                "post_exit_old_exit_reason": trade.exit_reason,
-                "post_exit_recovery_label": (
-                    f"[AFTER EXIT: CLOSE-CONFIRMED NET PROFIT +{best_close['max_net_pnl']:.4f} USDT · +{close_profit_minutes:.0f}m | best +{(best_close['at_ms']-start_ms)/60000:.0f}m | old: {trade.exit_reason}]"
-                    if recovered_to_profit else
-                    f"[AFTER EXIT: INTRABAR-ONLY POTENTIAL +{best_intrabar['max_net_pnl']:.4f} USDT; NO PROFITABLE 1m CLOSE | old: {trade.exit_reason}]"
-                    if intrabar_only else
-                    f"[AFTER EXIT: ENTRY RECOVERED ON CLOSE +{(first_entry_close-start_ms)/60000:.0f}m BUT NOT NET PROFIT | old: {trade.exit_reason}]"
-                    if recovered_to_entry else
-                    f"[AFTER EXIT: NO ENTRY/NET RECOVERY IN {horizon_hours:.0f}H | old: {trade.exit_reason}]"
-                )
-            })
-            with SessionLocal() as db:
-                live = db.get(PaperTrade, trade.id)
-                if live:
-                    live.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
-                    exists = db.scalar(select(PaperTradeEvent.id).where(
-                        PaperTradeEvent.paper_trade_id == trade.id,
-                        PaperTradeEvent.event_type == "POST_EXIT_RECOVERY_AUDIT_V5"
-                    ).limit(1))
-                    if not exists:
-                        db.add(PaperTradeEvent(
-                            paper_trade_id=trade.id, event_type="POST_EXIT_RECOVERY_AUDIT_V5",
-                            observed_at=live.closed_at or now(), value=best_close["max_net_pnl"],
-                            detail=raw["post_exit_recovery_label"]
-                        ))
-                    db.commit()
-            audited += 1
-            recovered += 1 if recovered_to_profit else 0
-        except Exception as exc:
-            failures += 1
-            log_check("post_exit_recovery_audit", False, None, None, f"trade={trade.id} {trade.symbol}: {str(exc)[:500]}")
-    return {"audited": audited, "recovered_to_profit": recovered, "failures": failures}
+
+def _shadow_dt(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 async def evaluate_open_paper_trades(
