@@ -24,6 +24,20 @@ class ExitPolicyRegressionTests(unittest.TestCase):
         self.assertIn('exit_reason = "LEADER_POSITION_REVERSED"', APP)
         self.assertIn('exit_reason = "LEADER_POSITION_CLOSED"', APP)
 
+    def test_history_position_is_used_as_exact_close_evidence(self):
+        self.assertIn("Provider HistoryPosition is authoritative closure evidence", APP)
+        self.assertIn("HistoryPosition.position_id == position_id", APP)
+        self.assertIn("CLOSED_CONFIRMED", APP)
+
+    def test_post_exit_recovery_requires_1m_close_for_realized_recovery(self):
+        self.assertIn("post_exit_recovery_audit_version") and self.assertIn('"post_exit_recovery_audit_version": 5', APP)
+        self.assertIn("RECOVERED_TO_NET_PROFIT_CLOSE_CONFIRMED", APP)
+        self.assertIn("INTRABAR_NET_PROFIT_ONLY", APP)
+        self.assertIn("post_exit_intrabar_potential_profit_usdt", APP)
+
+    def test_sqlite_timestamp_normalization_is_present(self):
+        self.assertIn("last_path_at.tzinfo is None", APP)
+
     def test_ui_no_longer_exposes_removed_controls(self):
         self.assertNotIn("Leader-continuation hard-loss ceiling", HTML)
         self.assertNotIn("Maximum leader-continuation hold", HTML)
