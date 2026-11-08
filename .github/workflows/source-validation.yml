@@ -1,14 +1,13 @@
-name: LAES source validation
+name: LAES offline release-candidate validation
 
 on:
   push:
     branches:
-      - main
       - "repair/**"
   pull_request:
 
 jobs:
-  syntax:
+  validate-and-package:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,8 +18,19 @@ jobs:
         run: pip install -r requirements.txt
       - name: Compile Python application
         run: python -m py_compile app.py
+      - name: Run exit-policy regression tests
+        run: python -m unittest discover -s tests -v
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
       - name: Validate dashboard JavaScript
         run: node --check static/app.js
+      - name: Build offline ZIP
+        run: |
+          zip -r /tmp/LAES-offline-release-candidate.zip . \
+            -x ".git/*" ".env" ".venv/*" "__pycache__/*" "*.pyc" "*.db" ".pytest_cache/*"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LAES-offline-release-candidate
+          path: /tmp/LAES-offline-release-candidate.zip
+          retention-days: 14
