@@ -2937,6 +2937,7 @@ def build_new_exit_policy_replay(trades: list[PaperTrade], cfg: dict) -> dict:
             "old_exit_reason": trade.exit_reason,
             "old_realized_net_pnl": round(float(trade.net_pnl or 0.0), 8),
             "leader_identity": "PROVIDER_POSITION_ID" if position_id else "SYMBOL_SIDE_ONLY",
+            "leader_identity_note": "Exact provider position ID is available." if position_id else "Provider position ID unavailable; symbol/side identity is not unique.",
             "baseline_leader_open_confirmed": raw.get("leader_state_at_check") == "OPEN_OBSERVED"
         }
         if old_exit is None:
@@ -3014,14 +3015,18 @@ def build_new_exit_policy_replay(trades: list[PaperTrade], cfg: dict) -> dict:
                 "leader_state_at_exit": exit_result["leader_state"],
                 "new_gross_pnl": p["gross"], "new_fee_slippage_estimate": p["fees_slippage_estimate"],
                 "new_funding_estimate": p["funding_estimate"],
-                "new_policy_net_pnl_estimate": p["net_estimate"], "checkpoints": checkpoints})
+                "new_policy_net_pnl_estimate": p["net_estimate"],
+                "hold_after_old_exit_hours": round((exit_result["at_ms"] - int(old_exit.timestamp() * 1000)) / 3600000, 3),
+                "checkpoints": checkpoints})
         elif last:
             at_ms, price = last
             p = pnl_at(trade, price, at_ms)
             rows.append({**common, "replay_status": "OPEN_UNREALIZED_AT_LAST_CANDLE",
                 "last_observed_at": datetime.fromtimestamp(at_ms / 1000, timezone.utc).isoformat(),
                 "last_observed_mark": price, "new_unrealized_net_pnl_estimate": p["net_estimate"],
-                "new_unrealized_gross_pnl": p["gross"], "checkpoints": checkpoints})
+                "new_unrealized_gross_pnl": p["gross"],
+                "hold_after_old_exit_hours": round((at_ms - int(old_exit.timestamp() * 1000)) / 3600000, 3),
+                "checkpoints": checkpoints})
         else:
             rows.append({**common, "replay_status": "NO_VALID_POST_EXIT_CANDLE", "checkpoints": checkpoints})
 
