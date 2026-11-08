@@ -56,6 +56,10 @@ class ClosedTradeForensicsTests(unittest.TestCase):
         self.assertIn('"leader_check_at": leader_checks.get(trade.id', APP)
         self.assertIn('function leaderCheck(t)', JS)
         self.assertIn('LATEST_VISIBLE_KOPYON_SNAPSHOT', APP)
+        migration = APP[APP.index("def migrate_paper_audit_metadata"):APP.index("def _leader_state_for_trade")]
+        paper_api = APP[APP.index('@app.get("/api/paper")'):APP.index('@app.get("/api/paper/research-replay")')]
+        self.assertNotIn("_leader_state_for_trade(db, open_trade)", migration)
+        self.assertIn("leader_checks = {}", paper_api)
 
     def test_new_vs_old_research_pnl_is_visible_and_labelled(self):
         self.assertIn('@app.get("/api/paper/research-replay")', APP)
