@@ -23,3 +23,85 @@
 .market-universe-panel{margin-bottom:14px}
 .market-universe-panel table{min-width:780px}
 @media(max-width:780px){.top-live-strip{margin:-16px 0 12px}.top-live-title{display:none}.paper-tab-buttons{overflow:auto}.paper-table-tab{flex:0 0 auto}}
+
+
+/* Responsive pass: keep the dense research UI usable on narrow phones. */
+html{scroll-behavior:smooth}
+body{overflow-x:hidden}
+.app-shell,.main,.page{min-width:0;max-width:100%}
+.table-scroll{max-width:100%;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch;overscroll-behavior-x:contain;scrollbar-width:thin}
+.table-scroll table{width:max-content;min-width:850px}
+.table-scroll th:first-child,.table-scroll td:first-child{position:sticky;left:0;z-index:2;background:#111b27}
+.table-scroll tbody td:first-child{background:#111a25}
+button,input,select,textarea{font:inherit}
+button{touch-action:manipulation}
+.panel,.metric-card,.trader-card,.opportunity-card{min-width:0}
+@media(max-width:780px){
+  .sidebar{position:sticky;top:0;z-index:50;background:rgba(9,14,20,.97);backdrop-filter:blur(12px)}
+  .brand{align-items:center}
+  .nav{padding:2px 0 5px;scrollbar-width:thin;overscroll-behavior-x:contain}
+  .nav-item{flex:0 0 auto;min-height:38px}
+  .main{width:100%;max-width:100%;padding:0 12px 28px}
+  .topbar{gap:10px;margin-bottom:16px}
+  .topbar h1{font-size:21px}
+  .top-actions{gap:6px}
+  .source-chip{min-width:0;padding:7px}
+  .top-actions .btn{min-height:36px}
+  .top-live-strip{top:112px;z-index:35;gap:5px;padding:7px 0;margin:0 -12px 12px;padding-left:12px;padding-right:12px}
+  .top-live-btn{min-height:36px;padding:8px 9px}
+  .hero{min-height:0;padding:17px;border-radius:13px}
+  .hero h2{font-size:22px}
+  .hero p{font-size:11px;line-height:1.55}
+  .hero-meta{min-width:0}
+  .metric-grid,.paper-metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+  .metric-card{padding:11px;border-radius:10px}
+  .metric-label{font-size:8px;line-height:1.45}
+  .metric-value{font-size:20px;overflow-wrap:anywhere}
+  .metric-foot{font-size:9px;line-height:1.45}
+  .content-grid,.content-grid.lower-grid,.system-grid{grid-template-columns:minmax(0,1fr);gap:9px}
+  .panel{padding:13px;border-radius:11px}
+  .panel-heading{gap:8px;flex-wrap:wrap}
+  .panel-heading h3{font-size:14px}
+  .panel-heading p{line-height:1.5}
+  .page-intro{gap:10px;margin-bottom:14px}
+  .page-intro h2{font-size:22px}
+  .page-intro p{font-size:10px;line-height:1.5}
+  .page-actions{flex-wrap:wrap}
+  .page-actions .btn{min-height:38px}
+  .search-input{width:100%;min-width:0;flex:1 1 180px}
+  .filter-row{gap:8px;align-items:flex-start;flex-wrap:wrap}
+  .trader-grid{grid-template-columns:minmax(0,1fr)}
+  .trader-card{padding:13px}
+  .opportunity-card{padding:13px}
+  .opp-head{gap:8px;flex-wrap:wrap}
+  .opp-stats{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .opp-bottom{grid-template-columns:minmax(0,1fr)}
+  .paper-tab-buttons{position:sticky;top:158px;z-index:20;background:#0b121a;padding:8px 0}
+  .paper-table-tab{min-height:38px}
+  .table-scroll{border:1px solid var(--line2);border-radius:8px}
+  .table-scroll table{min-width:900px}
+  .table-scroll th,.table-scroll td{padding:10px 9px;font-size:10px}
+  .settings-form input:not([type=checkbox]),.market-search input{min-height:40px}
+  .market-search{flex-wrap:wrap}
+  .market-search input{width:100%;min-width:0}
+  .market-search .btn{width:100%;min-height:40px}
+  .market-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .profile-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .trader-dialog{width:calc(100vw - 20px);max-width:none;max-height:88dvh;padding:14px}
+}
+@media(max-width:430px){
+  .main{padding-left:9px;padding-right:9px}
+  .top-live-strip{margin-left:-9px;margin-right:-9px;padding-left:9px;padding-right:9px;top:108px}
+  .source-chip{font-size:8px;gap:4px}
+  .topbar h1{font-size:19px}
+  .metric-card{padding:10px}
+  .metric-value{font-size:18px}
+  .form-grid{grid-template-columns:minmax(0,1fr)}
+  .monitor-step{gap:8px}
+  .monitor-step small{line-height:1.45}
+  .step-state{font-size:8px}
+  .panel-heading .btn{max-width:100%;white-space:normal}
+  .paper-tab-buttons{top:150px}
+  .market-grid{gap:7px}
+}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}*,*::before,*::after{transition:none!important;animation:none!important}}
