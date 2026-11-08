@@ -31,7 +31,7 @@ class ExitPolicyRegressionTests(unittest.TestCase):
 
     def test_post_exit_recovery_requires_1m_close_for_realized_recovery(self):
         self.assertIn("post_exit_recovery_audit_version", APP)
-        self.assertIn('"post_exit_recovery_audit_version": 5', APP)
+        self.assertIn('"post_exit_recovery_audit_version": 6', APP)
         self.assertIn("RECOVERED_TO_NET_PROFIT_CLOSE_CONFIRMED", APP)
         self.assertIn("INTRABAR_NET_PROFIT_ONLY", APP)
         self.assertIn("post_exit_intrabar_potential_profit_usdt", APP)

@@ -8,7 +8,7 @@ window.addEventListener("unhandledrejection", e => {
 const bind=(id,event,fn)=>{const el=$(id);if(!el){console.warn("LAES missing DOM hook:",id);return false;}el.addEventListener(event,fn);return true;};
 const click=(id,fn)=>{const el=$(id);if(!el){console.warn("LAES missing DOM hook:",id);return false;}el.onclick=fn;return true;};
 const $=id=>document.getElementById(id);
-const state={page:"overview",paperTab:null};
+const state={page:"overview",paperTab:null,closedFilter:"all",paperData:null,researchReplay:null};
 let paperDetailTimer=null;
 let paperLoadInFlight=false;
 const fmt=(v,d=2)=>v===null||v===undefined||v===""||Number.isNaN(Number(v))?"—":Number(v).toLocaleString(undefined,{maximumFractionDigits:d});
@@ -32,13 +32,15 @@ function setPage(name, options={}) {
  else if(name==="traders")loadTraders();
  else if(name==="positions")loadPositions();
  else if(name==="opportunities")loadOpportunities();
- else if(name==="paper")loadPaper();
+ else if(name==="paper"){loadPaper();loadResearchReplay();}
  else if(name==="market"){loadMarket(false);loadMarketUniverse();}
  else if(name==="database")loadSystem();
  return true;
 }
 document.addEventListener("click",e=>{
  const target=e.target instanceof Element?e.target:e.target?.parentElement;
+ const filter=target?.closest("[data-closed-filter]");
+ if(filter){e.preventDefault();setClosedTradeFilter(filter.dataset.closedFilter);return;}
  const paperTab=target?.closest("[data-paper-tab]");
  if(paperTab){e.preventDefault();switchPaperTab(paperTab.dataset.paperTab);return;}
  const nav=target?.closest(".nav-item[data-page]");
@@ -71,12 +73,15 @@ async function refreshOverview(){
  if(!d.kopyon?.configured)notice("KOPYON_API_KEY is not visible to this running service. Add it to laes-data-proof-python, not the retired Elixir service.","error");
  if(!d.database?.persistent)notice("The running service is not connected to persistent PostgreSQL. Check DATABASE_URL on laes-data-proof-python.","error");
  if(state.page==="overview"){
-  try{const p=await api("/api/paper");$("mPaperEquity").textContent=money(p.equity);$("mPaperPnl").textContent="Realized "+money(p.realized_pnl)+" · Unrealized "+money(p.unrealized_pnl);}catch{}
+  try{const p=await api("/api/paper");$("mPaperEquity").textContent=money(p.equity);$("mPaperPnl").innerHTML='Realized <b class="'+(Number(p.realized_pnl)>=0?"positive":"negative")+'">'+money(p.realized_pnl)+'</b> · Unrealized <b class="'+(Number(p.unrealized_pnl)>=0?"positive":"negative")+'">'+money(p.unrealized_pnl)+'</b>';}catch{}
   try{const o=await api("/api/opportunities?limit=100");const q=o.filter(x=>x.qualified);$("mOpportunities").textContent=fmt(q.length,0);$("navOppCount").textContent=fmt(q.length,0);renderMini(o.slice(0,5));}catch(e){$("overviewOpps").innerHTML='<div class="empty-state">'+esc(e.message)+'</div>';}
  }
  }catch(e){notice("Dashboard status unavailable: "+e.message,"error");}
 }
-function renderMini(items){if(!items.length){$("overviewOpps").innerHTML='<div class="empty-state">No qualifying or underwater positions observed yet. Only live provider snapshots appear here.</div>';return;}$("overviewOpps").innerHTML=items.map(o=>'<div class="mini-opp"><div><b>'+esc(o.symbol)+' · '+esc(o.side)+' · '+esc(o.trader_name)+'</b><small>'+esc(o.status)+' · adverse '+pct(o.adverse_pct)+' · observed '+date(o.observed_at)+'</small></div><strong>'+money(o.unrealized_pnl)+'</strong><span class="status-tag '+(o.qualified?"qualified":"")+'">'+(o.qualified?"PAPER READY":"WATCH")+'</span></div>').join("");}
+function renderMini(items){
+ if(!items.length){$("overviewOpps").innerHTML='<div class="empty-state">No qualifying or underwater positions observed yet. Only live provider snapshots appear here.</div>';return;}
+ $("overviewOpps").innerHTML=items.map(o=>'<div class="mini-opp"><div><b>'+esc(o.symbol)+' · '+esc(o.side)+' · '+esc(o.trader_name)+'</b><small>'+esc(o.status)+' · adverse '+pct(o.adverse_pct)+' · observed '+date(o.observed_at)+'</small></div><strong class="'+(Number(o.unrealized_pnl)>=0?"positive":"negative")+'">'+money(o.unrealized_pnl)+'</strong><span class="status-tag '+(o.qualified?"qualified":"")+'">'+(o.qualified?"PAPER READY":"WATCH")+'</span></div>').join("");
+}
 async function loadTraders(){
  $("traderGrid").innerHTML='<div class="empty-state">Loading discovered public trader records…</div>';
  try{const q=encodeURIComponent($("traderSearch").value||"");const rows=await api("/api/traders?limit=250&search="+q);$("traderListCount").textContent=rows.length+" live traders stored";
@@ -96,7 +101,7 @@ async function openTrader(enc){
  const d=await api("/api/traders/"+encodeURIComponent(id)),t=d.trader,p=d.profile||{},hs=d.history_summary||{};$("dialogName").textContent=t.name||id;$("dialogSub").textContent=id+" · "+(t.portfolio_type||"Portfolio")+" · visibility: "+t.visibility;
  const metrics=[["ROI",pct((t.roi||0)*100)],["Max drawdown",pct((t.max_drawdown||0)*100)],["Copier PnL",money(t.copier_pnl)],["Sharpe",fmt(t.sharpe_ratio)],["AUM",money(t.aum)],["Profit share",pct((p.profitShare||0)*100)],["Copiers",fmt(p.copiers??t.raw?.copiers,0)],["Margin balance",p.sourceDetails?.marginBalance?money(p.sourceDetails.marginBalance):"Not reported"]];
  let html=p.bio?'<p class="profile-bio">'+esc(p.bio)+'</p>':"";
- html+='<div class="profile-grid">'+metrics.map(m=>'<div class="profile-metric"><small>'+esc(m[0])+'</small><b>'+esc(m[1])+'</b></div>').join("")+'</div>';
+ html+='<div class="profile-grid">'+metrics.map(m=>{const isPnl=m[0]==="Copier PnL";const amount=parseFloat(String(m[1]).replace(/[^0-9+-.]/g,""));return '<div class="profile-metric"><small>'+esc(m[0])+'</small><b class="'+(isPnl?(amount>=0?"positive":"negative"):"")+'">'+esc(m[1])+'</b></div>';}).join("")+'</div>';
  html+='<div class="analysis-box"><h4>TRADER USUAL HOLDING BEHAVIOUR</h4><div class="analysis-line"><span>Completed history rows</span><b>'+fmt(hs.records,0)+'</b></div><div class="analysis-line"><span>Median holding time</span><b>'+duration(hs.median_hold_hours)+'</b></div><div class="analysis-line"><span>Average holding time</span><b>'+duration(hs.avg_hold_hours)+'</b></div><div class="analysis-line"><span>Closed-history win rate</span><b>'+pct(hs.win_rate_closed_history===null?null:hs.win_rate_closed_history*100)+'</b></div><div class="analysis-line"><span>Average net PnL</span><b>'+money(hs.avg_net_pnl)+'</b></div></div>';
  html+='<div class="panel-heading" style="margin-top:15px"><div><h3>Closed position history</h3><p>Fetched from Kopyon; history rows alone do not reveal historical MAE/MFE.</p></div></div><div class="profile-history"><table><thead><tr><th>SYMBOL</th><th>SIDE</th><th>OPENED</th><th>CLOSED</th><th>ROI</th><th>NET PNL</th></tr></thead><tbody>';
  html+=d.history?.length?d.history.map(h=>'<tr><td>'+esc(h.symbol)+'</td><td>'+esc(h.side)+'</td><td>'+date(h.opened_at)+'</td><td>'+date(h.closed_at)+'</td><td>'+pct((h.roi||0)*100)+'</td><td class="'+((h.net_pnl||0)>=0?"positive":"negative")+'">'+money(h.net_pnl)+'</td></tr>').join(""):'<tr><td colspan="6" class="empty-cell">No closed history returned.</td></tr>';
@@ -126,37 +131,100 @@ async function loadOpportunities(){
 }
 click("refreshOpps",loadOpportunities);
 async function loadPaper(){
- if(paperLoadInFlight)return; paperLoadInFlight=true;
+ if(paperLoadInFlight)return;paperLoadInFlight=true;
  try{
-  const d=await api("/api/paper"),open=d.trades.filter(t=>t.status==="OPEN"),closed=d.trades.filter(t=>t.status==="CLOSED");
+  const d=await api("/api/paper");state.paperData=d;
+  const open=d.trades.filter(t=>t.status==="OPEN"),closed=d.trades.filter(t=>t.status==="CLOSED");
   $("paperCapital").textContent=money(d.capital);$("paperMargin").textContent=money(d.deployed_margin)+" / "+money(d.margin_cap);
   $("paperRealized").textContent=money(d.realized_pnl);$("paperUnrealized").textContent=money(d.unrealized_pnl);$("paperFree").textContent=money(d.free_capital);$("paperEquity").textContent=money(d.equity);
+  $("paperRealized").classList.toggle("positive",Number(d.realized_pnl)>=0);$("paperRealized").classList.toggle("negative",Number(d.realized_pnl)<0);
+  $("paperUnrealized").classList.toggle("positive",Number(d.unrealized_pnl)>=0);$("paperUnrealized").classList.toggle("negative",Number(d.unrealized_pnl)<0);
   ["topOpenCount","paperOpenTableCount"].forEach(id=>$(id).textContent=open.length);["topClosedCount","paperClosedTableCount"].forEach(id=>$(id).textContent=closed.length);$("navPaperCount").textContent=open.length;
-  function row(t,isClosed){
-   const rec=t.post_exit_recovery_label||"Pending / audit not completed";
-   return '<tr class="clickable-row" onclick="openPaperTrade('+t.id+')"><td><span class="status-tag '+(isClosed?"neutral":"positive")+'">'+esc(t.status)+'</span></td><td><b>'+esc(t.trader_name||t.trader_id)+'</b><br><small>'+esc(t.leader_position_key||"unlinked")+'</small></td><td><b>'+esc(t.symbol)+'</b></td><td>'+esc(t.side)+'</td><td><b>'+fmt(t.entry_price,8)+'</b><br><small>Entry: '+date(t.opened_at)+'</small>'+(isClosed?"<br><b>Exit: "+fmt(t.exit_price,8)+'</b><br><small>Exit time: '+date(t.closed_at)+'</small>':"<br><small>Live mark: "+fmt(t.mark_price,8)+"</small>")+'</td><td class="'+(Number(t.net_pnl||0)>=0?"pnl-positive":"pnl-negative")+'">'+money(t.net_pnl)+'<br><small>MFE '+money(t.mfe_net_pnl)+' · MAE '+money(t.mae_net_pnl)+'</small></td><td>'+duration((new Date(isClosed?t.closed_at:Date.now())-new Date(t.opened_at))/3600000)+'</td>'+(isClosed?'<td>'+esc(t.exit_reason_display||t.exit_reason||"—")+'</td><td><small>'+esc(rec)+'</small></td>':'<td>'+esc(t.leader_status||t.last_leader_check_at||"Not recorded")+'</td><td>'+esc(t.data_quality_status||"—")+'</td>')+'<td><button class="btn btn-subtle" type="button" onclick="event.stopPropagation();openPaperTrade('+t.id+')">Full potential</button></td></tr>';
+  const audit=d.recovery_audit||{};
+  if($("recoveryAuditStatus")){
+   $("recoveryAuditStatus").textContent=audit.blocked?"Audit paused · Binance REST cooldown "+duration((audit.remaining_seconds||0)/3600):
+    fmt(audit.complete||0,0)+" audited · "+fmt(audit.pending||0,0)+" pending";
   }
-  $("paperOpenTrades").innerHTML=open.length?open.map(t=>row(t,false)).join():'<tr><td colspan="10" class="empty-cell">No open paper positions.</td></tr>';
-  $("paperClosedTrades").innerHTML=closed.length?closed.map(t=>row(t,true)).join():'<tr><td colspan="10" class="empty-cell">No closed paper positions.</td></tr>';
+  renderPaperTables(d);
   $("paperRiskClusters").innerHTML=(d.risk_clusters||[]).map(x=>'<div class="analysis-line"><span>'+esc(x.symbol)+' '+esc(x.side)+'</span><b>'+fmt(x.count,0)+' positions · '+money(x.net_pnl)+'</b></div>').join("")||'<div class="empty-state">No overlapping symbol/direction cluster currently needs attention.</div>';
   $("paperShadowPortfolio").innerHTML=renderShadowPortfolio(d.shadow_portfolio);
-  // A newly restarted/redeployed paper engine can legitimately have zero OPEN rows
-  // while the completed ledger remains populated. Show the completed ledger first
-  // in that case instead of presenting an apparently empty trading desk.
-  const preferredTab=state.paperTab||(open.length===0&&closed.length>0?"closed":"open");
-  state.paperTab=preferredTab;
-  document.querySelectorAll(".paper-table-tab,.top-live-btn").forEach(x=>x.classList.toggle("active",x.dataset.paperTab===preferredTab));
-  $("paperOpenTable").style.display=preferredTab==="open"?"":"none";
-  $("paperClosedTable").style.display=preferredTab==="closed"?"":"none";
  }catch(e){notice("Paper ledger: "+e.message,"error")}finally{paperLoadInFlight=false}
 }
+function renderPaperTables(d){
+ if(!d)return;
+ const open=d.trades.filter(t=>t.status==="OPEN"),closed=d.trades.filter(t=>t.status==="CLOSED");
+ function pnl(v){return '<span class="'+(Number(v||0)>=0?"positive":"negative")+'">'+money(v)+'</span>';}
+ function leaderCheck(t){
+  const status=t.leader_status||"NOT_CHECKED";
+  const labels={OPEN_OBSERVED:"OPEN · exact key observed",CLOSED_CONFIRMED:"CLOSED · confirmed",REVERSED:"REVERSED",STALE_OR_UNAVAILABLE:"STALE / unavailable",HIDDEN_OR_UNAVAILABLE:"HIDDEN / unavailable",NOT_CHECKED:"No stored check"};
+  const cls=status==="OPEN_OBSERVED"?"positive":status==="REVERSED"||status==="CLOSED_CONFIRMED"?"negative":"";
+  const at=t.leader_check_at||t.leader_state_checked_at||t.last_leader_check_at;
+  return '<b class="'+cls+'">'+esc(labels[status]||status)+'</b><br><small>'+esc(at?date(at):"Timestamp not stored")+'</small><br><small>'+esc(t.leader_state_detail||t.leader_check_source||"")+'</small>';
+ }
+ function row(t,isClosed){
+  const rec=t.post_exit_recovery_label||(t.post_exit_recovery_audit_status==="COMPLETE"?"Audit complete":"Recovery audit pending");
+  const pnlCell=pnl(t.net_pnl);
+  return '<tr class="clickable-row" onclick="openPaperTrade('+t.id+')"><td><span class="status-tag '+(isClosed?"neutral":"positive")+'">'+esc(t.status)+'</span></td><td><b>'+esc(t.trader_name||t.trader_id)+'</b><br><small>'+esc(t.leader_position_key||"unlinked")+'</small></td><td><b>'+esc(t.symbol)+'</b></td><td>'+esc(t.side)+'</td><td><b>'+fmt(t.entry_price,8)+'</b><br><small>Entry: '+date(t.opened_at)+'</small>'+(isClosed?"<br><b>Exit: "+fmt(t.exit_price,8)+'</b><br><small>Exit time: '+date(t.closed_at)+'</small>':"<br><small>Live mark: "+fmt(t.mark_price,8)+"</small>")+'</td><td>'+pnlCell+'<br><small>MFE '+pnl(t.mfe_net_pnl)+' · MAE '+pnl(t.mae_net_pnl)+'</small></td><td>'+duration((new Date(isClosed?t.closed_at:Date.now())-new Date(t.opened_at))/3600000)+'</td>'+(isClosed?'<td>'+esc(t.exit_reason_display||t.exit_reason||"—")+'</td><td><b>'+esc(rec)+'</b><br><small>'+esc(t.post_exit_recovery_audit_status||"PENDING")+'</small></td>':'<td>'+leaderCheck(t)+'</td><td>'+esc(t.data_quality_status||"—")+'</td>')+'<td><button class="btn btn-subtle" type="button" onclick="event.stopPropagation();openPaperTrade('+t.id+')">Forensics</button></td></tr>';
+ }
+ $("paperOpenTrades").innerHTML=open.length?open.map(t=>row(t,false)).join(""):'<tr><td colspan="10" class="empty-cell">No open paper positions.</td></tr>';
+ const profitable=closed.filter(t=>Number(t.net_pnl||0)>0),losses=closed.filter(t=>Number(t.net_pnl||0)<0);
+ $("closedAllCount").textContent=closed.length;$("closedProfitCount").textContent=profitable.length;$("closedLossCount").textContent=losses.length;
+ const chosen=state.closedFilter==="profitable"?profitable:state.closedFilter==="loss"?losses:closed;
+ $("paperClosedTrades").innerHTML=chosen.length?chosen.map(t=>row(t,true)).join(""):'<tr><td colspan="10" class="empty-cell">No trades in this closed-trade category.</td></tr>';
+ const latest=[...d.trades].sort((a,b)=>new Date(b.opened_at)-new Date(a.opened_at)).slice(0,12);
+ $("paperLatestTrades").innerHTML=latest.length?latest.map(t=>row(t,t.status==="CLOSED")).join(""):'<tr><td colspan="10" class="empty-cell">No trades are recorded.</td></tr>';
+ document.querySelectorAll("[data-closed-filter]").forEach(x=>x.classList.toggle("active",x.dataset.closedFilter===state.closedFilter));
+ const tab=state.paperTab||(open.length===0&&closed.length>0?"closed":"open");state.paperTab=tab;
+ document.querySelectorAll(".paper-table-tab,.top-live-btn").forEach(x=>x.classList.toggle("active",x.dataset.paperTab===tab));
+ $("paperOpenTable").style.display=tab==="open"?"":"none";
+ $("paperClosedTable").style.display=tab==="closed"?"":"none";
+ $("paperLatestTable").style.display=tab==="latest"?"":"none";
+ $("closedTradeFilters").style.display=tab==="closed"?"":"none";
+}
+function setClosedTradeFilter(filter){
+ if(!["all","profitable","loss"].includes(filter))return;
+ state.closedFilter=filter;
+ renderPaperTables(state.paperData);
+}
 function switchPaperTab(tab){
- if(tab!=="open"&&tab!=="closed")return;
+ if(!["open","closed","latest"].includes(tab))return;
  if(state.page!=="paper")setPage("paper",{scroll:false});
  state.paperTab=tab;
  document.querySelectorAll(".paper-table-tab,.top-live-btn").forEach(x=>x.classList.toggle("active",x.dataset.paperTab===tab));
- if($("paperOpenTable"))$("paperOpenTable").style.display=tab==="open"?"":"none";
- if($("paperClosedTable"))$("paperClosedTable").style.display=tab==="closed"?"":"none";
+ if(state.paperData)renderPaperTables(state.paperData);
+}
+async function runRecoveryAudit(){
+ const button=$("runRecoveryAudit");if(button){button.disabled=true;button.textContent="Auditing…";}
+ try{
+  const result=await api("/api/paper/audit/recovery",{method:"POST"});
+  const status=result.blocked?"Binance REST cooldown · "+duration((result.remaining_seconds||0)/3600):
+   "Audited "+fmt(result.audited,0)+" / attempted "+fmt(result.attempted,0)+" · "+fmt(result.pending,0)+" still pending";
+  $("recoveryAuditStatus").textContent=status;
+  notice(result.blocked?"Historical market audit is paused by Binance's active REST ban; it was not bypassed.":status,result.failures?"error":"success");
+  await loadPaper();
+ }catch(e){notice("Recovery audit: "+e.message,"error");}
+ finally{if(button){button.disabled=false;button.textContent="Run next recovery audit batch";}}
+}
+async function loadResearchReplay(){
+ const target=$("researchReplaySummary");if(!target)return;
+ target.innerHTML='<div class="empty-state">Replaying stored leader observations…</div>';
+ try{
+  const d=await api("/api/paper/research-replay");state.researchReplay=d;
+  const x=d.summary||{};
+  const val=(label,value)=>'<div class="replay-metric"><small>'+esc(label)+'</small><b class="'+(Number(value||0)>=0?"positive":"negative")+'">'+money(value)+'</b></div>';
+  const stat=(label,value)=>'<div class="replay-stat"><small>'+esc(label)+'</small><b>'+fmt(value,0)+'</b></div>';
+  target.innerHTML='<div class="replay-comparison">'+
+   '<section class="replay-side"><h4>RESEARCH REALIZED ACCORDING TO OLD SYSTEM</h4>'+val("Recorded old-policy realized net",x.old_system_realized_net_pnl)+
+   '<div class="replay-stats">'+stat("Closed trades",x.old_system_closed_trades)+stat("Profitable",x.old_system_profitable_trades)+stat("Loss-making",x.old_system_losing_trades)+'</div></section>'+
+   '<section class="replay-side"><h4>RESEARCH REALIZED NET PNL ACCORDING TO NEW SYSTEM</h4>'+val("New leader-following replay net",x.new_system_realized_net_pnl)+
+   '<div class="replay-stats">'+stat("Replayed attempts",x.new_system_replayed_attempts)+stat("Closed by policy",x.new_system_exits_observed)+stat("Priced closed",x.new_system_replayed_closed_trades)+stat("Profitable",x.new_system_profitable_trades)+stat("Loss-making",x.new_system_losing_trades)+stat("Leader still open",x.new_system_open_leader_trades)+stat("Excluded · no funding schedule",x.new_system_closed_but_funding_unpriced)+stat("No leader-open evidence",x.excluded_without_leader_open_evidence)+'</div>'+
+   '<div class="analysis-line"><span>Same replayed cohort · old policy PnL</span><b class="'+(Number(x.same_cohort_old_system_realized_net_pnl)>=0?"positive":"negative")+'">'+money(x.same_cohort_old_system_realized_net_pnl)+'</b></div>'+
+   '<div class="analysis-line"><span>Open positions · mark-to-last unrealized</span><b class="'+(Number(x.new_system_unrealized_net_at_last_observation)>=0?"positive":"negative")+'">'+money(x.new_system_unrealized_net_at_last_observation)+'</b></div></section></div>'+
+   '<div class="profile-history"><table><thead><tr><th>TRADE</th><th>SYMBOL</th><th>OLD NET</th><th>NEW RESEARCH NET</th><th>HOLD AFTER OLD EXIT</th><th>NEW EXIT / STATUS</th></tr></thead><tbody>'+
+   (d.trades||[]).slice().sort((a,b)=>b.trade_id-a.trade_id).slice(0,20).map(t=>'<tr><td>#'+t.trade_id+'</td><td>'+esc(t.symbol)+' '+esc(t.side)+'</td><td class="'+(Number(t.old_realized_net_pnl)>=0?"positive":"negative")+'">'+money(t.old_realized_net_pnl)+'</td><td class="'+(Number(t.new_research_realized_net_pnl)>=0?"positive":"negative")+'">'+(t.new_research_realized_net_pnl===null||t.new_research_realized_net_pnl===undefined?"—":money(t.new_research_realized_net_pnl))+'</td><td>'+duration(t.hold_after_old_exit_hours)+'</td><td>'+esc(t.new_exit_reason||t.replay_status||"—")+'<br><small>'+esc(t.new_exit_at||t.last_observed_at||"")+'</small></td></tr>').join("")+
+   '</tbody></table></div>';
+  $("researchReplayAssumptions").textContent=[d.source,x.exit_assumption,x.identity_caveat,x.cost_assumption,x.funding_assumption].filter(Boolean).join(" · ");
+ }catch(e){target.innerHTML='<div class="notice error">Research replay: '+esc(e.message)+'</div>';}
 }
 function paperChartSvg(d){
  const candles=d.candles||[], path=d.path||[], leaderPath=d.leader_path||[], t=d.trade||{}, l=d.leader||{};
@@ -256,7 +324,7 @@ async function refreshPaperTradeDetail(id){
    ['Current feed state',t.monitoring_status||'NOT RECORDED'],
    ['Feed resumed at',date(t.monitoring_resumed_at)],
    ['Last Binance mark',date(t.last_binance_price_at)]
-  ].map(x=>'<div class="profile-metric"><small>'+esc(x[0])+'</small><b>'+esc(x[1])+'</b></div>').join('')+'</div>';
+  ].map(x=>{const pnlMetric=/PnL|MFE|MAE/.test(x[0]);const n=parseFloat(String(x[1]).replace(/[^0-9+-.]/g,""));const cls=pnlMetric?(n>=0?"positive":"negative"):"";return '<div class="profile-metric"><small>'+esc(x[0])+'</small><b class="'+cls+'">'+esc(x[1])+'</b></div>';}).join('')+'</div>';
   html+='<div class="analysis-box"><h4>LINKED LEADER POSITION</h4>'+
    '<div class="analysis-line"><span>Leader name / ID</span><b>'+esc(l.trader_name||d.trader?.name||'—')+' / '+esc(l.trader_id||t.trader_id||'—')+'</b></div>'+
    '<div class="analysis-line"><span>Exact position key</span><b>'+esc(l.position_key||t.leader_position_key||'—')+'</b></div>'+
@@ -272,17 +340,29 @@ async function refreshPaperTradeDetail(id){
    paperChartSvg(d)+
    '<div class="muted-note">Candles are Binance USD-M Futures market data. Purple = our observed price path and entry. Green = Kopyon leader mark observations and recovery price. Vertical lines = linked paper entries/exits. Refreshes while this trade detail remains open.'+
    (d.candle_error?' Candle fetch warning: '+esc(d.candle_error):'')+'</div></div>';
-  html+='<div class="analysis-box"><h4>SAME LEADER POSITION · HARVEST CAMPAIGN</h4>'+
-   '<div class="analysis-line"><span>Paper attempts / re-entries</span><b>'+fmt(camp.trade_count,0)+' / '+fmt(camp.reentry_count,0)+'</b></div>'+
+  const replay=d.new_system_replay||{};
+  html+='<div class="analysis-box research-trade-card"><h4>NEW EXIT POLICY · HISTORICAL RESEARCH REPLAY · NOT AN EXECUTED ORDER</h4>'+
+   '<div class="analysis-line"><span>Research realized according to old system</span><b class="'+(Number(t.net_pnl)>=0?'positive':'negative')+'">'+money(t.net_pnl)+'</b></div>'+
+   '<div class="analysis-line"><span>Research realized net PnL according to new system</span><b class="'+(Number(replay.new_research_realized_net_pnl)>=0?'positive':'negative')+'">'+(replay.new_research_realized_net_pnl===null||replay.new_research_realized_net_pnl===undefined?'Not realized / funding unpriced':money(replay.new_research_realized_net_pnl))+'</b></div>'+
+   '<div class="analysis-line"><span>Replay status</span><b>'+esc(replay.replay_status||'No qualifying replay evidence')+'</b></div>'+
+   '<div class="analysis-line"><span>New policy exit reason / price quality</span><b>'+esc(replay.new_exit_reason||'Still open / excluded')+' · '+esc(replay.new_exit_price_quality||'—')+'</b></div>'+
+   '<div class="analysis-line"><span>New exit time / detection time</span><b>'+date(replay.new_exit_at)+' / '+date(replay.new_exit_detection_at)+'</b></div>'+
+   '<div class="analysis-line"><span>Hold time after old exit</span><b>'+duration(replay.hold_after_old_exit_hours)+'</b></div>'+
+   '<div class="analysis-line"><span>Leader identity confidence</span><b>'+esc(replay.leader_identity||'—')+'</b></div>'+
+   '<div class="sample-warning">'+esc(replay.leader_identity_note||'No leader identity note')+'</div>'+
+   (replay.checkpoints?.length?'<div class="profile-history"><table><thead><tr><th>CHECKPOINT</th><th>OBSERVED TIME</th><th>LEADER MARK</th><th>RESEARCH NET</th></tr></thead><tbody>'+replay.checkpoints.map(cp=>'<tr><td>'+fmt(cp.target_hours,0)+'h target · '+fmt(cp.actual_elapsed_hours,2)+'h actual</td><td>'+date(cp.observed_at)+'</td><td>'+fmt(cp.leader_mark,8)+'</td><td class="'+(Number(cp.net_pnl)>=0?'positive':'negative')+'">'+(cp.net_pnl===null||cp.net_pnl===undefined?'Funding unpriced':money(cp.net_pnl))+'</td></tr>').join('')+'</tbody></table></div>':'<div class="muted-note">No 3h / 6h / later checkpoint was verifiably sampled while this leader key remained visible.</div>')+
+   '</div>';
+  html+='<div class="analysis-box"><h4>SAME LEADER POSITION · CAMPAIGN PNL & ENTRY FORENSICS</h4>'+
+   '<div class="analysis-line"><span>Entry attempts / re-entries</span><b>'+fmt(camp.trade_count,0)+' / '+fmt(camp.reentry_count,0)+'</b></div>'+
    '<div class="analysis-line"><span>Currently open attempts</span><b>'+fmt(camp.open_count,0)+'</b></div>'+
-   '<div class="analysis-line"><span>Realized campaign net PnL</span><b>'+money(camp.realized_net_pnl)+'</b></div>'+
-   '<div class="analysis-line"><span>Total campaign net PnL</span><b>'+money(camp.total_net_pnl)+'</b></div>'+
-   '<div class="analysis-line"><span>Positive attempts total</span><b>'+money(camp.sum_positive_attempt_pnl)+'</b></div>'+
-   '<div class="analysis-line"><span>Negative attempts total</span><b>'+money(camp.sum_negative_attempt_pnl)+'</b></div>'+
-   '<div class="profile-history"><table><thead><tr><th>ATTEMPT</th><th>NET</th><th>MFE</th><th>AFTER-EXIT RECOVERY</th><th>EXIT</th></tr></thead><tbody>'+
-   (camp.trades||[]).map(x=>'<tr><td>#'+x.id+'</td><td class="'+(Number(x.net_pnl)>=0?'positive':'negative')+'">'+money(x.net_pnl)+'</td><td>'+money(x.mfe_net_pnl)+'</td><td>'+esc(x.post_exit_status||'Not audited')+(x.post_exit_minutes_to_net_profit!==null&&x.post_exit_minutes_to_net_profit!==undefined?' · +'+fmt(x.post_exit_minutes_to_net_profit,1)+'m':'')+'</td><td>'+esc(x.exit_reason||'OPEN')+'</td></tr>').join('')+
+   '<div class="analysis-line"><span>Realized campaign net PnL</span><b class="'+(Number(camp.realized_net_pnl)>=0?'positive':'negative')+'">'+money(camp.realized_net_pnl)+'</b></div>'+
+   '<div class="analysis-line"><span>Total campaign net PnL</span><b class="'+(Number(camp.total_net_pnl)>=0?'positive':'negative')+'">'+money(camp.total_net_pnl)+'</b></div>'+
+   '<div class="analysis-line"><span>Positive attempts total</span><b class="positive">'+money(camp.sum_positive_attempt_pnl)+'</b></div>'+
+   '<div class="analysis-line"><span>Negative attempts total</span><b class="negative">'+money(camp.sum_negative_attempt_pnl)+'</b></div>'+
+   '<div class="profile-history"><table><thead><tr><th>ENTRY #</th><th>ENTRY TIME</th><th>EXIT TIME</th><th>HOLD</th><th>GROSS</th><th>COSTS</th><th>NET</th><th>AFTER-EXIT</th></tr></thead><tbody>'+
+   (camp.trades||[]).map(x=>'<tr><td><b>Entry #'+fmt(x.attempt_number,0)+' · Trade #'+x.id+'</b></td><td>'+date(x.opened_at)+'</td><td>'+date(x.closed_at)+'</td><td>'+duration(x.hold_duration_hours)+'</td><td class="'+(Number(x.gross_pnl)>=0?'positive':'negative')+'">'+money(x.gross_pnl)+'</td><td class="negative">'+money(x.estimated_costs)+'</td><td class="'+(Number(x.net_pnl)>=0?'positive':'negative')+'"><b>'+money(x.net_pnl)+'</b></td><td>'+esc(x.post_exit_status||'Pending')+'<br><small>'+date(x.post_exit_max_at)+'</small></td></tr>').join('')+
    '</tbody></table></div>'+
-   '<div class="sample-warning">Linked trade IDs: '+esc((camp.trade_ids||[]).join(', '))+'</div></div>';
+   '<div class="sample-warning">Campaign total is the sum of these actual paper-ledger attempts. Linked trade IDs: '+esc((camp.trade_ids||[]).join(', '))+'</div></div>';
   html+='<div class="analysis-box"><h4>SWING & LEADER-RECOVERY PROFIT LADDER</h4><div class="profile-history"><table><thead><tr><th>TARGET / MOVE</th><th>PRICE</th><th>GROSS</th><th>ESTIMATED NET</th></tr></thead><tbody>'+
    (lad.length?lad.map(x=>'<tr><td>'+esc(x.target_type==='INTERMEDIATE_SWING_FROM_LATEST_MARK'?'Swing +':'Leader recovery +')+fmt(x.target_pct_from_reference,2)+'%</td><td>'+fmt(x.price,8)+'</td><td class="'+(x.gross_pnl_usdt>=0?'positive':'negative')+'">'+money(x.gross_pnl_usdt)+'</td><td class="'+(x.estimated_net_pnl_usdt>=0?'positive':'negative')+'">'+money(x.estimated_net_pnl_usdt)+'</td></tr>').join(''):'<tr><td colspan="4">No swing or leader recovery targets available.</td></tr>')+
    '</tbody></table></div></div>';
@@ -308,6 +388,8 @@ async function openPaperTrade(id){
 }
 window.openPaperTrade=openPaperTrade;
 click("reloadPaper",loadPaper);
+click("runRecoveryAudit",runRecoveryAudit);
+click("loadResearchReplay",loadResearchReplay);
 bind("paperSettings","submit",async e=>{e.preventDefault();const f=new FormData(e.currentTarget),body={};for(const [k,v] of f.entries())body[k]=Number(v);body.auto_enabled=e.currentTarget.elements.auto_enabled.checked;try{await api("/api/paper/settings",{method:"POST",body:JSON.stringify(body)});$("paperSaveStatus").textContent="Saved · paper settings active";await loadPaper();}catch(err){$("paperSaveStatus").textContent=err.message;}});
 function spark(values){if(!values||values.length<2)return'<div class="empty-state">Candle series unavailable</div>';const min=Math.min(...values),max=Math.max(...values),span=max-min||1;const pts=values.map((v,i)=>(i/(values.length-1)*100)+","+(95-(v-min)/span*85)).join(" ");return'<svg viewBox="0 0 100 100" preserveAspectRatio="none"><polyline points="'+pts+'" fill="none" stroke="#a995f3" stroke-width="1.8" vector-effect="non-scaling-stroke"/><line x1="0" y1="95" x2="100" y2="95" stroke="#354454" stroke-width=".6"/></svg>';}
 async function loadMarket(forceRefresh=true){

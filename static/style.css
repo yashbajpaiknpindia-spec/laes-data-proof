@@ -121,3 +121,53 @@ button{touch-action:manipulation}
  .top-live-strip{top:108px}
  .paper-tab-buttons{top:150px}
 }
+
+
+/* Closed-trade audit controls and research PnL hierarchy */
+.pnl-positive{color:var(--green)!important;font-weight:850!important}
+.pnl-negative{color:var(--red)!important;font-weight:850!important}
+.positive{color:var(--green)!important;font-weight:750}
+.negative{color:var(--red)!important;font-weight:750}
+.mini-opp strong{font-weight:850}
+.paper-tab-buttons{display:flex;align-items:center;flex-wrap:wrap;gap:7px}
+.audit-status{font:10px var(--mono);color:var(--muted);padding:5px 8px;line-height:1.45}
+.closed-trade-filters{display:flex;gap:7px;align-items:center;flex-wrap:wrap;padding:0 0 11px}
+.closed-filter{background:#101a25;border:1px solid var(--line);color:#aebccc;border-radius:7px;padding:7px 11px;font:10px var(--mono);font-weight:700}
+.closed-filter.active{background:#25203b;border-color:#7666b8;color:#eee8ff}
+.closed-filter span{margin-left:5px;color:#fff;font-weight:850}
+.research-replay-panel{border-color:#4a3c69}
+.replay-comparison{display:grid;grid-template-columns:1fr 1fr;gap:11px;margin:10px 0 14px}
+.replay-side{background:#0b141d;border:1px solid var(--line2);border-radius:10px;padding:13px;min-width:0}
+.replay-side h4{font:11px var(--mono);font-weight:900;letter-spacing:.04em;line-height:1.5;margin:0 0 10px;color:#c9baff}
+.replay-metric{padding:11px;border-radius:8px;background:#111d28;border:1px solid var(--line2);margin-bottom:9px}
+.replay-metric small{display:block;color:var(--muted);font:9px var(--mono);font-weight:700}
+.replay-metric b{display:block;font:900 23px var(--mono);margin-top:5px;overflow-wrap:anywhere}
+.replay-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
+.replay-stat{background:#111b26;border:1px solid var(--line2);padding:8px;border-radius:7px;min-width:0}
+.replay-stat small{display:block;color:var(--muted);font:8px var(--mono);line-height:1.4}
+.replay-stat b{display:block;font:850 14px var(--mono);margin-top:4px}
+.research-trade-card h4{color:#c5b4ff;font-weight:900}
+.research-trade-card .analysis-line b{font-size:11px;font-weight:850}
+.profile-metric{border-width:1px}
+.profile-metric small{font-size:9px;font-weight:700;color:#9eafc0}
+.profile-metric b{font-size:13px;font-weight:900;line-height:1.4;overflow-wrap:anywhere}
+.profile-history th{font-weight:850;font-size:9px}
+.profile-history td{font-size:10px;font-weight:650;white-space:normal}
+.analysis-line{font-size:10px}
+.analysis-line b{font-weight:850}
+@media(max-width:780px){
+ .paper-tab-buttons{align-items:stretch}
+ .paper-tab-buttons .btn{min-height:38px;flex:0 0 auto}
+ .audit-status{flex:1 1 100%;padding:2px 3px}
+ .closed-trade-filters{position:sticky;top:205px;z-index:18;background:#0b121a;padding:7px 0}
+ .closed-filter{min-height:36px}
+ .replay-comparison{grid-template-columns:minmax(0,1fr)}
+ .replay-metric b{font-size:21px}
+ .replay-stats{grid-template-columns:repeat(3,minmax(0,1fr))}
+}
+@media(max-width:430px){
+ .paper-tab-buttons{gap:5px}
+ .paper-tab-buttons .btn{font-size:9px;padding:8px 9px}
+ .closed-trade-filters{top:198px}
+ .replay-stats{grid-template-columns:repeat(2,minmax(0,1fr))}
+}

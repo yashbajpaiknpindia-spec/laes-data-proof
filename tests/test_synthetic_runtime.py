@@ -128,7 +128,7 @@ class SyntheticRuntimeAuditTests(unittest.TestCase):
         original = app.binance_get
         app.binance_get = fake_binance_get
         try:
-            result = asyncio.run(app.run_post_exit_recovery_audit(max_trades=10))
+            result = asyncio.run(app.run_post_exit_recovery_audit(max_trades=1))
         finally:
             app.binance_get = original
         self.assertEqual(result["audited"], 1)

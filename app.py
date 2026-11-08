@@ -203,6 +203,7 @@ last_scan: dict[str, Any] = {"state": "starting", "started_at": None, "finished_
 worker_alive = False
 scan_lock = asyncio.Lock()
 opportunity_lock = asyncio.Lock()
+recovery_audit_lock = asyncio.Lock()
 last_manual_sync = 0.0
 news_cache: dict[str, Any] = {"fetched_at": 0.0, "items": [], "error": None}
 
@@ -318,6 +319,17 @@ def migrate_paper_audit_metadata() -> None:
             .group_by(PaperTradePath.paper_trade_id)
         ).all()
         max_gaps = {int(trade_id): float(gap or 0.0) for trade_id, gap in gap_rows}
+        leader_checks = {}
+        for open_trade in [item for item in trades if item.status == "OPEN"]:
+            leader_state, leader_detail = _leader_state_for_trade(db, open_trade)
+            latest_visible = db.scalar(select(PositionSnapshot).where(
+                PositionSnapshot.trader_id == open_trade.trader_id
+            ).order_by(desc(PositionSnapshot.id)).limit(1))
+            leader_checks[open_trade.id] = {
+                "status": leader_state, "detail": leader_detail,
+                "checked_at": latest_visible.observed_at.isoformat() if latest_visible else None,
+                "source": "LATEST_VISIBLE_KOPYON_SNAPSHOT" if latest_visible else "NO_LEADER_SNAPSHOT"
+            }
 
         for trade in trades:
             raw = parse_json(trade.raw_json)
@@ -799,7 +811,8 @@ async def monitor_worker() -> None:
             if time.monotonic() - last_recovery_audit >= 600:
                 try:
                     audit = await run_post_exit_recovery_audit(max_trades=5)
-                    log_check("post_exit_recovery_audit", True, 200, None, f"audited={audit.get('audited', 0)} recovered_to_profit={audit.get('recovered_to_profit', 0)} failures={audit.get('failures', 0)}")
+                    audit_ok = audit.get("failures", 0) == 0 and not audit.get("blocked", False)
+                    log_check("post_exit_recovery_audit", audit_ok, 429 if audit.get("blocked") else 200 if audit_ok else 207, None, f"attempted={audit.get('attempted', 0)} audited={audit.get('audited', 0)} recovered_to_profit={audit.get('recovered_to_profit', 0)} failures={audit.get('failures', 0)} pending={audit.get('pending', 0)} status={audit.get('status')}")
                 except Exception as audit_exc:
                     log_check("post_exit_recovery_audit", False, None, None, str(audit_exc)[:700])
                 last_recovery_audit = time.monotonic()
@@ -832,7 +845,8 @@ async def _startup_recovery_audit() -> None:
     await asyncio.sleep(2)
     try:
         audit = await run_post_exit_recovery_audit(max_trades=5)
-        log_check("post_exit_recovery_audit_startup", True, 200, None, f"audited={audit.get('audited', 0)} recovered_to_profit={audit.get('recovered_to_profit', 0)} failures={audit.get('failures', 0)}")
+        audit_ok = audit.get("failures", 0) == 0 and not audit.get("blocked", False)
+        log_check("post_exit_recovery_audit_startup", audit_ok, 429 if audit.get("blocked") else 200 if audit_ok else 207, None, f"attempted={audit.get('attempted', 0)} audited={audit.get('audited', 0)} recovered_to_profit={audit.get('recovered_to_profit', 0)} failures={audit.get('failures', 0)} pending={audit.get('pending', 0)} status={audit.get('status')}")
     except Exception as exc:
         log_check("post_exit_recovery_audit_startup", False, None, None, str(exc)[:900])
 
@@ -1749,141 +1763,183 @@ def _leader_state_for_trade(db, trade: PaperTrade) -> tuple[str, str]:
 
 
 async def run_post_exit_recovery_audit(max_trades: int = 5) -> dict:
-    """
-    Read-only post-exit audit for closed losing paper trades.
-    Candle HIGH/LOW is intrabar potential only. A recovery is classified as
-    confirmed only when a Binance 1m CLOSE itself produces positive net PnL.
-    """
-    cfg = paper_config()
-    horizon_hours = max(1.0, min(24.0, float(cfg.get("post_exit_recovery_audit_hours", 24.0))))
-    audited = recovered = failures = 0
-    with SessionLocal() as db:
-        trades = db.scalars(select(PaperTrade).where(
-            PaperTrade.status == "CLOSED", PaperTrade.net_pnl < 0
-        ).order_by(PaperTrade.closed_at)).all()
-
-    for trade in trades:
-        if audited >= max(1, int(max_trades)):
-            break
-        raw = parse_json(trade.raw_json)
-        if raw.get("post_exit_recovery_audit_version") == 5:
-            continue
-        if not trade.closed_at or not trade.exit_price or not trade.entry_price:
-            continue
-        closed_at = trade.closed_at
-        if closed_at.tzinfo is None:
-            closed_at = closed_at.replace(tzinfo=timezone.utc)
-        start_ms = int(closed_at.timestamp() * 1000)
-        end_ms = start_ms + int(horizon_hours * 3600 * 1000)
-        try:
-            rows, _ = await binance_get("/fapi/v1/markPriceKlines", {
-                "symbol": trade.symbol, "interval": "1m",
-                "startTime": start_ms, "endTime": end_ms, "limit": 1500
-            })
-            if not isinstance(rows, list) or not rows:
-                raise RuntimeError("No Binance mark-price candles returned")
-            directional = 1.0 if trade.side == "LONG" else -1.0
-            best_close = best_intrabar = None
-            first_entry_close = first_net_profit_close = first_net_profit_intrabar = None
-            worst_close = None
-            for row in rows:
-                if not isinstance(row, (list, tuple)) or len(row) < 7:
-                    continue
-                at_ms = int(row[0])
-                high, low, close = safe_float(row[2]), safe_float(row[3]), safe_float(row[4])
-                if high is None or low is None or close is None:
-                    continue
-                def candidate(price: float) -> tuple[float, float, float]:
-                    gross = directional * (price - trade.entry_price) * trade.quantity
-                    turnover = (trade.entry_price + price) * trade.quantity
-                    cost = turnover * ((float(cfg["taker_fee_pct"]) + float(cfg["slippage_pct"])) / 100.0)
-                    return gross - cost, gross, cost
-                close_net, close_gross, close_cost = candidate(close)
-                favorable = high if trade.side == "LONG" else low
-                intrabar_net, intrabar_gross, intrabar_cost = candidate(favorable)
-                if best_close is None or close_net > best_close["max_net_pnl"]:
-                    best_close = {"max_net_pnl": close_net, "max_price": close, "at_ms": at_ms, "gross": close_gross, "cost": close_cost}
-                if best_intrabar is None or intrabar_net > best_intrabar["max_net_pnl"]:
-                    best_intrabar = {"max_net_pnl": intrabar_net, "max_price": favorable, "at_ms": at_ms, "gross": intrabar_gross, "cost": intrabar_cost}
-                if close_net > 0 and first_net_profit_close is None:
-                    first_net_profit_close = at_ms
-                if intrabar_net > 0 and first_net_profit_intrabar is None:
-                    first_net_profit_intrabar = at_ms
-                crossed_close = (close >= trade.entry_price) if trade.side == "LONG" else (close <= trade.entry_price)
-                if crossed_close and first_entry_close is None:
-                    first_entry_close = at_ms
-                if worst_close is None or close_net < worst_close["min_net_pnl"]:
-                    worst_close = {"min_net_pnl": close_net, "at_ms": at_ms}
-            if best_close is None or best_intrabar is None:
+    """Resumable read-only audit. Never bypasses the Binance REST circuit breaker."""
+    async with recovery_audit_lock:
+        cfg = paper_config()
+        horizon_hours = max(1.0, min(72.0, float(cfg.get("post_exit_recovery_audit_hours", 24.0))))
+        with SessionLocal() as db:
+            closed = db.scalars(select(PaperTrade).where(PaperTrade.status == "CLOSED").order_by(PaperTrade.closed_at)).all()
+        pending = [t for t in closed if parse_json(t.raw_json).get("post_exit_recovery_audit_version", 0) != 6]
+        cooldown = binance_rest_status()
+        if cooldown.get("blocked"):
+            return {"audited": 0, "attempted": 0, "recovered_to_profit": 0, "failures": 0,
+                    "blocked": True, "blocked_until": cooldown.get("blocked_until"),
+                    "remaining_seconds": cooldown.get("remaining_seconds"), "pending": len(pending),
+                    "status": "WAITING_FOR_BINANCE_REST_COOLDOWN"}
+        attempted = audited = recovered = failures = 0
+        for trade in pending:
+            if attempted >= max(1, min(20, int(max_trades))):
+                break
+            if binance_rest_status().get("blocked"):
+                break
+            raw = parse_json(trade.raw_json)
+            closed_at = _shadow_dt(trade.closed_at)
+            if not closed_at or not trade.exit_price or not trade.entry_price:
                 continue
+            attempted += 1
+            start_ms = int(closed_at.timestamp() * 1000)
+            end_ms = start_ms + int(horizon_hours * 3600000)
+            try:
+                rows_all = []
+                cursor = start_ms
+                while cursor < end_ms:
+                    rows, _ = await binance_get("/fapi/v1/markPriceKlines", {
+                        "symbol": trade.symbol, "interval": "1m",
+                        "startTime": cursor, "endTime": end_ms, "limit": 1500
+                    })
+                    if not isinstance(rows, list) or not rows:
+                        break
+                    rows_all.extend(rows)
+                    next_cursor = int(rows[-1][0]) + 60000
+                    if next_cursor <= cursor or len(rows) < 1500:
+                        break
+                    cursor = next_cursor
+                if not rows_all:
+                    raise RuntimeError("No Binance post-exit mark-price candles returned")
+                direction = 1.0 if trade.side == "LONG" else -1.0
+                entry_rate = abs(safe_float(raw.get("funding_rate_at_entry")) or 0.0)
+                next_funding = safe_float(raw.get("next_funding_time"))
+                opened = _shadow_dt(trade.opened_at) or closed_at
+                opened_ms = int(opened.timestamp() * 1000)
+                def pnl_at(price, at_ms):
+                    gross = direction * (price - trade.entry_price) * trade.quantity
+                    turnover = (trade.entry_price + price) * trade.quantity
+                    costs = turnover * (float(cfg["taker_fee_pct"]) + float(cfg["slippage_pct"])) / 100.0
+                    if next_funding:
+                        next_ms = next_funding
+                        while next_ms <= opened_ms:
+                            next_ms += 28800000
+                        count = 0 if at_ms < next_ms else 1 + int((at_ms - next_ms) // 28800000)
+                    else:
+                        count = max(0, int((at_ms - opened_ms) // 28800000))
+                    funding = float(trade.notional or 0.0) * entry_rate * count
+                    return gross - costs - funding, gross, costs + funding, funding
+                best_close = None
+                best_intrabar = None
+                first_profit = first_entry = first_intrabar_profit = None
+                worst = None
+                last_valid_ms = None
+                for row in rows_all:
+                    if not isinstance(row, (list, tuple)) or len(row) < 7:
+                        continue
+                    at_ms = int(row[0])
+                    # Never trust a provider/mock response that returns candles
+                    # outside the exact requested post-exit observation window.
+                    if at_ms < start_ms or at_ms > end_ms:
+                        continue
+                    last_valid_ms = at_ms
+                    high, low, close = safe_float(row[2]), safe_float(row[3]), safe_float(row[4])
+                    if high is None or low is None or close is None:
+                        continue
+                    net, gross, costs, funding = pnl_at(close, at_ms)
+                    favorable = high if trade.side == "LONG" else low
+                    intra_net, _, _, _ = pnl_at(favorable, at_ms)
+                    if best_close is None or net > best_close["net"]:
+                        best_close = {"net": net, "gross": gross, "costs": costs, "funding": funding, "price": close, "at": at_ms}
+                    if best_intrabar is None or intra_net > best_intrabar["net"]:
+                        best_intrabar = {"net": intra_net, "price": favorable, "at": at_ms}
+                    if net > 0 and first_profit is None:
+                        first_profit = at_ms
+                    if intra_net > 0 and first_intrabar_profit is None:
+                        first_intrabar_profit = at_ms
+                    if ((trade.side == "LONG" and close >= trade.entry_price) or
+                        (trade.side == "SHORT" and close <= trade.entry_price)) and first_entry is None:
+                        first_entry = at_ms
+                    if worst is None or net < worst["net"]:
+                        worst = {"net": net, "at": at_ms}
+                if best_close is None or best_intrabar is None:
+                    raise RuntimeError("No valid OHLC mark candles returned")
+                recovered_profit = best_close["net"] > 0
+                intrabar_only = not recovered_profit and best_intrabar["net"] > 0
+                recovered_entry = first_entry is not None
+                status = ("RECOVERED_TO_NET_PROFIT_CLOSE_CONFIRMED" if recovered_profit else
+                          "INTRABAR_NET_PROFIT_ONLY" if intrabar_only else
+                          "RECOVERED_TO_ENTRY_CLOSE_CONFIRMED" if recovered_entry else "NO_ENTRY_RECOVERY")
+                raw.update({
+                    "post_exit_recovery_audit_version": 6,
+                    "post_exit_recovery_audit_status": "COMPLETE",
+                    "post_exit_recovery_status": status,
+                    "post_exit_recovery_market_source": "BINANCE_USDM_MARK_PRICE_1M_CLOSE_CONFIRMED",
+                    "post_exit_recovery_horizon_hours": horizon_hours,
+                    "post_exit_max_net_pnl": round(best_close["net"], 8),
+                    "post_exit_max_gross_pnl": round(best_close["gross"], 8),
+                    "post_exit_max_price": best_close["price"],
+                    "post_exit_max_at": datetime.fromtimestamp(best_close["at"]/1000, timezone.utc).isoformat(),
+                    "post_exit_max_funding_estimate": round(best_close["funding"], 8),
+                    "post_exit_intrabar_max_net_pnl": round(best_intrabar["net"], 8),
+                    "post_exit_intrabar_max_price": best_intrabar["price"],
+                    "post_exit_intrabar_max_at": datetime.fromtimestamp(best_intrabar["at"]/1000, timezone.utc).isoformat(),
+                    "post_exit_return_to_entry_at": datetime.fromtimestamp(first_entry/1000, timezone.utc).isoformat() if first_entry else None,
+                    "post_exit_minutes_to_entry": round((first_entry-start_ms)/60000, 2) if first_entry else None,
+                    "post_exit_first_net_profit_at": datetime.fromtimestamp(first_profit/1000, timezone.utc).isoformat() if first_profit else None,
+                    "post_exit_minutes_to_net_profit": round((first_profit-start_ms)/60000, 2) if first_profit else None,
+                    "post_exit_intrabar_first_net_profit_at": datetime.fromtimestamp(first_intrabar_profit/1000, timezone.utc).isoformat() if first_intrabar_profit else None,
+                    "post_exit_intrabar_minutes_to_net_profit": round((first_intrabar_profit-start_ms)/60000, 2) if first_intrabar_profit else None,
+                    "post_exit_minutes_to_best": round((best_close["at"]-start_ms)/60000, 2),
+                    "post_exit_observed_minutes": round((last_valid_ms-start_ms)/60000, 2),
+                    "post_exit_worst_net_pnl": round(worst["net"], 8) if worst else None,
+                    "post_exit_worst_at": datetime.fromtimestamp(worst["at"]/1000, timezone.utc).isoformat() if worst else None,
+                    "post_exit_recovery_profit_usdt": round(max(0.0, best_close["net"]), 8),
+                    "post_exit_intrabar_potential_profit_usdt": round(max(0.0, best_intrabar["net"]), 8),
+                    "post_exit_cost_assumption": "Current configured taker fee and slippage; historic settings were not stored.",
+                    "post_exit_funding_assumption": "Conservative debit at absolute entry funding rate; not a verified exchange funding settlement history.",
+                    "post_exit_old_exit_reason": trade.exit_reason,
+                    "post_exit_recovery_label": f"Post-exit peak {best_close['net']:+.4f} USDT at +{(best_close['at']-start_ms)/60000:.0f}m; source Binance mark-price 1m close; old exit {trade.exit_reason}"
+                })
+                with SessionLocal() as db:
+                    live = db.get(PaperTrade, trade.id)
+                    if live:
+                        live.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
+                        if not db.scalar(select(PaperTradeEvent.id).where(
+                            PaperTradeEvent.paper_trade_id == trade.id,
+                            PaperTradeEvent.event_type == "POST_EXIT_RECOVERY_AUDIT_V6"
+                        ).limit(1)):
+                            db.add(PaperTradeEvent(paper_trade_id=trade.id, event_type="POST_EXIT_RECOVERY_AUDIT_V6",
+                                                   observed_at=live.closed_at or now(), value=best_close["net"],
+                                                   detail=raw["post_exit_recovery_label"]))
+                        db.commit()
+                audited += 1
+                recovered += int(recovered_profit)
+            except Exception as exc:
+                failures += 1
+                with SessionLocal() as db:
+                    live = db.get(PaperTrade, trade.id)
+                    if live:
+                        latest = parse_json(live.raw_json)
+                        latest["post_exit_audit_last_attempt_at"] = now().isoformat()
+                        latest["post_exit_audit_last_error"] = str(exc)[:500]
+                        live.raw_json = json.dumps(latest, separators=(",", ":"), default=str)
+                        db.commit()
+                if binance_rest_status().get("blocked"):
+                    break
+                log_check("post_exit_recovery_audit", False, None, None, f"trade={trade.id} {trade.symbol}: {str(exc)[:500]}")
+        with SessionLocal() as db:
+            after = db.scalars(select(PaperTrade).where(PaperTrade.status == "CLOSED")).all()
+        pending_count = sum(1 for t in after if parse_json(t.raw_json).get("post_exit_recovery_audit_version", 0) != 6)
+        cooldown = binance_rest_status()
+        return {"audited": audited, "attempted": attempted, "recovered_to_profit": recovered,
+                "failures": failures, "blocked": bool(cooldown.get("blocked")),
+                "blocked_until": cooldown.get("blocked_until"), "remaining_seconds": cooldown.get("remaining_seconds"),
+                "pending": pending_count,
+                "status": "WAITING_FOR_BINANCE_REST_COOLDOWN" if cooldown.get("blocked") else "COMPLETE" if pending_count == 0 else "PARTIAL"}
 
-            recovered_to_profit = best_close["max_net_pnl"] > 0
-            recovered_to_entry = first_entry_close is not None
-            intrabar_only = (not recovered_to_profit) and best_intrabar["max_net_pnl"] > 0
-            status = (
-                "RECOVERED_TO_NET_PROFIT_CLOSE_CONFIRMED" if recovered_to_profit else
-                "INTRABAR_NET_PROFIT_ONLY" if intrabar_only else
-                "RECOVERED_TO_ENTRY_CLOSE_CONFIRMED" if recovered_to_entry else
-                "NO_ENTRY_RECOVERY"
-            )
-            close_profit_minutes = ((first_net_profit_close - start_ms) / 60000) if first_net_profit_close else None
-            intrabar_profit_minutes = ((first_net_profit_intrabar - start_ms) / 60000) if first_net_profit_intrabar else None
-            raw.update({
-                "post_exit_recovery_audit_version": 5,
-                "post_exit_recovery_status": status,
-                "post_exit_recovery_market_source": "BINANCE_USDM_MARK_PRICE_1M_CLOSE_CONFIRMED",
-                "post_exit_recovery_horizon_hours": horizon_hours,
-                "post_exit_max_net_pnl": round(best_close["max_net_pnl"], 8),
-                "post_exit_max_gross_pnl": round(best_close["gross"], 8),
-                "post_exit_max_price": best_close["max_price"],
-                "post_exit_max_at": datetime.fromtimestamp(best_close["at_ms"]/1000, timezone.utc).isoformat(),
-                "post_exit_intrabar_max_net_pnl": round(best_intrabar["max_net_pnl"], 8),
-                "post_exit_intrabar_max_price": best_intrabar["max_price"],
-                "post_exit_intrabar_max_at": datetime.fromtimestamp(best_intrabar["at_ms"]/1000, timezone.utc).isoformat(),
-                "post_exit_return_to_entry_at": datetime.fromtimestamp(first_entry_close/1000, timezone.utc).isoformat() if first_entry_close else None,
-                "post_exit_minutes_to_entry": round((first_entry_close-start_ms)/60000, 2) if first_entry_close else None,
-                "post_exit_first_net_profit_at": datetime.fromtimestamp(first_net_profit_close/1000, timezone.utc).isoformat() if first_net_profit_close else None,
-                "post_exit_minutes_to_net_profit": round(close_profit_minutes, 2) if close_profit_minutes is not None else None,
-                "post_exit_intrabar_first_net_profit_at": datetime.fromtimestamp(first_net_profit_intrabar/1000, timezone.utc).isoformat() if first_net_profit_intrabar else None,
-                "post_exit_intrabar_minutes_to_net_profit": round(intrabar_profit_minutes, 2) if intrabar_profit_minutes is not None else None,
-                "post_exit_minutes_to_best": round((best_close["at_ms"]-start_ms)/60000, 2),
-                "post_exit_observed_minutes": round((int(rows[-1][0])-start_ms)/60000, 2),
-                "post_exit_worst_net_pnl": round(worst_close["min_net_pnl"], 8) if worst_close else None,
-                "post_exit_worst_at": datetime.fromtimestamp(worst_close["at_ms"]/1000, timezone.utc).isoformat() if worst_close else None,
-                "post_exit_recovery_profit_usdt": round(max(0.0, best_close["max_net_pnl"]), 8),
-                "post_exit_intrabar_potential_profit_usdt": round(max(0.0, best_intrabar["max_net_pnl"]), 8),
-                "post_exit_old_exit_reason": trade.exit_reason,
-                "post_exit_recovery_label": (
-                    f"[AFTER EXIT: CLOSE-CONFIRMED NET PROFIT +{best_close['max_net_pnl']:.4f} USDT · +{close_profit_minutes:.0f}m | best +{(best_close['at_ms']-start_ms)/60000:.0f}m | old: {trade.exit_reason}]"
-                    if recovered_to_profit else
-                    f"[AFTER EXIT: INTRABAR-ONLY POTENTIAL +{best_intrabar['max_net_pnl']:.4f} USDT; NO PROFITABLE 1m CLOSE | old: {trade.exit_reason}]"
-                    if intrabar_only else
-                    f"[AFTER EXIT: ENTRY RECOVERED ON CLOSE +{(first_entry_close-start_ms)/60000:.0f}m BUT NOT NET PROFIT | old: {trade.exit_reason}]"
-                    if recovered_to_entry else
-                    f"[AFTER EXIT: NO ENTRY/NET RECOVERY IN {horizon_hours:.0f}H | old: {trade.exit_reason}]"
-                )
-            })
-            with SessionLocal() as db:
-                live = db.get(PaperTrade, trade.id)
-                if live:
-                    live.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
-                    exists = db.scalar(select(PaperTradeEvent.id).where(
-                        PaperTradeEvent.paper_trade_id == trade.id,
-                        PaperTradeEvent.event_type == "POST_EXIT_RECOVERY_AUDIT_V5"
-                    ).limit(1))
-                    if not exists:
-                        db.add(PaperTradeEvent(
-                            paper_trade_id=trade.id, event_type="POST_EXIT_RECOVERY_AUDIT_V5",
-                            observed_at=live.closed_at or now(), value=best_close["max_net_pnl"],
-                            detail=raw["post_exit_recovery_label"]
-                        ))
-                    db.commit()
-            audited += 1
-            recovered += 1 if recovered_to_profit else 0
-        except Exception as exc:
-            failures += 1
-            log_check("post_exit_recovery_audit", False, None, None, f"trade={trade.id} {trade.symbol}: {str(exc)[:500]}")
-    return {"audited": audited, "recovered_to_profit": recovered, "failures": failures}
+
+def _shadow_dt(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 async def evaluate_open_paper_trades(
@@ -2757,6 +2813,14 @@ async def api_paper():
             "post_exit_recovery_minutes_to_best": safe_float(raw.get("post_exit_minutes_to_best")),
             "post_exit_recovery_worst_net_pnl": safe_float(raw.get("post_exit_worst_net_pnl")),
             "post_exit_recovery_observed_minutes": safe_float(raw.get("post_exit_observed_minutes")),
+            "post_exit_recovery_audit_version": safe_float(raw.get("post_exit_recovery_audit_version")),
+            "post_exit_recovery_audit_status": raw.get("post_exit_recovery_audit_status", "PENDING"),
+            "last_leader_check_at": raw.get("last_leader_check_at"),
+            "leader_state_checked_at": raw.get("leader_state_checked_at"),
+            "leader_state_detail": leader_checks.get(trade.id, {}).get("detail") or raw.get("leader_state_detail"),
+            "leader_status": leader_checks.get(trade.id, {}).get("status") or raw.get("leader_state_at_check") or raw.get("leader_status") or "NOT_CHECKED",
+            "leader_check_source": leader_checks.get(trade.id, {}).get("source") or ("KOPYON_VISIBLE_POSITION_SNAPSHOT" if raw.get("leader_state_checked_at") or raw.get("last_leader_check_at") else "NO_STORED_CHECK"),
+            "leader_check_at": leader_checks.get(trade.id, {}).get("checked_at") or raw.get("leader_state_checked_at") or raw.get("last_leader_check_at"),
             "opened_at": trade.opened_at.isoformat(),
             "closed_at": trade.closed_at.isoformat() if trade.closed_at else None
         })
@@ -2771,6 +2835,14 @@ async def api_paper():
         "free_capital": round(max(0.0, equity - deployed_margin), 8),
         "open_count": len(open_trades), "closed_count": len(closed_trades),
         "correlated_exposure_groups": correlated_groups,
+        "recovery_audit": {
+            "complete": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version") == 6),
+            "pending": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version") != 6),
+            "version5_or_older": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version") != 6),
+            "blocked": bool(binance_rest_status().get("blocked")),
+            "remaining_seconds": binance_rest_status().get("remaining_seconds"),
+            "blocked_until": binance_rest_status().get("blocked_until")
+        },
         "shadow_portfolio": shadow_portfolio,
         "price_feed": {
             "status": PAPER_PRICE_STREAM_STATE.get("status"),
@@ -2789,6 +2861,207 @@ async def api_paper():
         },
         "trades": trade_rows
     }
+
+
+def build_new_exit_policy_replay(trades: list[PaperTrade], cfg: dict) -> dict:
+    """Replay closed paper entries using persisted, visible Kopyon leader observations only."""
+    if not trades:
+        return {"summary": {}, "trades": [], "source": "Stored Kopyon position snapshots"}
+    trader_ids = sorted({t.trader_id for t in trades})
+    earliest = min((_shadow_dt(t.opened_at) or now()) for t in trades)
+    with SessionLocal() as db:
+        snapshots = db.scalars(select(PositionSnapshot).where(
+            PositionSnapshot.trader_id.in_(trader_ids),
+            PositionSnapshot.observed_at >= earliest
+        ).order_by(PositionSnapshot.trader_id, PositionSnapshot.observed_at, PositionSnapshot.id)).all()
+        snapshot_ids = [x.id for x in snapshots]
+        observations = db.scalars(select(PositionObservation).where(
+            PositionObservation.snapshot_id.in_(snapshot_ids)
+        ).order_by(PositionObservation.snapshot_id, PositionObservation.id)).all() if snapshot_ids else []
+    obs_by_snapshot: dict[int, list[PositionObservation]] = {}
+    snaps_by_trader: dict[str, list[PositionSnapshot]] = {}
+    complete_snapshot_ids: set[int] = set()
+    for obs in observations:
+        obs_by_snapshot.setdefault(obs.snapshot_id, []).append(obs)
+    for snap in snapshots:
+        # A visible HTTP response without a positions list is not a visible-empty
+        # portfolio. Only provider responses with an explicit positions array
+        # may advance the two-consecutive-omissions closure rule.
+        snapshot_payload = unwrap_data(parse_json(snap.raw_json))
+        if not snap.hidden and isinstance(snapshot_payload.get("positions"), list):
+            complete_snapshot_ids.add(snap.id)
+        snaps_by_trader.setdefault(snap.trader_id, []).append(snap)
+
+    def pnl_at(trade: PaperTrade, raw: dict, mark: float, at: datetime) -> dict:
+        direction = 1.0 if trade.side.upper() == "LONG" else -1.0
+        gross = direction * (mark - float(trade.entry_price)) * float(trade.quantity)
+        turnover = (float(trade.entry_price) + mark) * float(trade.quantity)
+        fee_slippage = turnover * (float(cfg["taker_fee_pct"]) + float(cfg["slippage_pct"])) / 100.0
+        rate = safe_float(raw.get("funding_rate_at_entry"))
+        next_funding = safe_float(raw.get("next_funding_time"))
+        if rate is None or not next_funding:
+            return {"gross": round(gross, 8), "fees_slippage": round(fee_slippage, 8), "funding": None, "net": None}
+        opened = _shadow_dt(trade.opened_at) or at
+        opened_ms = int(opened.timestamp() * 1000)
+        next_ms = next_funding
+        while next_ms <= opened_ms:
+            next_ms += 28800000
+        at_ms = int(at.timestamp() * 1000)
+        settlement_count = 0 if at_ms < next_ms else 1 + int((at_ms - next_ms) // 28800000)
+        funding = float(trade.notional or 0.0) * abs(rate) * settlement_count
+        return {
+            "gross": round(gross, 8), "fees_slippage": round(fee_slippage, 8),
+            "funding": round(funding, 8), "net": round(gross - fee_slippage - funding, 8)
+        }
+
+    result_rows = []
+    closed = [t for t in trades if t.status == "CLOSED"]
+    old_total = sum(float(t.net_pnl or 0.0) for t in closed)
+    old_wins = sum(1 for t in closed if float(t.net_pnl or 0.0) > 0)
+    old_losses = sum(1 for t in closed if float(t.net_pnl or 0.0) < 0)
+    for trade in closed:
+        raw = parse_json(trade.raw_json)
+        old_exit = _shadow_dt(trade.closed_at)
+        if old_exit is None:
+            continue
+        leader_key = trade.source_key.split("|", 1)[1] if "|" in trade.source_key else ""
+        parts = leader_key.split("|")
+        identity = "PROVIDER_POSITION_ID" if len(parts) >= 3 else "SYMBOL_SIDE_FALLBACK"
+        identity_note = (
+            "Provider position ID is present in the stored key."
+            if identity == "PROVIDER_POSITION_ID" else
+            "Provider position ID was not exposed; this match is leader + symbol + side, not a unique position ID."
+        )
+        checked_at = None
+        try:
+            checked_at = _shadow_dt(datetime.fromisoformat(str(raw.get("leader_state_checked_at") or "").replace("Z", "+00:00")))
+        except Exception:
+            pass
+        baseline_open = (
+            raw.get("leader_state_at_check") == "OPEN_OBSERVED"
+            and checked_at is not None
+            and abs((old_exit - checked_at).total_seconds()) <= 300
+        )
+        timeline = snaps_by_trader.get(trade.trader_id, [])
+        common = {
+            "trade_id": trade.id, "trader_id": trade.trader_id, "trader_name": trade.trader_name,
+            "symbol": trade.symbol, "side": trade.side, "old_exit_at": old_exit.isoformat(),
+            "old_exit_reason": trade.exit_reason, "old_realized_net_pnl": round(float(trade.net_pnl or 0.0), 8),
+            "leader_identity": identity, "leader_identity_note": identity_note,
+            "baseline_leader_open_confirmed": baseline_open
+        }
+        if not baseline_open:
+            result_rows.append({**common, "replay_status": "EXCLUDED_NO_LEADER_OPEN_EVIDENCE_AT_OLD_EXIT"})
+            continue
+
+        missing = 0
+        last_mark = last_mark_at = None
+        checkpoints = []
+        checkpoint_hours = (3, 6, 12, 24, 48, 72)
+        next_checkpoint = 0
+        peak = None
+        exit_price = exit_at = exit_detected_at = exit_reason = exit_quality = None
+        for snap in timeline:
+            snap_at = _shadow_dt(snap.observed_at)
+            if snap_at is None or snap_at <= old_exit or snap.id not in complete_snapshot_ids:
+                continue
+            rows = obs_by_snapshot.get(snap.id, [])
+            exact = next((o for o in rows if o.position_key == leader_key), None)
+            if exact is not None:
+                missing = 0
+                if exact.mark_price is not None and float(exact.mark_price) > 0:
+                    last_mark, last_mark_at = float(exact.mark_price), snap_at
+                    p = pnl_at(trade, raw, last_mark, snap_at)
+                    if p["net"] is not None and (peak is None or p["net"] > peak["net"]):
+                        peak = {**p, "mark": last_mark, "at": snap_at.isoformat(), "elapsed_hours": round((snap_at-old_exit).total_seconds()/3600, 3)}
+                    elapsed = (snap_at - old_exit).total_seconds() / 3600
+                    while next_checkpoint < len(checkpoint_hours) and elapsed >= checkpoint_hours[next_checkpoint]:
+                        pcp = pnl_at(trade, raw, last_mark, snap_at)
+                        checkpoints.append({
+                            "target_hours": checkpoint_hours[next_checkpoint], "actual_elapsed_hours": round(elapsed, 3),
+                            "observed_at": snap_at.isoformat(), "leader_mark": last_mark,
+                            "gross_pnl": pcp["gross"], "fees_slippage": pcp["fees_slippage"],
+                            "funding_estimate": pcp["funding"], "net_pnl": pcp["net"]
+                        })
+                        next_checkpoint += 1
+                continue
+            opposite = "SHORT" if trade.side.upper() == "LONG" else "LONG"
+            reversal = next((o for o in rows if o.symbol.upper() == trade.symbol.upper() and o.side.upper() == opposite), None)
+            if reversal is not None and reversal.mark_price is not None and float(reversal.mark_price) > 0:
+                exit_price, exit_at, exit_detected_at = float(reversal.mark_price), snap_at, snap_at
+                exit_reason, exit_quality = "LEADER_REVERSED", "OBSERVED_OPPOSITE_SIDE_LEADER_MARK"
+                break
+            missing += 1
+            if missing >= 2:
+                if last_mark is not None and last_mark_at is not None:
+                    exit_price, exit_at, exit_detected_at = last_mark, last_mark_at, snap_at
+                    exit_reason, exit_quality = "TWO_CONSECUTIVE_VISIBLE_OMISSIONS", "LAST_OBSERVED_LEADER_MARK_PROXY"
+                break
+
+        if exit_price is not None and exit_at is not None:
+            p = pnl_at(trade, raw, exit_price, exit_at)
+            result_rows.append({
+                **common, "replay_status": "CLOSED_BY_NEW_LEADER_POLICY",
+                "new_exit_reason": exit_reason, "new_exit_at": exit_at.isoformat(),
+                "new_exit_detection_at": exit_detected_at.isoformat() if exit_detected_at else None,
+                "new_exit_price": exit_price, "new_exit_price_quality": exit_quality,
+                "new_gross_pnl": p["gross"], "new_fee_slippage_estimate": p["fees_slippage"],
+                "new_funding_estimate": p["funding"], "new_research_realized_net_pnl": p["net"],
+                "hold_after_old_exit_hours": round((exit_at-old_exit).total_seconds()/3600, 3),
+                "peak_after_old_exit": peak, "checkpoints": checkpoints
+            })
+        elif last_mark is not None and last_mark_at is not None:
+            p = pnl_at(trade, raw, last_mark, last_mark_at)
+            result_rows.append({
+                **common, "replay_status": "LEADER_STILL_OPEN_AT_LAST_OBSERVATION",
+                "last_observed_at": last_mark_at.isoformat(), "last_observed_mark": last_mark,
+                "new_unrealized_net_pnl": p["net"], "new_unrealized_gross_pnl": p["gross"],
+                "checkpoints": checkpoints
+            })
+        else:
+            result_rows.append({**common, "replay_status": "NO_POST_EXIT_PRICE_OBSERVATION", "checkpoints": checkpoints})
+
+    completed = [x for x in result_rows if x.get("replay_status") == "CLOSED_BY_NEW_LEADER_POLICY"]
+    valued = [x for x in completed if x.get("new_research_realized_net_pnl") is not None]
+    open_rows = [x for x in result_rows if x.get("replay_status") == "LEADER_STILL_OPEN_AT_LAST_OBSERVATION"]
+    valued_open = [x for x in open_rows if x.get("new_unrealized_net_pnl") is not None]
+    summary = {
+        "old_system_realized_net_pnl": round(old_total, 8), "old_system_closed_trades": len(closed),
+        "old_system_profitable_trades": old_wins, "old_system_losing_trades": old_losses,
+        "new_system_realized_net_pnl": round(sum(float(x["new_research_realized_net_pnl"]) for x in valued), 8),
+        "new_system_replayed_attempts": len(result_rows),
+        "new_system_exits_observed": len(completed),
+        "new_system_replayed_closed_trades": len(valued),
+        "new_system_profitable_trades": sum(1 for x in valued if x["new_research_realized_net_pnl"] > 0),
+        "new_system_losing_trades": sum(1 for x in valued if x["new_research_realized_net_pnl"] < 0),
+        "new_system_closed_but_funding_unpriced": len(completed) - len(valued),
+        "new_system_open_leader_trades": len(open_rows),
+        "new_system_unrealized_net_at_last_observation": round(sum(float(x["new_unrealized_net_pnl"]) for x in valued_open), 8),
+        "eligible_with_leader_open_at_old_exit": sum(1 for x in result_rows if x.get("baseline_leader_open_confirmed")),
+        "excluded_without_leader_open_evidence": sum(1 for x in result_rows if not x.get("baseline_leader_open_confirmed")),
+        "same_cohort_old_system_realized_net_pnl": round(sum(float(x.get("old_realized_net_pnl") or 0.0) for x in completed), 8),
+        "price_source": "Persisted Kopyon leader mark observations only",
+        "identity_caveat": "A stored key without provider position ID is matched by leader + symbol + side only.",
+        "cost_assumption": "Current taker fee and slippage settings are applied; historic per-entry settings were not stored.",
+        "funding_assumption": "Conservative debit from absolute entry funding rate and recorded settlement schedule. Rows without a usable schedule are excluded from new-system realized net PnL.",
+        "exit_assumption": "No fixed continuation timeout. Close on an observed opposite-side leader mark or two consecutive visible omissions. Omission exits use the last observed leader mark as a proxy, not an exchange fill.",
+        "paper_only": True
+    }
+    return {"summary": summary, "trades": result_rows, "source": "Stored Kopyon position snapshots; no invented fills"}
+
+
+@app.get("/api/paper/research-replay")
+async def api_paper_research_replay():
+    cfg = paper_config()
+    with SessionLocal() as db:
+        closed = db.scalars(select(PaperTrade).where(PaperTrade.status == "CLOSED").order_by(PaperTrade.opened_at, PaperTrade.id)).all()
+    return build_new_exit_policy_replay(closed, cfg)
+
+
+@app.post("/api/paper/audit/recovery")
+async def api_paper_run_recovery_audit():
+    """Run one bounded, resumable batch of the historical 1m market recovery audit."""
+    return await run_post_exit_recovery_audit(max_trades=5)
 
 
 @app.get("/api/paper/{trade_id}")
@@ -2863,12 +3136,19 @@ async def api_paper_trade_detail(trade_id: int):
     campaign_trade_details = []
     for item in campaign_rows:
         item_raw = parse_json(item.raw_json)
+        item_opened = _shadow_dt(item.opened_at)
+        item_closed = _shadow_dt(item.closed_at)
+        hold_seconds = max(0.0, (item_closed - item_opened).total_seconds()) if item_opened and item_closed else None
         campaign_trade_details.append({
-            "id": item.id, "status": item.status, "entry_price": item.entry_price,
-            "exit_price": item.exit_price, "net_pnl": round(float(item.net_pnl or 0.0), 8),
+            "id": item.id, "attempt_number": len(campaign_trade_details) + 1,
+            "status": item.status, "entry_price": item.entry_price,
+            "exit_price": item.exit_price, "gross_pnl": round(float(item.gross_pnl or 0.0), 8),
+            "estimated_costs": round(float(item.estimated_costs or 0.0), 8),
+            "net_pnl": round(float(item.net_pnl or 0.0), 8),
             "mfe_net_pnl": safe_float(item_raw.get("mfe_net_pnl")),
             "mae_net_pnl": safe_float(item_raw.get("mae_net_pnl")),
             "post_exit_status": item_raw.get("post_exit_recovery_status"),
+            "post_exit_audit_status": item_raw.get("post_exit_recovery_audit_status", "PENDING"),
             "post_exit_max_net_pnl": safe_float(item_raw.get("post_exit_max_net_pnl")),
             "post_exit_minutes_to_entry": safe_float(item_raw.get("post_exit_minutes_to_entry")),
             "post_exit_minutes_to_net_profit": safe_float(item_raw.get("post_exit_minutes_to_net_profit")),
@@ -2876,6 +3156,8 @@ async def api_paper_trade_detail(trade_id: int):
             "post_exit_max_at": item_raw.get("post_exit_max_at"),
             "opened_at": item.opened_at.isoformat(),
             "closed_at": item.closed_at.isoformat() if item.closed_at else None,
+            "hold_duration_seconds": round(hold_seconds, 2) if hold_seconds is not None else None,
+            "hold_duration_hours": round(hold_seconds / 3600, 3) if hold_seconds is not None else None,
             "exit_reason": item.exit_reason
         })
     campaign = {
@@ -3041,7 +3323,10 @@ async def api_paper_trade_detail(trade_id: int):
                 "fetched_at": time.monotonic(), "candles": [], "error": candle_error
             }
 
+    single_replay = build_new_exit_policy_replay([trade], paper_config())
+    replay_trade = (single_replay.get("trades") or [None])[0]
     return {
+        "new_system_replay": replay_trade,
         "trade": {
             "id": trade.id, "status": trade.status, "trader_id": trade.trader_id,
             "leader_position_key": trade.source_key.split("|", 1)[1] if "|" in trade.source_key else trade.source_key,
