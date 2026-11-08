@@ -319,18 +319,6 @@ def migrate_paper_audit_metadata() -> None:
             .group_by(PaperTradePath.paper_trade_id)
         ).all()
         max_gaps = {int(trade_id): float(gap or 0.0) for trade_id, gap in gap_rows}
-        leader_checks = {}
-        for open_trade in [item for item in trades if item.status == "OPEN"]:
-            leader_state, leader_detail = _leader_state_for_trade(db, open_trade)
-            latest_visible = db.scalar(select(PositionSnapshot).where(
-                PositionSnapshot.trader_id == open_trade.trader_id
-            ).order_by(desc(PositionSnapshot.id)).limit(1))
-            leader_checks[open_trade.id] = {
-                "status": leader_state, "detail": leader_detail,
-                "checked_at": latest_visible.observed_at.isoformat() if latest_visible else None,
-                "source": "LATEST_VISIBLE_KOPYON_SNAPSHOT" if latest_visible else "NO_LEADER_SNAPSHOT"
-            }
-
         for trade in trades:
             raw = parse_json(trade.raw_json)
             opened = trade.opened_at
@@ -2591,6 +2579,17 @@ async def api_paper():
             .group_by(PaperTradePath.paper_trade_id)
         ).all()
         max_gaps = {int(trade_id): float(gap or 0.0) for trade_id, gap in gap_rows}
+        leader_checks = {}
+        for open_trade in [item for item in shadow_trades if item.status == "OPEN"]:
+            leader_state, leader_detail = _leader_state_for_trade(db, open_trade)
+            latest_visible = db.scalar(select(PositionSnapshot).where(
+                PositionSnapshot.trader_id == open_trade.trader_id
+            ).order_by(desc(PositionSnapshot.id)).limit(1))
+            leader_checks[open_trade.id] = {
+                "status": leader_state, "detail": leader_detail,
+                "checked_at": latest_visible.observed_at.isoformat() if latest_visible else None,
+                "source": "LATEST_VISIBLE_KOPYON_SNAPSHOT" if latest_visible else "NO_LEADER_SNAPSHOT"
+            }
 
     open_trades = [trade for trade in shadow_trades if trade.status == "OPEN"]
     closed_trades = [trade for trade in shadow_trades if trade.status == "CLOSED"]
