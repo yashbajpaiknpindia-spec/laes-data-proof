@@ -32,6 +32,7 @@ if not KOPYON_ROOT.endswith("/binance-copy-trading"):
 BINANCE_ROOT = os.getenv("BINANCE_BASE_URL", "https://fapi.binance.com").rstrip("/")
 DISCOVERY_INTERVAL = max(900, int(os.getenv("LAES_DISCOVERY_INTERVAL_SECONDS", "1800")))
 POSITION_BATCH = max(1, min(20, int(os.getenv("LAES_POSITION_BATCH", "20"))))
+TRADER_DISCOVERY_PAGES = max(1, min(20, int(os.getenv("LAES_TRADER_DISCOVERY_PAGES", "5"))))
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./laes_local.db").strip()
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
@@ -658,21 +659,51 @@ def record_position_snapshot(trader_id: str, payload: dict) -> tuple[int, bool]:
     return saved, hidden
 
 async def discover_traders() -> tuple[int, list[str]]:
-    payload, _ = await kopyon_get("traders", {
-        "period": "7D",
-        "sortBy": "copierPnl",
-        "order": "DESC",
-        "type": "PUBLIC",
-        "page": 1,
-        "rows": 20
-    })
-    data = unwrap_data(payload)
-    rows = data.get("traders") or data.get("rows") or data.get("items") or []
-    if not isinstance(rows, list):
-        rows = []
-    saved = persist_traders(rows)
-    ids = [str(row.get("traderId") or row.get("portfolioId") or row.get("id") or "") for row in rows]
-    return saved, [item for item in ids if item]
+    """
+    Discover multiple ranking pages instead of only page 1.
+
+    Kopyon's Binance traders endpoint is paginated at 20 rows/page and returns
+    hasMore/total. The old implementation silently stopped at page 1, which
+    made the stored leader universe depend on historical rows already present
+    in PostgreSQL. We now refresh up to TRADER_DISCOVERY_PAGES pages (default 5,
+    max 100 leaders) while respecting the provider's 20-row page limit.
+    """
+    all_rows: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    for page in range(1, TRADER_DISCOVERY_PAGES + 1):
+        payload, _ = await kopyon_get("traders", {
+            "period": "7D",
+            "sortBy": "copierPnl",
+            "order": "DESC",
+            "type": "PUBLIC",
+            "page": page,
+            "rows": 20
+        })
+        data = unwrap_data(payload)
+        rows = data.get("traders") or data.get("rows") or data.get("items") or []
+        if not isinstance(rows, list) or not rows:
+            break
+
+        page_new = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            trader_id = str(
+                row.get("traderId") or row.get("portfolioId") or row.get("id") or ""
+            ).strip()
+            if not trader_id or trader_id in seen_ids:
+                continue
+            seen_ids.add(trader_id)
+            all_rows.append(row)
+            page_new += 1
+
+        has_more = bool(data.get("hasMore"))
+        if not has_more or page_new == 0 or len(rows) < 20:
+            break
+
+    saved = persist_traders(all_rows)
+    return saved, list(seen_ids)
 
 async def sync_one_trader_positions(trader_id: str) -> tuple[int, bool]:
     payload, _ = await kopyon_get("openPositions", {"traderId": trader_id})
