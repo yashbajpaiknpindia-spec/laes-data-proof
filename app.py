@@ -2981,7 +2981,7 @@ async def api_paper(strategy: str = "RECOVERY"):
         "open_count": len(open_trades), "closed_count": len(closed_trades),
         "correlated_exposure_groups": correlated_groups,
         "recovery_audit": {
-            "complete": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version") == 7),
+            "complete": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version") == 8),
             "pending": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version") != 7),
             "version6_or_older": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version", 0) < 7),
             "blocked": bool(binance_rest_status().get("blocked")),
