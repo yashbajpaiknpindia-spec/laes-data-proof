@@ -800,7 +800,7 @@ async def monitor_worker() -> None:
         # WebSocket-fed market price history; this does not add Kopyon calls.
         await run_monitor_cycle()
         last_discovery = time.monotonic()
-        last_recovery_audit = time.monotonic()
+        last_recovery_audit = time.monotonic() - 300.0  # first V8 audit batch runs immediately after startup
         last_open_leader_refresh = time.monotonic()
         while True:
             await asyncio.sleep(60)
