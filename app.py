@@ -1513,6 +1513,79 @@ async def build_opportunity(
         "recovery_warning": "Market trend/news are contextual risk factors, not a deterministic cause or guarantee of recovery."
     }
 
+def build_momentum_opportunity(
+    obs: PositionObservation, snapshot_time: str | None, trader_name: str | None,
+    news: list[dict], allow_entry_creation: bool = False
+) -> dict:
+    """Independent paper strategy: profitable leader + directional Binance momentum."""
+    entry = safe_float(obs.entry_price)
+    leader_mark = safe_float(obs.mark_price)
+    cfg = paper_config()
+    leader_profit_pct = None
+    if entry and leader_mark and entry > 0:
+        leader_profit_pct = ((leader_mark-entry)/entry*100) if obs.side == "LONG" else ((entry-leader_mark)/entry*100)
+    leader_profitable = bool(leader_profit_pct is not None and leader_profit_pct >= float(cfg.get("momentum_min_leader_profit_pct", 0.05)))
+    try:
+        market = await market_features(obs.symbol) if leader_profitable else {"symbol": obs.symbol, "mark_price": leader_mark, "momentum_5m_pct": None, "not_requested": True}
+    except Exception as exc:
+        market = {"symbol": obs.symbol, "mark_price": leader_mark, "momentum_5m_pct": None, "error": str(exc)[:220]}
+    mark = safe_float(market.get("mark_price")) or leader_mark
+    momentum = safe_float(market.get("momentum_5m_pct"))
+    threshold = float(cfg.get("momentum_min_5m_pct", 0.02))
+    momentum_ok = bool(market.get("momentum_5m_fresh")) and momentum is not None and (
+        momentum >= threshold if obs.side == "LONG" else momentum <= -threshold
+    )
+    reasons = []
+    quote_volume = safe_float(market.get("quote_volume_24h_usdt"))
+    spread_pct = safe_float(market.get("spread_pct"))
+    depth_usdt = safe_float(market.get("min_depth_within_1pct_usdt"))
+    atr = safe_float(market.get("atr_24h_pct"))
+    if quote_volume is None or quote_volume < 5_000_000: reasons.append("24h quote volume below $5M or unavailable")
+    if spread_pct is None or spread_pct > 0.10: reasons.append("spread above 0.10% or unavailable")
+    if depth_usdt is None or depth_usdt < 10000: reasons.append("order-book depth within 1% below $10K or unavailable")
+    if obs.side == "LONG":
+        if not market.get("paper_long_book_covered", False): reasons.append("full simulated LONG notional is not covered")
+        if (safe_float(market.get("paper_long_vwap_slippage_pct")) or 999) > 0.10: reasons.append("simulated LONG VWAP slippage exceeds 0.10%")
+    else:
+        if not market.get("paper_short_book_covered", False): reasons.append("full simulated SHORT notional is not covered")
+        if (safe_float(market.get("paper_short_vwap_slippage_pct")) or 999) > 0.10: reasons.append("simulated SHORT VWAP slippage exceeds 0.10%")
+    volume_ratio = safe_float(market.get("volume_ratio_recent_6h_vs_prior_24h"))
+    if volume_ratio is None or volume_ratio < 0.30: reasons.append("recent 6h volume below 30% baseline or unavailable")
+    if atr is None or atr < 0.02 or atr > 8.0: reasons.append("volatility too low or disorderly")
+    if not market.get("live_price_fresh", False): reasons.append("live Binance mark-price stream not warmed")
+    if not market.get("momentum_5m_fresh", False): reasons.append("live 5-minute momentum not warmed")
+    with SessionLocal() as db:
+        latest = db.scalar(select(PositionSnapshot).where(PositionSnapshot.trader_id == obs.trader_id).order_by(desc(PositionSnapshot.id)).limit(1))
+    current = bool(latest and not latest.hidden and latest.id == obs.snapshot_id)
+    fresh = bool(current and (now() - latest.observed_at).total_seconds() <= 900)
+    qualified = bool(leader_profitable and momentum_ok and not reasons and mark and entry and current and fresh)
+    if not current:
+        status = "LEADER POSITIONS HIDDEN" if latest and latest.hidden else "POSITION NOT IN LATEST LEADER SNAPSHOT"
+    elif not fresh:
+        status = "STALE LEADER SNAPSHOT"
+    elif not leader_profitable:
+        status = "LEADER NOT PROFITABLE"
+    elif not momentum_ok:
+        status = "PROFITABLE · MOMENTUM NOT CONFIRMED"
+    elif reasons:
+        status = "DEAD / COSTLY MARKET"
+    else:
+        status = "QUALIFIED MOMENTUM"
+    if qualified and cfg.get("auto_enabled") and allow_entry_creation:
+        create_paper_trade(obs, trader_name, mark, cfg, market, "MOMENTUM")
+    return {
+        "strategy": "MOMENTUM", "trader_id": obs.trader_id, "trader_name": trader_name or obs.trader_id,
+        "position_key": obs.position_key, "symbol": obs.symbol, "side": obs.side,
+        "entry_price": entry, "mark_price": mark, "leader_profit_pct": leader_profit_pct,
+        "unrealized_pnl": obs.unrealized_pnl, "roi": obs.roi, "leverage": obs.leverage,
+        "observed_at": snapshot_time, "leader_profitable": leader_profitable,
+        "momentum_5m_pct": momentum, "momentum_confirmed": momentum_ok,
+        "qualified": qualified, "status": status, "market": market,
+        "dead_market_reasons": reasons, "leader_snapshot_current": current,
+        "leader_snapshot_fresh": fresh,
+        "entry_model": "CURRENT_BINANCE_MARK_WHILE_PROFITABLE_LEADER_HAS_DIRECTIONAL_5M_MOMENTUM"
+    }
+
 def create_paper_trade(obs: PositionObservation, trader_name: str | None, mark: float, cfg: dict, market: dict, strategy: str = "RECOVERY") -> None:
     if mark <= 0 or not obs.entry_price or obs.entry_price <= 0:
         return
@@ -2541,15 +2614,17 @@ async def scan_paper_opportunities(limit: int = 100, allow_entry_creation: bool 
     async with opportunity_lock:
         return await _api_opportunities_locked(limit, allow_entry_creation)
 
-async def _api_opportunities_locked(limit: int = 100, allow_entry_creation: bool = False):
-    limit = max(1, min(limit, 200))
+
+async def _api_opportunities_locked(limit: int = 2000, allow_entry_creation: bool = False):
+    limit = max(1, min(limit, 2000))
     with SessionLocal() as db:
         latest_ids = select(func.max(PositionSnapshot.id).label("id")).group_by(PositionSnapshot.trader_id).subquery()
         latest_snapshots = db.scalars(select(PositionSnapshot).join(latest_ids, PositionSnapshot.id == latest_ids.c.id)).all()
         visible = {snap.id: snap for snap in latest_snapshots if not snap.hidden}
-        observations = db.scalars(select(PositionObservation).where(
-            PositionObservation.snapshot_id.in_(list(visible.keys()))
-        ).order_by(desc(PositionObservation.id))).all() if visible else []
+        observations = db.scalars(
+            select(PositionObservation).where(PositionObservation.snapshot_id.in_(list(visible.keys())))
+            .order_by(desc(PositionObservation.id))
+        ).all() if visible else []
         traders = {t.trader_id: t.name for t in db.scalars(select(Trader)).all()}
     latest = {}
     for obs in observations:
@@ -2560,11 +2635,10 @@ async def _api_opportunities_locked(limit: int = 100, allow_entry_creation: bool
     result = []
     for obs in list(latest.values())[:limit]:
         snapshot = visible.get(obs.snapshot_id)
-        result.append(await build_opportunity(
-            obs, snapshot.observed_at.isoformat() if snapshot else None,
-            traders.get(obs.trader_id), news, allow_entry_creation=allow_entry_creation
-        ))
-    return sorted(result, key=lambda x: (x["qualified"], x["adverse_pct"] or 0), reverse=True)
+        observed = snapshot.observed_at.isoformat() if snapshot else None
+        result.append(await build_opportunity(obs, observed, traders.get(obs.trader_id), news, allow_entry_creation=allow_entry_creation))
+        result.append(await build_momentum_opportunity(obs, observed, traders.get(obs.trader_id), news, allow_entry_creation=allow_entry_creation))
+    return sorted(result, key=lambda x: (x["qualified"], x.get("leader_profit_pct", x.get("adverse_pct", 0)) or 0), reverse=True)
 
 
 def paper_exit_reason_display(trade: PaperTrade, raw: dict) -> str:
