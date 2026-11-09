@@ -19,8 +19,8 @@ class ClosedTradeForensicsTests(unittest.TestCase):
         self.assertIn('id="paperLatestTrades"', HTML)
 
     def test_historical_audit_is_versioned_resumable_and_rate_limit_aware(self):
-        self.assertIn('"post_exit_recovery_audit_version": 7', APP)
-        self.assertIn('pending = [t for t in closed if parse_json(t.raw_json).get("post_exit_recovery_audit_version", 0) != 7]', APP)
+        self.assertIn('"post_exit_recovery_audit_version": 8', APP)
+        self.assertIn('pending = [t for t in closed if parse_json(t.raw_json).get("post_exit_recovery_audit_version", 0) != 8]', APP)
         self.assertIn('cooldown = binance_rest_status()', APP)
         self.assertIn('if cooldown.get("blocked"):', APP)
         self.assertIn('attempted >= max(1, min(20, int(max_trades)))', APP)
@@ -33,7 +33,7 @@ class ClosedTradeForensicsTests(unittest.TestCase):
     def test_replay_uses_binance_candle_paths_for_every_closed_trade(self):
         self.assertIn("post_exit_mark_candles", APP)
         self.assertIn("MISSING_VERIFIED_BINANCE_CANDLES", APP)
-        self.assertIn("PROFIT_HARVEST_NET_POSITIVE", APP)
+        self.assertIn("PROFIT_HARVEST_TARGET_OR_PROFIT_LOCK", APP)
         self.assertIn("PROTECTIVE_STOP_AFTER_LEADER_CLOSE_OR_UNKNOWN", APP)
         self.assertNotIn("EXCLUDED_NO_LEADER_OPEN_EVIDENCE_AT_OLD_EXIT", APP)
         self.assertIn("omissions do not prove closure", APP)
