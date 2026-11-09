@@ -2907,7 +2907,7 @@ async def api_paper(strategy: str = "RECOVERY"):
             closed_dt = closed_dt.replace(tzinfo=timezone.utc)
         hold_seconds = max(0.0, (closed_dt - opened_dt).total_seconds())
         trade_rows.append({
-            "id": trade.id, "trader_id": trade.trader_id, "trader_name": trade.trader_name,
+            "id": trade.id, "strategy": trade.strategy, "trader_id": trade.trader_id, "trader_name": trade.trader_name,
             "leader_position_key": (trade.source_key.split("|", 1)[1] if "|" in trade.source_key else trade.source_key),
             "symbol": trade.symbol, "side": trade.side, "status": trade.status,
             "entry_price": trade.entry_price, "mark_price": trade.mark_price, "exit_price": trade.exit_price,
@@ -2930,6 +2930,11 @@ async def api_paper(strategy: str = "RECOVERY"):
             "mfe_net_pnl": safe_float(raw.get("mfe_net_pnl")),
             "mae_net_pnl": safe_float(raw.get("mae_net_pnl")),
             "mfe_pct": safe_float(raw.get("mfe_pct")), "mae_pct": safe_float(raw.get("mae_pct")),
+            "entry_timing_improvement_pct": safe_float(raw.get("entry_timing_improvement_pct")),
+            "entry_timing_best_price": safe_float(raw.get("entry_timing_best_price")),
+            "entry_timing_best_at": raw.get("entry_timing_best_at"),
+            "entry_timing_potential_gross_pnl": safe_float(raw.get("entry_timing_potential_gross_pnl")),
+            "entry_timing_verdict": raw.get("entry_timing_verdict"),
             "data_quality_status": raw.get("data_quality_status", "LEGACY_UNCLASSIFIED"),
             "monitoring_status": raw.get("monitoring_status", "NOT_RECORDED"),
             "max_data_gap_seconds": round(max_gap, 3),
