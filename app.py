@@ -1857,8 +1857,11 @@ async def run_post_exit_recovery_audit(max_trades: int = 5) -> dict:
             if not closed_at or not trade.exit_price or not trade.entry_price:
                 continue
             attempted += 1
-            start_ms = int(closed_at.timestamp() * 1000)
-            end_ms = start_ms + int(horizon_hours * 3600000)
+            entry_at = _shadow_dt(trade.opened_at) or closed_at
+            entry_window_minutes = max(5.0, min(120.0, float(cfg.get("entry_timing_audit_window_minutes", 30.0))))
+            start_ms = int((entry_at - timedelta(minutes=entry_window_minutes)).timestamp() * 1000)
+            exit_ms = int(closed_at.timestamp() * 1000)
+            end_ms = exit_ms + int(horizon_hours * 3600000)
             try:
                 rows_all = []
                 cursor = start_ms
@@ -1929,6 +1932,17 @@ async def run_post_exit_recovery_audit(max_trades: int = 5) -> dict:
                         worst = {"net": net, "at": at_ms}
                 if best_close is None or best_intrabar is None:
                     raise RuntimeError("No valid OHLC mark candles returned")
+                pre_entry = [row for row in rows_all if isinstance(row, (list, tuple)) and len(row) >= 7 and start_ms <= int(row[0]) < exit_ms]
+                entry_best = None
+                if pre_entry:
+                    for row in pre_entry:
+                        at_ms = int(row[0]); high = safe_float(row[2]); low = safe_float(row[3])
+                        if high is None or low is None: continue
+                        candidate = low if trade.side == "LONG" else high
+                        improvement = ((trade.entry_price-candidate)/trade.entry_price*100.0) if trade.side == "LONG" else ((candidate-trade.entry_price)/trade.entry_price*100.0)
+                        if improvement > 0 and (entry_best is None or improvement > entry_best["improvement_pct"]):
+                            entry_best = {"price": candidate, "at": at_ms, "improvement_pct": improvement}
+                entry_potential_gross = (trade.entry_price-entry_best["price"])*trade.quantity if entry_best and trade.side == "LONG" else ((entry_best["price"]-trade.entry_price)*trade.quantity if entry_best else None)
                 recovered_profit = best_close["net"] > 0
                 intrabar_only = not recovered_profit and best_intrabar["net"] > 0
                 recovered_entry = first_entry is not None
@@ -1942,10 +1956,24 @@ async def run_post_exit_recovery_audit(max_trades: int = 5) -> dict:
                         [int(row[0]), round(float(row[2]), 12), round(float(row[3]), 12), round(float(row[4]), 12)]
                         for row in rows_all
                         if isinstance(row, (list, tuple)) and len(row) >= 7
-                        and start_ms <= int(row[0]) <= end_ms
+                        and exit_ms <= int(row[0]) <= end_ms
                         and safe_float(row[2]) is not None and safe_float(row[3]) is not None
                         and safe_float(row[4]) is not None
                     ],
+                    "entry_timing_mark_candles": [
+                        [int(row[0]), round(float(row[2]), 12), round(float(row[3]), 12), round(float(row[4]), 12)]
+                        for row in rows_all
+                        if isinstance(row, (list, tuple)) and len(row) >= 7
+                        and start_ms <= int(row[0]) < exit_ms
+                        and safe_float(row[2]) is not None and safe_float(row[3]) is not None
+                        and safe_float(row[4]) is not None
+                    ],
+                    "entry_timing_window_minutes": entry_window_minutes,
+                    "entry_timing_best_price": entry_best["price"] if entry_best else None,
+                    "entry_timing_best_at": datetime.fromtimestamp(entry_best["at"]/1000, timezone.utc).isoformat() if entry_best else None,
+                    "entry_timing_improvement_pct": round(entry_best["improvement_pct"], 8) if entry_best else None,
+                    "entry_timing_potential_gross_pnl": round(entry_potential_gross, 8) if entry_potential_gross is not None else None,
+                    "entry_timing_verdict": ("HINDSIGHT_BETTER_ENTRY_VISIBLE" if entry_best else "NO_MATERIAL_PRE_ENTRY_IMPROVEMENT_VISIBLE") if pre_entry else "NO_PRE_ENTRY_CANDLES",
                     "post_exit_candle_interval": "1m",
                     "post_exit_candle_source_verified": "BINANCE_USDM_MARK_PRICE_1M",
                     "post_exit_recovery_status": status,
@@ -1982,11 +2010,11 @@ async def run_post_exit_recovery_audit(max_trades: int = 5) -> dict:
                         live.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
                         if not db.scalar(select(PaperTradeEvent.id).where(
                             PaperTradeEvent.paper_trade_id == trade.id,
-                            PaperTradeEvent.event_type == "POST_EXIT_RECOVERY_AUDIT_V7"
+                            PaperTradeEvent.event_type.in_(["POST_EXIT_RECOVERY_AUDIT_V7", "POST_EXIT_RECOVERY_AUDIT_V8"])
                         ).limit(1)):
-                            db.add(PaperTradeEvent(paper_trade_id=trade.id, event_type="POST_EXIT_RECOVERY_AUDIT_V6",
+                            db.add(PaperTradeEvent(paper_trade_id=trade.id, event_type="POST_EXIT_RECOVERY_AUDIT_V8",
                                                    observed_at=live.closed_at or now(), value=best_close["net"],
-                                                   detail=raw["post_exit_recovery_label"]))
+                                                   detail=raw["post_exit_recovery_label"] + " · Entry timing audit: " + str(raw.get("entry_timing_verdict"))))
                         db.commit()
                 audited += 1
                 recovered += int(recovered_profit)
@@ -2005,7 +2033,7 @@ async def run_post_exit_recovery_audit(max_trades: int = 5) -> dict:
                 log_check("post_exit_recovery_audit", False, None, None, f"trade={trade.id} {trade.symbol}: {str(exc)[:500]}")
         with SessionLocal() as db:
             after = db.scalars(select(PaperTrade).where(PaperTrade.status == "CLOSED")).all()
-        pending_count = sum(1 for t in after if parse_json(t.raw_json).get("post_exit_recovery_audit_version", 0) != 7)
+        pending_count = sum(1 for t in after if parse_json(t.raw_json).get("post_exit_recovery_audit_version", 0) != 8)
         cooldown = binance_rest_status()
         return {"audited": audited, "attempted": attempted, "recovered_to_profit": recovered,
                 "failures": failures, "blocked": bool(cooldown.get("blocked")),
