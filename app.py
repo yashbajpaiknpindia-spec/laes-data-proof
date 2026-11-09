@@ -322,6 +322,47 @@ def paper_config() -> dict:
         merged["max_total_margin_pct"] = max(float(merged.get("max_total_margin_pct", 0.0) or 0.0), 1000.0)
     return merged
 
+def run_local_forensic_audit_all_closed() -> None:
+    """Fast local forensic pass over every closed trade using persisted paper paths."""
+    with SessionLocal() as db:
+        trades = db.scalars(select(PaperTrade).where(PaperTrade.status == "CLOSED")).all()
+        rows = db.execute(
+            select(PaperTradePath.paper_trade_id, func.count(PaperTradePath.id),
+                   func.max(PaperTradePath.net_pnl), func.min(PaperTradePath.net_pnl))
+            .group_by(PaperTradePath.paper_trade_id)
+        ).all()
+        agg = {int(tid): (int(n or 0), safe_float(mfe), safe_float(mae))
+               for tid, n, mfe, mae in rows}
+        changed = 0
+        for trade in trades:
+            raw = parse_json(trade.raw_json)
+            if int(raw.get("forensic_audit_version", 0) or 0) >= 1:
+                continue
+            n, mfe, mae = agg.get(int(trade.id), (0, None, None))
+            raw["forensic_audit_version"] = 1
+            raw["forensic_audit_status"] = "LOCAL_PATH_AUDIT_COMPLETE" if n else "NO_LOCAL_PATH_DATA"
+            raw["forensic_path_count"] = n
+            raw["forensic_path_mfe_net_pnl"] = mfe
+            raw["forensic_path_mae_net_pnl"] = mae
+            raw["forensic_exit_capture_pct"] = round(float(trade.net_pnl) / mfe * 100.0, 2) if mfe and mfe > 0 else None
+            raw["forensic_mfe_vs_realized"] = (
+                "NO_PATH" if mfe is None else
+                "FAVORABLE_EXCURSION_LEFT_ON_TABLE" if mfe > float(trade.net_pnl or 0) + 0.05 else
+                "SOME_FAVORABLE_EXCURSION_LEFT" if mfe > float(trade.net_pnl or 0) else
+                "NO_MATERIAL_MFE_GAP"
+            )
+            raw["forensic_post_exit_status"] = (
+                "POST_EXIT_CANDLE_PATH_PRESENT"
+                if len(parse_json(raw.get("post_exit_mark_candles"), [])) > 0
+                else "POST_EXIT_CANDLE_AUDIT_PENDING_EXTERNAL_CANDLE_PATH"
+            )
+            raw["forensic_entry_timing_status"] = "PRE_ENTRY_BINANCE_CANDLE_AUDIT_REQUIRED"
+            raw["forensic_note"] = "Local path audit only; no better fill or post-exit recovery is claimed without verified Binance candles."
+            trade.raw_json = json.dumps(raw)
+            changed += 1
+        if changed:
+            db.commit()
+
 def migrate_paper_audit_metadata() -> None:
     """
     Idempotent, non-destructive metadata migration.
@@ -844,6 +885,7 @@ async def monitor_worker() -> None:
         worker_alive = False
 
 async def _startup_recovery_audit() -> None:
+    await asyncio.to_thread(run_local_forensic_audit_all_closed)
     # Never block HTTP startup on historical recovery work. The web service must
     # become available first; the audit is read-only background maintenance.
     await asyncio.sleep(2)
