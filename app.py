@@ -506,9 +506,6 @@ def run_local_forensic_audit_all_closed() -> None:
             # that the leader mark later returned to its own entry, but is not a
             # follower fill, Binance candle path, or realized profit.
             position_key = trade.source_key.split("|", 1)[1] if "|" in trade.source_key else ""
-            leader_entry = safe_float(raw.get("leader_entry"))
-            if leader_entry is None:
-                leader_entry = safe_float(trade.entry_price)
             closed = _shadow_dt(trade.closed_at)
             post_points = []
             if closed and position_key:
@@ -3235,9 +3232,11 @@ async def api_paper(strategy: str = "RECOVERY"):
             "forensic_post_exit_leader_returned_to_entry": raw.get("forensic_post_exit_leader_returned_to_entry"),
             "forensic_post_exit_leader_minutes_to_entry": safe_float(raw.get("forensic_post_exit_leader_minutes_to_entry")),
             "forensic_post_exit_leader_return_at": raw.get("forensic_post_exit_leader_return_at"),
-            "forensic_entry_thresholds": raw.get("forensic_entry_thresholds", {}),
-            "forensic_entry_5pct_status": raw.get("forensic_entry_5pct_status", "PENDING"),
-            "forensic_entry_5pct_net_before_funding": safe_float(raw.get("forensic_entry_5pct_net_before_funding")),
+            "forensic_entry_timing": raw.get("forensic_entry_timing", {}),
+            "forensic_entry_timing_status": raw.get("forensic_entry_timing_status", "PENDING"),
+            "forensic_entry_improvement_pct": safe_float(raw.get("forensic_entry_improvement_pct")),
+            "forensic_entry_counterfactual_net_before_funding": safe_float(raw.get("forensic_entry_counterfactual_net_before_funding")),
+            "forensic_entry_net_improvement_before_funding": safe_float(raw.get("forensic_entry_net_improvement_before_funding")),
             "forensic_note": raw.get("forensic_note"),
             "data_quality_status": raw.get("data_quality_status", "LEGACY_UNCLASSIFIED"),
             "monitoring_status": raw.get("monitoring_status", "NOT_RECORDED"),
@@ -3301,7 +3300,10 @@ async def api_paper(strategy: str = "RECOVERY"):
             "mfe_left_on_table": sum(1 for t in closed_trades if parse_json(t.raw_json).get("forensic_mfe_vs_realized") == "FAVORABLE_EXCURSION_LEFT_ON_TABLE"),
             "leader_returned_to_entry_after_exit": sum(1 for t in closed_trades if parse_json(t.raw_json).get("forensic_post_exit_leader_returned_to_entry") is True),
             "leader_post_exit_snapshots": sum(1 for t in closed_trades if int(parse_json(t.raw_json).get("forensic_post_exit_leader_snapshot_count", 0) or 0) > 0),
-            "five_pct_delayed_entry_tested": sum(1 for t in closed_trades if parse_json(t.raw_json).get("forensic_entry_5pct_status") in {"HYPOTHETICAL_HOLD_TO_OLD_EXIT", "ALREADY_AT_OR_BEYOND_THRESHOLD_AT_ACTUAL_ENTRY", "THRESHOLD_NOT_REACHED_IN_SAVED_PATH"})
+            "entries_with_pre_entry_samples": sum(1 for t in closed_trades if int((parse_json(t.raw_json).get("forensic_entry_timing") or {}).get("pre_entry_observation_count", 0) or 0) > 0),
+            "better_pre_entry_price_found": sum(1 for t in closed_trades if (parse_json(t.raw_json).get("forensic_entry_timing") or {}).get("status") == "BEST_OBSERVED_PRE_ENTRY_PRICE_FOUND"),
+            "hypothetical_entry_net_improved": sum(1 for t in closed_trades if safe_float((parse_json(t.raw_json).get("forensic_entry_timing") or {}).get("net_improvement_before_funding")) is not None and safe_float((parse_json(t.raw_json).get("forensic_entry_timing") or {}).get("net_improvement_before_funding")) > 0),
+            "hypothetical_entry_net_improvement_before_funding": round(sum(safe_float((parse_json(t.raw_json).get("forensic_entry_timing") or {}).get("net_improvement_before_funding")) or 0.0 for t in closed_trades), 8)
         },
         "scanner": {
             "last_scan_finished_at": last_scan.get("finished_at"),
@@ -3540,6 +3542,25 @@ async def api_paper_research_replay():
 async def api_paper_run_recovery_audit():
     """Run one bounded, resumable batch of the historical 1m market recovery audit."""
     return await run_post_exit_recovery_audit(max_trades=5)
+
+
+@app.post("/api/paper/audit/local")
+async def api_paper_run_local_forensic_audit():
+    """Run the fast all-closed-trade audit against data already persisted locally."""
+    await asyncio.to_thread(run_local_forensic_audit_all_closed)
+    with SessionLocal() as db:
+        closed = db.scalars(select(PaperTrade).where(PaperTrade.status == "CLOSED")).all()
+    raw_rows = [parse_json(t.raw_json) for t in closed]
+    return {
+        "status": "COMPLETE" if all(int(x.get("forensic_audit_version", 0) or 0) >= 2 for x in raw_rows) else "PARTIAL",
+        "closed_trades": len(closed),
+        "complete": sum(1 for x in raw_rows if int(x.get("forensic_audit_version", 0) or 0) >= 2),
+        "pending": sum(1 for x in raw_rows if int(x.get("forensic_audit_version", 0) or 0) < 2),
+        "with_saved_paths": sum(1 for x in raw_rows if int(x.get("forensic_path_count", 0) or 0) > 0),
+        "better_pre_entry_price_found": sum(1 for x in raw_rows if (x.get("forensic_entry_timing") or {}).get("status") == "BEST_OBSERVED_PRE_ENTRY_PRICE_FOUND"),
+        "leader_returned_to_entry_after_exit": sum(1 for x in raw_rows if x.get("forensic_post_exit_leader_returned_to_entry") is True),
+        "leader_post_exit_snapshots": sum(1 for x in raw_rows if int(x.get("forensic_post_exit_leader_snapshot_count", 0) or 0) > 0)
+    }
 
 
 @app.get("/api/paper/{trade_id}")
@@ -3866,9 +3887,11 @@ async def api_paper_trade_detail(trade_id: int):
             "forensic_post_exit_leader_returned_to_entry": raw.get("forensic_post_exit_leader_returned_to_entry"),
             "forensic_post_exit_leader_minutes_to_entry": safe_float(raw.get("forensic_post_exit_leader_minutes_to_entry")),
             "forensic_post_exit_leader_return_at": raw.get("forensic_post_exit_leader_return_at"),
-            "forensic_entry_thresholds": raw.get("forensic_entry_thresholds", {}),
-            "forensic_entry_5pct_status": raw.get("forensic_entry_5pct_status", "PENDING"),
-            "forensic_entry_5pct_net_before_funding": safe_float(raw.get("forensic_entry_5pct_net_before_funding")),
+            "forensic_entry_timing": raw.get("forensic_entry_timing", {}),
+            "forensic_entry_timing_status": raw.get("forensic_entry_timing_status", "PENDING"),
+            "forensic_entry_improvement_pct": safe_float(raw.get("forensic_entry_improvement_pct")),
+            "forensic_entry_counterfactual_net_before_funding": safe_float(raw.get("forensic_entry_counterfactual_net_before_funding")),
+            "forensic_entry_net_improvement_before_funding": safe_float(raw.get("forensic_entry_net_improvement_before_funding")),
             "forensic_note": raw.get("forensic_note"),
             "last_binance_price_at": raw.get("last_binance_price_at"),
             "last_leader_check_at": raw.get("last_leader_check_at"),
