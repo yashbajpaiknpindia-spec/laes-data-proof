@@ -346,7 +346,7 @@ def run_local_forensic_audit_all_closed() -> None:
             .where(PaperTradePath.paper_trade_id.in_(trade_ids))
             .order_by(PaperTradePath.paper_trade_id, PaperTradePath.observed_at)
         ).all()
-        earliest_close = min((_shadow_dt(t.closed_at) or _shadow_dt(t.opened_at) or now()) for t in trades)
+        earliest_open = min((_shadow_dt(t.opened_at) or now()) for t in trades)
         latest_close = max((_shadow_dt(t.closed_at) or now()) for t in trades)
         leader_rows = db.execute(
             select(PositionObservation, PositionSnapshot)
@@ -354,7 +354,7 @@ def run_local_forensic_audit_all_closed() -> None:
             .where(
                 PositionObservation.trader_id.in_(trader_ids),
                 PositionSnapshot.hidden.is_(False),
-                PositionSnapshot.observed_at >= earliest_close,
+                PositionSnapshot.observed_at >= earliest_open - timedelta(hours=72),
                 PositionSnapshot.observed_at <= latest_close + timedelta(hours=72)
             )
             .order_by(PositionSnapshot.observed_at)
@@ -410,68 +410,96 @@ def run_local_forensic_audit_all_closed() -> None:
                 "NO_MATERIAL_MFE_GAP"
             )
 
-            # Counterfactual delayed-entry checks. A threshold already exceeded at
-            # the original entry is NOT counted as a later-entry opportunity.
+            # Per-trade better-entry audit. There are no fixed percentage triggers:
+            # find the best *observed exact-leader mark* after that leader position first
+            # appeared in our stored history but before our follower paper entry. It is
+            # a hindsight sample, not a signal or guaranteed fill.
             opened = _shadow_dt(trade.opened_at) or now()
-            initial_adverse = safe_float(raw.get("adverse_pct"))
-            threshold_audit = {}
-            for threshold in (2.5, 3.5, 5.0):
-                key = str(threshold)
-                if initial_adverse is not None and initial_adverse >= threshold:
-                    threshold_audit[key] = {
-                        "status": "ALREADY_AT_OR_BEYOND_THRESHOLD_AT_ACTUAL_ENTRY",
-                        "initial_leader_adverse_pct": round(initial_adverse, 6)
-                    }
-                    continue
-                candidate = next((
-                    p for p in points
-                    if (_shadow_dt(p.observed_at) or opened) > opened + timedelta(seconds=5)
-                    and safe_float(p.leader_adverse_pct) is not None
-                    and float(p.leader_adverse_pct) >= threshold
-                    and safe_float(p.paper_price) is not None
-                    and float(p.paper_price) > 0
-                ), None)
-                if candidate is None:
-                    threshold_audit[key] = {
-                        "status": "THRESHOLD_NOT_REACHED_IN_SAVED_PATH",
-                        "initial_leader_adverse_pct": round(initial_adverse, 6) if initial_adverse is not None else None
-                    }
-                    continue
-                candidate_entry = float(candidate.paper_price)
-                candidate_exit = safe_float(trade.exit_price)
-                if candidate_exit is None or candidate_exit <= 0 or not trade.quantity:
-                    threshold_audit[key] = {
-                        "status": "THRESHOLD_REACHED_BUT_EXIT_PRICE_UNAVAILABLE",
-                        "entry_at": candidate.observed_at.isoformat(),
-                        "entry_mark_sampled": candidate_entry
-                    }
-                    continue
-                direction = 1.0 if trade.side.upper() == "LONG" else -1.0
-                gross = direction * (candidate_exit - candidate_entry) * float(trade.quantity)
-                fees_slippage = (
-                    (candidate_entry + candidate_exit) * float(trade.quantity)
-                    * (float(cfg.get("taker_fee_pct", 0.05)) + float(cfg.get("slippage_pct", 0.02))) / 100.0
+            position_key = trade.source_key.split("|", 1)[1] if "|" in trade.source_key else ""
+            leader_timeline = leader_by_key.get((str(trade.trader_id), position_key), [])
+            pre_entry_leader_points = [
+                item for item in leader_timeline
+                if item[0] < opened - timedelta(seconds=5) and item[1] is not None and item[1] > 0
+            ]
+            if leader_entry is None:
+                leader_entry = next(
+                    (observed_entry for _, _, observed_entry in leader_timeline if observed_entry and observed_entry > 0),
+                    None
                 )
-                entry_at = _shadow_dt(candidate.observed_at) or opened
-                threshold_audit[key] = {
-                    "status": "HYPOTHETICAL_HOLD_TO_OLD_EXIT",
-                    "entry_at": entry_at.isoformat(),
-                    "entry_mark_sampled": round(candidate_entry, 12),
-                    "leader_adverse_pct_at_entry": round(float(candidate.leader_adverse_pct), 6),
-                    "minutes_waited_from_actual_entry": round((entry_at - opened).total_seconds() / 60.0, 3),
-                    "actual_exit_at": _shadow_dt(trade.closed_at).isoformat() if trade.closed_at else None,
-                    "actual_exit_mark": round(candidate_exit, 12),
-                    "gross_pnl_estimate": round(gross, 8),
-                    "fee_slippage_estimate": round(fees_slippage, 8),
-                    "net_before_funding_estimate": round(gross - fees_slippage, 8),
-                    "funding_included": False,
-                    "path_gap_seconds": round(max_gap, 3),
-                    "fill_quality": "SAMPLED_PAPER_MARK_NOT_EXECUTABLE_FILL"
-                }
-            raw["forensic_entry_thresholds"] = threshold_audit
-            five = threshold_audit.get("5.0", {})
-            raw["forensic_entry_5pct_status"] = five.get("status", "NOT_AUDITED")
-            raw["forensic_entry_5pct_net_before_funding"] = five.get("net_before_funding_estimate")
+            best_entry_point = None
+            actual_entry = safe_float(trade.entry_price)
+            direction = 1.0 if trade.side.upper() == "LONG" else -1.0
+            if pre_entry_leader_points and actual_entry and actual_entry > 0:
+                best_entry_point = (
+                    min(pre_entry_leader_points, key=lambda item: item[1])
+                    if direction > 0 else
+                    max(pre_entry_leader_points, key=lambda item: item[1])
+                )
+            entry_timing = {
+                "status": (
+                    "BEST_OBSERVED_PRE_ENTRY_PRICE_FOUND"
+                    if best_entry_point and (
+                        (actual_entry - best_entry_point[1]) * direction > 0
+                    ) else
+                    "NO_BETTER_PRE_ENTRY_MARK_OBSERVED"
+                    if best_entry_point else
+                    "NO_EXACT_LEADER_SNAPSHOTS_BEFORE_OUR_ENTRY"
+                ),
+                "basis": "EXACT_KEY_KOPYON_LEADER_POSITION_MARK_SNAPSHOTS",
+                "pre_entry_observation_count": len(pre_entry_leader_points),
+                "first_pre_entry_observation_at": pre_entry_leader_points[0][0].isoformat() if pre_entry_leader_points else None,
+                "last_pre_entry_observation_at": pre_entry_leader_points[-1][0].isoformat() if pre_entry_leader_points else None,
+                "leader_position_entry_price": leader_entry,
+                "actual_follower_entry_price": actual_entry,
+                "actual_exit_price": safe_float(trade.exit_price),
+                "funding_included": False,
+                "fill_quality": "SAMPLED_LEADER_MARK_NOT_EXECUTABLE_FILL"
+            }
+            if best_entry_point and actual_entry and actual_entry > 0:
+                best_at, best_price, _ = best_entry_point
+                improvement_pct = (actual_entry - best_price) / actual_entry * 100.0 * direction
+                relative_to_leader_pct = (
+                    (leader_entry - best_price) / leader_entry * 100.0 * direction
+                    if leader_entry and leader_entry > 0 else None
+                )
+                entry_timing.update({
+                    "best_observed_entry_at": best_at.isoformat(),
+                    "best_observed_entry_mark": round(best_price, 12),
+                    "entry_price_improvement_vs_actual_pct": round(improvement_pct, 8),
+                    "entry_price_advantage_vs_leader_entry_pct": round(relative_to_leader_pct, 8) if relative_to_leader_pct is not None else None,
+                    "minutes_between_best_sample_and_actual_entry": round((opened - best_at).total_seconds() / 60.0, 3),
+                    "pre_entry_observation_window_minutes": round(
+                        (pre_entry_leader_points[-1][0] - pre_entry_leader_points[0][0]).total_seconds() / 60.0, 3
+                    ) if len(pre_entry_leader_points) > 1 else 0.0
+                })
+                candidate_exit = safe_float(trade.exit_price)
+                if candidate_exit and candidate_exit > 0 and trade.quantity:
+                    quantity = float(trade.quantity)
+                    candidate_gross = direction * (candidate_exit - best_price) * quantity
+                    candidate_fees_slippage = (
+                        (best_price + candidate_exit) * quantity
+                        * (float(cfg.get("taker_fee_pct", 0.05)) + float(cfg.get("slippage_pct", 0.02))) / 100.0
+                    )
+                    actual_gross = direction * (candidate_exit - actual_entry) * quantity
+                    actual_fees_slippage = (
+                        (actual_entry + candidate_exit) * quantity
+                        * (float(cfg.get("taker_fee_pct", 0.05)) + float(cfg.get("slippage_pct", 0.02))) / 100.0
+                    )
+                    candidate_net = candidate_gross - candidate_fees_slippage
+                    actual_net_before_funding = actual_gross - actual_fees_slippage
+                    entry_timing.update({
+                        "hold_to_actual_exit_net_before_funding": round(candidate_net, 8),
+                        "actual_entry_hold_to_actual_exit_net_before_funding": round(actual_net_before_funding, 8),
+                        "net_improvement_before_funding": round(candidate_net - actual_net_before_funding, 8),
+                        "estimated_round_trip_fee_slippage": round(candidate_fees_slippage, 8),
+                        "funding_included": False,
+                        "comparison_exit_basis": "ACTUAL_HISTORICAL_EXIT_PRICE"
+                    })
+            raw["forensic_entry_timing"] = entry_timing
+            raw["forensic_entry_timing_status"] = entry_timing["status"]
+            raw["forensic_entry_improvement_pct"] = entry_timing.get("entry_price_improvement_vs_actual_pct")
+            raw["forensic_entry_counterfactual_net_before_funding"] = entry_timing.get("hold_to_actual_exit_net_before_funding")
+            raw["forensic_entry_net_improvement_before_funding"] = entry_timing.get("net_improvement_before_funding")
 
             # Exact-position leader snapshots after our exit. This can establish
             # that the leader mark later returned to its own entry, but is not a
