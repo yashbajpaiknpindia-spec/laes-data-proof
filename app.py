@@ -3094,6 +3094,9 @@ def build_new_exit_policy_replay(trades: list[PaperTrade], cfg: dict) -> dict:
         checkpoints = []
         checkpoint_hours = (3, 6, 12, 24, 48, 72)
         next_checkpoint = 0
+        replay_mfe = None
+        replay_min_harvest_margin_pct = float(cfg.get("profit_harvest_min_margin_pct", 0.70))
+        replay_giveback_pct = float(cfg.get("profit_giveback_pct", 35.0))
         for candle in sorted(candles, key=lambda c: int(c[0]) if isinstance(c, (list, tuple)) and c else 0):
             if not isinstance(candle, (list, tuple)) or len(candle) < 4:
                 continue
@@ -3140,9 +3143,14 @@ def build_new_exit_policy_replay(trades: list[PaperTrade], cfg: dict) -> dict:
                     "leader_state": state, "pnl": stop_pnl}
                 break
             if p["net_estimate"] is not None and p["net_estimate"] > 0:
-                exit_result = {"at_ms": at_ms, "price": close, "reason": "PROFIT_HARVEST_NET_POSITIVE",
-                    "quality": "BINANCE_MARK_PRICE_1M_CLOSE", "leader_state": "NOT_REQUIRED_FOR_PROFIT_HARVEST", "pnl": p}
-                break
+                replay_mfe = max(float(replay_mfe or p["net_estimate"]), float(p["net_estimate"]))
+                margin_pct = float(p["net_estimate"]) / max(float(trade.margin_used or 0.0), 1e-9) * 100.0
+                giveback = max(0.0, (replay_mfe - float(p["net_estimate"])) / replay_mfe * 100.0) if replay_mfe > 0 else 0.0
+                target_hit = (trade.side.upper() == "LONG" and close >= float(trade.target_price)) or (trade.side.upper() == "SHORT" and close <= float(trade.target_price))
+                if target_hit or margin_pct >= replay_min_harvest_margin_pct or giveback >= replay_giveback_pct:
+                    exit_result = {"at_ms": at_ms, "price": close, "reason": "PROFIT_HARVEST_TARGET_OR_PROFIT_LOCK",
+                        "quality": "BINANCE_MARK_PRICE_1M_CLOSE", "leader_state": "NOT_REQUIRED_FOR_PROFIT_HARVEST", "pnl": p}
+                    break
         if exit_result:
             p = exit_result["pnl"]
             rows.append({**common, "replay_status": "POLICY_EXIT_SIMULATED",
@@ -3184,7 +3192,7 @@ def build_new_exit_policy_replay(trades: list[PaperTrade], cfg: dict) -> dict:
         "no_valid_candle_trades": sum(1 for x in rows if x.get("replay_status") == "NO_VALID_POST_EXIT_CANDLE"),
         "leader_open_evidence_at_old_exit": sum(1 for x in rows if x.get("baseline_leader_open_confirmed")),
         "price_source": "Persisted Binance USD-M mark-price 1m OHLC candles",
-        "exit_policy": "Harvest first candle close with estimated net above zero; defer protective stop only while exact leader position is observed open; omissions do not prove closure.",
+        "exit_policy": "Harvest only after configured target/min-margin or MFE giveback lock; defer protective stop only while exact leader position is observed open; omissions do not prove closure.",
         "cost_assumption": "Configured taker fee and slippage; historical per-trade settings were not persisted.",
         "funding_assumption": "Absolute entry funding rate and 8-hour schedule estimate; not verified historical settlement records.",
         "execution_caveat": "Counterfactual mark-price simulation only, not actual exchange fills or realized PnL.",
