@@ -312,7 +312,15 @@ def paper_config() -> dict:
         "post_exit_recovery_audit_hours": 6.0
     }
     saved = setting("paper_config", {})
-    return {**defaults, **(saved if isinstance(saved, dict) else {})}
+    merged = {**defaults, **(saved if isinstance(saved, dict) else {})}
+    # Research paper mode is intentionally not wallet-limited. The shadow portfolio
+    # remains the constrained comparison. Existing low-capital settings are promoted
+    # so the scanner cannot silently stop taking valid research opportunities.
+    if bool(merged.get("research_unconstrained", True)):
+        merged["capital_usdt"] = max(float(merged.get("capital_usdt", 0.0) or 0.0), 1_000_000.0)
+        merged["max_margin_pct"] = max(float(merged.get("max_margin_pct", 0.0) or 0.0), 100.0)
+        merged["max_total_margin_pct"] = max(float(merged.get("max_total_margin_pct", 0.0) or 0.0), 1000.0)
+    return merged
 
 def migrate_paper_audit_metadata() -> None:
     """
@@ -822,7 +830,7 @@ async def monitor_worker() -> None:
                         log_check("open_paper_leader_refresh", False, None, None, f"{trader_id}: {str(leader_exc)[:500]}")
                 last_open_leader_refresh = time.monotonic()
             try:
-                opportunities = await scan_paper_opportunities(limit=100, allow_entry_creation=True)
+                opportunities = await scan_paper_opportunities(limit=2000, allow_entry_creation=True)
                 qualified_count = sum(1 for item in opportunities if item.get("qualified"))
                 log_check("paper_analysis", True, 200, None, f"minute_recheck observed={len(opportunities)} qualified={qualified_count}")
             except Exception as exc:
@@ -1513,6 +1521,47 @@ async def build_opportunity(
         "recovery_warning": "Market trend/news are contextual risk factors, not a deterministic cause or guarantee of recovery."
     }
 
+async def momentum_market_features(symbol: str) -> dict:
+    """
+    Lightweight momentum feed that never depends on Binance REST availability.
+    Static liquidity/volatility is taken from the persisted MarketInsight cache when
+    available; directional 5-minute momentum and mark price come from the live
+    Binance WebSocket. Unknown static fields are marked pending rather than silently
+    rejecting a research-only opportunity.
+    """
+    symbol = str(symbol).upper()
+    with SessionLocal() as db:
+        cache_row = db.get(MarketInsight, symbol)
+    cached = parse_json(cache_row.raw_json) if cache_row else {}
+    live_at = PAPER_SYMBOL_LAST_PRICE_AT.get(symbol)
+    live_fresh = bool(live_at and time.time() - live_at <= 10)
+    live_price = PAPER_SYMBOL_LAST_PRICE.get(symbol) if live_fresh else safe_float(cached.get("mark_price"))
+    history = PAPER_SYMBOL_PRICE_HISTORY.get(symbol, [])
+    cutoff = time.time() - 300
+    baseline = next((price for stamp, price in history if stamp <= cutoff), None)
+    momentum_fresh = bool(live_fresh and baseline and baseline > 0 and live_price and live_price > 0)
+    momentum = ((live_price / baseline) - 1) * 100 if momentum_fresh else None
+    return {
+        "symbol": symbol,
+        "mark_price": live_price,
+        "momentum_5m_pct": momentum,
+        "momentum_5m_fresh": momentum_fresh,
+        "live_price_fresh": live_fresh,
+        "quote_volume_24h_usdt": safe_float(cached.get("quote_volume_24h_usdt")),
+        "spread_pct": safe_float(cached.get("spread_pct")),
+        "min_depth_within_1pct_usdt": safe_float(cached.get("min_depth_within_1pct_usdt")),
+        "volume_ratio_recent_6h_vs_prior_24h": safe_float(cached.get("volume_ratio_recent_6h_vs_prior_24h")),
+        "atr_24h_pct": safe_float(cached.get("atr_24h_pct")),
+        "paper_long_book_covered": cached.get("paper_long_book_covered"),
+        "paper_short_book_covered": cached.get("paper_short_book_covered"),
+        "paper_long_vwap_slippage_pct": safe_float(cached.get("paper_long_vwap_slippage_pct")),
+        "paper_short_vwap_slippage_pct": safe_float(cached.get("paper_short_vwap_slippage_pct")),
+        "funding_rate": PAPER_SYMBOL_FUNDING_RATE.get(symbol, safe_float(cached.get("funding_rate"))),
+        "next_funding_time": cached.get("next_funding_time"),
+        "static_market_data_status": "CACHED" if cache_row else "PENDING",
+        "source": "BINANCE_WS_MARK_PRICE_1S + PERSISTED_MARKET_INSIGHT",
+    }
+
 async def build_momentum_opportunity(
     obs: PositionObservation, snapshot_time: str | None, trader_name: str | None,
     news: list[dict], allow_entry_creation: bool = False
@@ -1525,10 +1574,10 @@ async def build_momentum_opportunity(
     if entry and leader_mark and entry > 0:
         leader_profit_pct = ((leader_mark-entry)/entry*100) if obs.side == "LONG" else ((entry-leader_mark)/entry*100)
     leader_profitable = bool(leader_profit_pct is not None and leader_profit_pct >= float(cfg.get("momentum_min_leader_profit_pct", 0.05)))
-    try:
-        market = await market_features(obs.symbol) if leader_profitable else {"symbol": obs.symbol, "mark_price": leader_mark, "momentum_5m_pct": None, "not_requested": True}
-    except Exception as exc:
-        market = {"symbol": obs.symbol, "mark_price": leader_mark, "momentum_5m_pct": None, "error": str(exc)[:220]}
+    market = await momentum_market_features(obs.symbol) if leader_profitable else {
+        "symbol": obs.symbol, "mark_price": leader_mark, "momentum_5m_pct": None,
+        "momentum_5m_fresh": False, "live_price_fresh": False, "not_requested": True
+    }
     mark = safe_float(market.get("mark_price")) or leader_mark
     momentum = safe_float(market.get("momentum_5m_pct"))
     threshold = float(cfg.get("momentum_min_5m_pct", 0.02))
@@ -1540,18 +1589,23 @@ async def build_momentum_opportunity(
     spread_pct = safe_float(market.get("spread_pct"))
     depth_usdt = safe_float(market.get("min_depth_within_1pct_usdt"))
     atr = safe_float(market.get("atr_24h_pct"))
-    if quote_volume is None or quote_volume < 5_000_000: reasons.append("24h quote volume below $5M or unavailable")
-    if spread_pct is None or spread_pct > 0.10: reasons.append("spread above 0.10% or unavailable")
-    if depth_usdt is None or depth_usdt < 10000: reasons.append("order-book depth within 1% below $10K or unavailable")
+    # Unknown static fields are data-pending, not automatic rejection. This is a
+    # research paper ledger, so missing cached depth/volume must not erase a live
+    # profitable-leader signal. Known bad values remain hard rejects.
+    if quote_volume is not None and quote_volume < 5_000_000: reasons.append("24h quote volume below $5M")
+    if spread_pct is not None and spread_pct > 0.10: reasons.append("spread above 0.10%")
+    if depth_usdt is not None and depth_usdt < 10000: reasons.append("order-book depth within 1% below $10K")
     if obs.side == "LONG":
-        if not market.get("paper_long_book_covered", False): reasons.append("full simulated LONG notional is not covered")
-        if (safe_float(market.get("paper_long_vwap_slippage_pct")) or 999) > 0.10: reasons.append("simulated LONG VWAP slippage exceeds 0.10%")
+        if market.get("paper_long_book_covered") is False: reasons.append("cached LONG book cannot cover simulated notional")
+        slip = safe_float(market.get("paper_long_vwap_slippage_pct"))
+        if slip is not None and slip > 0.10: reasons.append("cached LONG VWAP slippage exceeds 0.10%")
     else:
-        if not market.get("paper_short_book_covered", False): reasons.append("full simulated SHORT notional is not covered")
-        if (safe_float(market.get("paper_short_vwap_slippage_pct")) or 999) > 0.10: reasons.append("simulated SHORT VWAP slippage exceeds 0.10%")
+        if market.get("paper_short_book_covered") is False: reasons.append("cached SHORT book cannot cover simulated notional")
+        slip = safe_float(market.get("paper_short_vwap_slippage_pct"))
+        if slip is not None and slip > 0.10: reasons.append("cached SHORT VWAP slippage exceeds 0.10%")
     volume_ratio = safe_float(market.get("volume_ratio_recent_6h_vs_prior_24h"))
-    if volume_ratio is None or volume_ratio < 0.30: reasons.append("recent 6h volume below 30% baseline or unavailable")
-    if atr is None or atr < 0.02 or atr > 8.0: reasons.append("volatility too low or disorderly")
+    if volume_ratio is not None and volume_ratio < 0.30: reasons.append("recent 6h volume below 30% baseline")
+    if atr is not None and (atr < 0.02 or atr > 8.0): reasons.append("volatility too low or disorderly")
     if not market.get("live_price_fresh", False): reasons.append("live Binance mark-price stream not warmed")
     if not market.get("momentum_5m_fresh", False): reasons.append("live 5-minute momentum not warmed")
     with SessionLocal() as db:
@@ -1630,7 +1684,8 @@ def create_paper_trade(obs: PositionObservation, trader_name: str | None, mark: 
             margin = min(margin, free_capital, remaining_portfolio_margin)
         leverage = max(1.0, min(float(cfg["max_leverage"]), float(obs.leverage or 1.0)))
         notional = margin * leverage
-        notional = min(notional, capital * 0.25)
+        if not bool(cfg.get("research_unconstrained", True)):
+            notional = min(notional, capital * 0.25)
         if notional < 5 or margin <= 0:
             return
         quantity = notional / mark
