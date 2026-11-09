@@ -6,6 +6,7 @@ APP = (ROOT / "app.py").read_text()
 HTML = (ROOT / "templates" / "index.html").read_text()
 
 class ExitPolicyRegressionTests(unittest.TestCase):
+    # V8: historical recovery audit + target/MFE profit-lock policy.
     def test_fixed_continuation_timeout_is_removed(self):
         self.assertNotIn("LEADER_CONTINUATION_TIMEOUT", APP)
         self.assertNotIn("continuation_timed_out", APP)
