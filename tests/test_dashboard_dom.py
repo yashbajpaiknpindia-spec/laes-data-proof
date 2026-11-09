@@ -26,7 +26,7 @@ class DashboardDomRegressionTests(unittest.TestCase):
     def test_each_dashboard_page_exists_once(self) -> None:
         expected = {
             "page-overview", "page-traders", "page-positions",
-            "page-opportunities", "page-paper", "page-market", "page-database",
+            "page-opportunities", "page-paper", "page-momentum", "page-market", "page-database",
         }
         pages = re.findall(r'<section class="page(?: active)?" id="(page-[^"]+)"', TEMPLATE)
         self.assertEqual(set(pages), expected)

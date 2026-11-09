@@ -173,6 +173,7 @@ class PaperTrade(Base):
     trader_name: Mapped[str | None] = mapped_column(String(240))
     symbol: Mapped[str] = mapped_column(String(80), index=True)
     side: Mapped[str] = mapped_column(String(12))
+    strategy: Mapped[str] = mapped_column(String(24), default="RECOVERY", index=True)
     status: Mapped[str] = mapped_column(String(20), default="OPEN", index=True)
     entry_price: Mapped[float] = mapped_column(Float)
     mark_price: Mapped[float] = mapped_column(Float)
@@ -198,6 +199,7 @@ if engine.dialect.name == "postgresql":
     with engine.begin() as migration:
         migration.execute(text("ALTER TABLE history_positions ALTER COLUMN opened_at_ms TYPE BIGINT"))
         migration.execute(text("ALTER TABLE history_positions ALTER COLUMN closed_at_ms TYPE BIGINT"))
+        migration.execute(text("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS strategy VARCHAR(24) NOT NULL DEFAULT 'RECOVERY'"))
 
 last_scan: dict[str, Any] = {"state": "starting", "started_at": None, "finished_at": None, "last_error": None, "traders_found": 0, "positions_checked": 0, "observations_saved": 0}
 worker_alive = False
@@ -295,6 +297,12 @@ def paper_config() -> dict:
         "meaningful_profit_steps": [0.10, 0.20, 0.30, 0.50, 0.70, 1.00],
         "target_pct": 0.70,
         "stop_pct": 0.45,
+        "profit_harvest_min_margin_pct": 0.70,
+        "profit_giveback_pct": 35.0,
+        "momentum_min_leader_profit_pct": 0.05,
+        "momentum_min_5m_pct": 0.02,
+        "entry_timing_audit_window_minutes": 30.0,
+        "post_exit_recovery_audit_version": 8,
         "taker_fee_pct": 0.05,
         "slippage_pct": 0.02,
         "max_leverage": 3.0,
@@ -728,7 +736,7 @@ async def run_monitor_cycle(force: bool = False) -> dict:
             trader_count, discovered_ids = await discover_traders()
             with SessionLocal() as db:
                 traders = db.scalars(
-                    select(Trader).order_by(desc(Trader.copier_pnl), desc(Trader.last_seen_at)).limit(100)
+                    select(Trader).order_by(desc(Trader.copier_pnl), desc(Trader.last_seen_at))
                 ).all()
                 ids = [t.trader_id for t in traders]
                 cursor = int(setting("position_rotation_cursor", 0) or 0)
@@ -755,7 +763,7 @@ async def run_monitor_cycle(force: bool = False) -> dict:
                 except Exception as exc:
                     log_check("trader_profile", False, None, None, f"{trader_id}: {str(exc)[:700]}")
             try:
-                opportunities = await scan_paper_opportunities(limit=100, allow_entry_creation=True)
+                opportunities = await scan_paper_opportunities(limit=2000, allow_entry_creation=True)
                 qualified_count = sum(1 for item in opportunities if item.get("qualified"))
                 market_blocked = sum(1 for item in opportunities if any("live Binance" in reason for reason in item.get("dead_market_reasons", [])))
                 log_check("paper_analysis", True, 200, None, f"observed={len(opportunities)} qualified={qualified_count} live_market_warmup_or_blocked={market_blocked}")
@@ -1487,7 +1495,7 @@ async def build_opportunity(
     recovery = recovery_statistics(obs.trader_id, obs.position_key, obs.symbol, obs.side, entry)
     hold = holding_time(obs.trader_id, obs.position_key, raw, snapshot_time)
     if qualified and cfg.get("auto_enabled") and allow_entry_creation:
-        create_paper_trade(obs, trader_name, mark or entry or 0, cfg, market)
+        create_paper_trade(obs, trader_name, mark or entry or 0, cfg, market, "RECOVERY")
     return {
         "trader_id": obs.trader_id, "trader_name": trader_name or obs.trader_id,
         "position_key": obs.position_key, "symbol": obs.symbol, "side": obs.side,
@@ -1505,7 +1513,80 @@ async def build_opportunity(
         "recovery_warning": "Market trend/news are contextual risk factors, not a deterministic cause or guarantee of recovery."
     }
 
-def create_paper_trade(obs: PositionObservation, trader_name: str | None, mark: float, cfg: dict, market: dict) -> None:
+async def build_momentum_opportunity(
+    obs: PositionObservation, snapshot_time: str | None, trader_name: str | None,
+    news: list[dict], allow_entry_creation: bool = False
+) -> dict:
+    """Independent paper strategy: profitable leader + directional Binance momentum."""
+    entry = safe_float(obs.entry_price)
+    leader_mark = safe_float(obs.mark_price)
+    cfg = paper_config()
+    leader_profit_pct = None
+    if entry and leader_mark and entry > 0:
+        leader_profit_pct = ((leader_mark-entry)/entry*100) if obs.side == "LONG" else ((entry-leader_mark)/entry*100)
+    leader_profitable = bool(leader_profit_pct is not None and leader_profit_pct >= float(cfg.get("momentum_min_leader_profit_pct", 0.05)))
+    try:
+        market = await market_features(obs.symbol) if leader_profitable else {"symbol": obs.symbol, "mark_price": leader_mark, "momentum_5m_pct": None, "not_requested": True}
+    except Exception as exc:
+        market = {"symbol": obs.symbol, "mark_price": leader_mark, "momentum_5m_pct": None, "error": str(exc)[:220]}
+    mark = safe_float(market.get("mark_price")) or leader_mark
+    momentum = safe_float(market.get("momentum_5m_pct"))
+    threshold = float(cfg.get("momentum_min_5m_pct", 0.02))
+    momentum_ok = bool(market.get("momentum_5m_fresh")) and momentum is not None and (
+        momentum >= threshold if obs.side == "LONG" else momentum <= -threshold
+    )
+    reasons = []
+    quote_volume = safe_float(market.get("quote_volume_24h_usdt"))
+    spread_pct = safe_float(market.get("spread_pct"))
+    depth_usdt = safe_float(market.get("min_depth_within_1pct_usdt"))
+    atr = safe_float(market.get("atr_24h_pct"))
+    if quote_volume is None or quote_volume < 5_000_000: reasons.append("24h quote volume below $5M or unavailable")
+    if spread_pct is None or spread_pct > 0.10: reasons.append("spread above 0.10% or unavailable")
+    if depth_usdt is None or depth_usdt < 10000: reasons.append("order-book depth within 1% below $10K or unavailable")
+    if obs.side == "LONG":
+        if not market.get("paper_long_book_covered", False): reasons.append("full simulated LONG notional is not covered")
+        if (safe_float(market.get("paper_long_vwap_slippage_pct")) or 999) > 0.10: reasons.append("simulated LONG VWAP slippage exceeds 0.10%")
+    else:
+        if not market.get("paper_short_book_covered", False): reasons.append("full simulated SHORT notional is not covered")
+        if (safe_float(market.get("paper_short_vwap_slippage_pct")) or 999) > 0.10: reasons.append("simulated SHORT VWAP slippage exceeds 0.10%")
+    volume_ratio = safe_float(market.get("volume_ratio_recent_6h_vs_prior_24h"))
+    if volume_ratio is None or volume_ratio < 0.30: reasons.append("recent 6h volume below 30% baseline or unavailable")
+    if atr is None or atr < 0.02 or atr > 8.0: reasons.append("volatility too low or disorderly")
+    if not market.get("live_price_fresh", False): reasons.append("live Binance mark-price stream not warmed")
+    if not market.get("momentum_5m_fresh", False): reasons.append("live 5-minute momentum not warmed")
+    with SessionLocal() as db:
+        latest = db.scalar(select(PositionSnapshot).where(PositionSnapshot.trader_id == obs.trader_id).order_by(desc(PositionSnapshot.id)).limit(1))
+    current = bool(latest and not latest.hidden and latest.id == obs.snapshot_id)
+    fresh = bool(current and (now() - latest.observed_at).total_seconds() <= 900)
+    qualified = bool(leader_profitable and momentum_ok and not reasons and mark and entry and current and fresh)
+    if not current:
+        status = "LEADER POSITIONS HIDDEN" if latest and latest.hidden else "POSITION NOT IN LATEST LEADER SNAPSHOT"
+    elif not fresh:
+        status = "STALE LEADER SNAPSHOT"
+    elif not leader_profitable:
+        status = "LEADER NOT PROFITABLE"
+    elif not momentum_ok:
+        status = "PROFITABLE · MOMENTUM NOT CONFIRMED"
+    elif reasons:
+        status = "DEAD / COSTLY MARKET"
+    else:
+        status = "QUALIFIED MOMENTUM"
+    if qualified and cfg.get("auto_enabled") and allow_entry_creation:
+        create_paper_trade(obs, trader_name, mark, cfg, market, "MOMENTUM")
+    return {
+        "strategy": "MOMENTUM", "trader_id": obs.trader_id, "trader_name": trader_name or obs.trader_id,
+        "position_key": obs.position_key, "symbol": obs.symbol, "side": obs.side,
+        "entry_price": entry, "mark_price": mark, "leader_profit_pct": leader_profit_pct,
+        "unrealized_pnl": obs.unrealized_pnl, "roi": obs.roi, "leverage": obs.leverage,
+        "observed_at": snapshot_time, "leader_profitable": leader_profitable,
+        "momentum_5m_pct": momentum, "momentum_confirmed": momentum_ok,
+        "qualified": qualified, "status": status, "market": market,
+        "dead_market_reasons": reasons, "leader_snapshot_current": current,
+        "leader_snapshot_fresh": fresh,
+        "entry_model": "CURRENT_BINANCE_MARK_WHILE_PROFITABLE_LEADER_HAS_DIRECTIONAL_5M_MOMENTUM"
+    }
+
+def create_paper_trade(obs: PositionObservation, trader_name: str | None, mark: float, cfg: dict, market: dict, strategy: str = "RECOVERY") -> None:
     if mark <= 0 or not obs.entry_price or obs.entry_price <= 0:
         return
     source_key = f"{obs.trader_id}|{obs.position_key}"
@@ -1517,10 +1598,10 @@ def create_paper_trade(obs: PositionObservation, trader_name: str | None, mark: 
         ).order_by(desc(PositionSnapshot.id)).limit(1))
         if latest_snapshot is None or latest_snapshot.hidden or latest_snapshot.id != obs.snapshot_id:
             return
-        existing = db.scalar(select(PaperTrade.id).where(PaperTrade.source_key == source_key, PaperTrade.status == "OPEN").limit(1))
+        existing = db.scalar(select(PaperTrade.id).where(PaperTrade.source_key == source_key, PaperTrade.strategy == strategy, PaperTrade.status == "OPEN").limit(1))
         if existing:
             return
-        prior = db.scalars(select(PaperTrade).where(PaperTrade.source_key == source_key).order_by(desc(PaperTrade.opened_at))).all()
+        prior = db.scalars(select(PaperTrade).where(PaperTrade.source_key == source_key, PaperTrade.strategy == strategy).order_by(desc(PaperTrade.opened_at))).all()
         if len(prior) >= 5:
             return
         if prior:
@@ -1563,10 +1644,11 @@ def create_paper_trade(obs: PositionObservation, trader_name: str | None, mark: 
             target = mark * (1 - target_frac)
         db.add(PaperTrade(
             source_key=source_key, trader_id=obs.trader_id, trader_name=trader_name,
-            symbol=obs.symbol, side=obs.side, status="OPEN",
+            symbol=obs.symbol, side=obs.side, strategy=strategy, status="OPEN",
             entry_price=mark, mark_price=mark, quantity=quantity, notional=notional,
             margin_used=margin, leverage=leverage, stop_price=stop, target_price=target,
             raw_json=json.dumps({
+                "strategy": strategy,
                 "leader_entry": obs.entry_price,
                 "leader_mark": obs.mark_price,
                 "adverse_pct": ((obs.entry_price-mark)/obs.entry_price*100 if obs.side=="LONG" else (mark-obs.entry_price)/obs.entry_price*100),
@@ -1757,7 +1839,7 @@ async def run_post_exit_recovery_audit(max_trades: int = 5) -> dict:
         horizon_hours = max(1.0, min(72.0, float(cfg.get("post_exit_recovery_audit_hours", 24.0))))
         with SessionLocal() as db:
             closed = db.scalars(select(PaperTrade).where(PaperTrade.status == "CLOSED").order_by(PaperTrade.closed_at)).all()
-        pending = [t for t in closed if parse_json(t.raw_json).get("post_exit_recovery_audit_version", 0) != 7]
+        pending = [t for t in closed if parse_json(t.raw_json).get("post_exit_recovery_audit_version", 0) != 8]
         cooldown = binance_rest_status()
         if cooldown.get("blocked"):
             return {"audited": 0, "attempted": 0, "recovered_to_profit": 0, "failures": 0,
@@ -1775,8 +1857,11 @@ async def run_post_exit_recovery_audit(max_trades: int = 5) -> dict:
             if not closed_at or not trade.exit_price or not trade.entry_price:
                 continue
             attempted += 1
-            start_ms = int(closed_at.timestamp() * 1000)
-            end_ms = start_ms + int(horizon_hours * 3600000)
+            entry_at = _shadow_dt(trade.opened_at) or closed_at
+            entry_window_minutes = max(5.0, min(120.0, float(cfg.get("entry_timing_audit_window_minutes", 30.0))))
+            start_ms = int((entry_at - timedelta(minutes=entry_window_minutes)).timestamp() * 1000)
+            exit_ms = int(closed_at.timestamp() * 1000)
+            end_ms = exit_ms + int(horizon_hours * 3600000)
             try:
                 rows_all = []
                 cursor = start_ms
@@ -1847,6 +1932,17 @@ async def run_post_exit_recovery_audit(max_trades: int = 5) -> dict:
                         worst = {"net": net, "at": at_ms}
                 if best_close is None or best_intrabar is None:
                     raise RuntimeError("No valid OHLC mark candles returned")
+                pre_entry = [row for row in rows_all if isinstance(row, (list, tuple)) and len(row) >= 7 and start_ms <= int(row[0]) < exit_ms]
+                entry_best = None
+                if pre_entry:
+                    for row in pre_entry:
+                        at_ms = int(row[0]); high = safe_float(row[2]); low = safe_float(row[3])
+                        if high is None or low is None: continue
+                        candidate = low if trade.side == "LONG" else high
+                        improvement = ((trade.entry_price-candidate)/trade.entry_price*100.0) if trade.side == "LONG" else ((candidate-trade.entry_price)/trade.entry_price*100.0)
+                        if improvement > 0 and (entry_best is None or improvement > entry_best["improvement_pct"]):
+                            entry_best = {"price": candidate, "at": at_ms, "improvement_pct": improvement}
+                entry_potential_gross = (trade.entry_price-entry_best["price"])*trade.quantity if entry_best and trade.side == "LONG" else ((entry_best["price"]-trade.entry_price)*trade.quantity if entry_best else None)
                 recovered_profit = best_close["net"] > 0
                 intrabar_only = not recovered_profit and best_intrabar["net"] > 0
                 recovered_entry = first_entry is not None
@@ -1854,16 +1950,30 @@ async def run_post_exit_recovery_audit(max_trades: int = 5) -> dict:
                           "INTRABAR_NET_PROFIT_ONLY" if intrabar_only else
                           "RECOVERED_TO_ENTRY_CLOSE_CONFIRMED" if recovered_entry else "NO_ENTRY_RECOVERY")
                 raw.update({
-                    "post_exit_recovery_audit_version": 7,
+                    "post_exit_recovery_audit_version": 8,
                     "post_exit_recovery_audit_status": "COMPLETE",
                     "post_exit_mark_candles": [
                         [int(row[0]), round(float(row[2]), 12), round(float(row[3]), 12), round(float(row[4]), 12)]
                         for row in rows_all
                         if isinstance(row, (list, tuple)) and len(row) >= 7
-                        and start_ms <= int(row[0]) <= end_ms
+                        and exit_ms <= int(row[0]) <= end_ms
                         and safe_float(row[2]) is not None and safe_float(row[3]) is not None
                         and safe_float(row[4]) is not None
                     ],
+                    "entry_timing_mark_candles": [
+                        [int(row[0]), round(float(row[2]), 12), round(float(row[3]), 12), round(float(row[4]), 12)]
+                        for row in rows_all
+                        if isinstance(row, (list, tuple)) and len(row) >= 7
+                        and start_ms <= int(row[0]) < exit_ms
+                        and safe_float(row[2]) is not None and safe_float(row[3]) is not None
+                        and safe_float(row[4]) is not None
+                    ],
+                    "entry_timing_window_minutes": entry_window_minutes,
+                    "entry_timing_best_price": entry_best["price"] if entry_best else None,
+                    "entry_timing_best_at": datetime.fromtimestamp(entry_best["at"]/1000, timezone.utc).isoformat() if entry_best else None,
+                    "entry_timing_improvement_pct": round(entry_best["improvement_pct"], 8) if entry_best else None,
+                    "entry_timing_potential_gross_pnl": round(entry_potential_gross, 8) if entry_potential_gross is not None else None,
+                    "entry_timing_verdict": ("HINDSIGHT_BETTER_ENTRY_VISIBLE" if entry_best else "NO_MATERIAL_PRE_ENTRY_IMPROVEMENT_VISIBLE") if pre_entry else "NO_PRE_ENTRY_CANDLES",
                     "post_exit_candle_interval": "1m",
                     "post_exit_candle_source_verified": "BINANCE_USDM_MARK_PRICE_1M",
                     "post_exit_recovery_status": status,
@@ -1900,11 +2010,11 @@ async def run_post_exit_recovery_audit(max_trades: int = 5) -> dict:
                         live.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
                         if not db.scalar(select(PaperTradeEvent.id).where(
                             PaperTradeEvent.paper_trade_id == trade.id,
-                            PaperTradeEvent.event_type == "POST_EXIT_RECOVERY_AUDIT_V7"
+                            PaperTradeEvent.event_type.in_(["POST_EXIT_RECOVERY_AUDIT_V7", "POST_EXIT_RECOVERY_AUDIT_V8"])
                         ).limit(1)):
-                            db.add(PaperTradeEvent(paper_trade_id=trade.id, event_type="POST_EXIT_RECOVERY_AUDIT_V6",
+                            db.add(PaperTradeEvent(paper_trade_id=trade.id, event_type="POST_EXIT_RECOVERY_AUDIT_V8",
                                                    observed_at=live.closed_at or now(), value=best_close["net"],
-                                                   detail=raw["post_exit_recovery_label"]))
+                                                   detail=raw["post_exit_recovery_label"] + " · Entry timing audit: " + str(raw.get("entry_timing_verdict"))))
                         db.commit()
                 audited += 1
                 recovered += int(recovered_profit)
@@ -1923,7 +2033,7 @@ async def run_post_exit_recovery_audit(max_trades: int = 5) -> dict:
                 log_check("post_exit_recovery_audit", False, None, None, f"trade={trade.id} {trade.symbol}: {str(exc)[:500]}")
         with SessionLocal() as db:
             after = db.scalars(select(PaperTrade).where(PaperTrade.status == "CLOSED")).all()
-        pending_count = sum(1 for t in after if parse_json(t.raw_json).get("post_exit_recovery_audit_version", 0) != 7)
+        pending_count = sum(1 for t in after if parse_json(t.raw_json).get("post_exit_recovery_audit_version", 0) != 8)
         cooldown = binance_rest_status()
         return {"audited": audited, "attempted": attempted, "recovered_to_profit": recovered,
                 "failures": failures, "blocked": bool(cooldown.get("blocked")),
@@ -2161,10 +2271,20 @@ async def evaluate_open_paper_trades(
                             detail="Funding history is temporarily unavailable. Live PnL includes a conservative debit estimate for settlements since entry; positive exits are allowed only when that estimated net remains positive."
                         ))
                         raw["funding_pending_event_at"] = ts.isoformat()
-            if net > 0 and funding_verified:
-                # No minimum profit threshold: every observed positive net amount,
-                # after round-trip costs and verified funding, is realized immediately.
-                exit_reason = "PROFIT_HARVEST_NET_POSITIVE"
+            current_mfe = max(float(raw.get("mfe_net_pnl", net)), net)
+            giveback_pct = 0.0
+            if current_mfe > 0:
+                giveback_pct = max(0.0, (current_mfe - net) / current_mfe * 100.0)
+            min_harvest_margin_pct = float(cfg.get("profit_harvest_min_margin_pct", 0.70))
+            profit_lock = current_mfe > 0 and giveback_pct >= float(cfg.get("profit_giveback_pct", 35.0)) and net > 0
+            target_or_min_profit = bool(hit_target or pnl_pct >= min_harvest_margin_pct)
+            raw["profit_management"] = {
+                "mfe_net_pnl": current_mfe, "giveback_pct": giveback_pct,
+                "min_harvest_margin_pct": min_harvest_margin_pct,
+                "target_hit": hit_target, "profit_lock_triggered": profit_lock
+            }
+            if net > 0 and funding_verified and (target_or_min_profit or profit_lock):
+                exit_reason = "PROFIT_HARVEST_TARGET_OR_PROFIT_LOCK"
             elif net > 0 and not funding_verified:
                 # Funding REST may be blocked. _paper_pnl has already deducted
                 # round-trip fees/slippage and a conservative funding debit for every
@@ -2177,7 +2297,14 @@ async def evaluate_open_paper_trades(
                 )
                 funding_schedule_known = bool(safe_float(raw.get("next_funding_time")))
                 if funding_schedule_known and (funding_events_est == 0 or funding_rate_known):
-                    exit_reason = "PROFIT_HARVEST_NET_POSITIVE_FUNDING_ESTIMATED"
+                    current_mfe = max(float(raw.get("mfe_net_pnl", net)), net)
+                    giveback_pct = max(0.0, (current_mfe - net) / current_mfe * 100.0) if current_mfe > 0 else 0.0
+                    target_or_min_profit = bool(hit_target or pnl_pct >= float(cfg.get("profit_harvest_min_margin_pct", 0.70)))
+                    profit_lock = current_mfe > 0 and giveback_pct >= float(cfg.get("profit_giveback_pct", 35.0)) and net > 0
+                    if target_or_min_profit or profit_lock:
+                        exit_reason = "PROFIT_HARVEST_TARGET_OR_PROFIT_LOCK_FUNDING_ESTIMATED"
+                    else:
+                        exit_reason = None
                     raw["funding_audit_status"] = "PENDING_POST_CLOSE_RECONCILIATION"
                     raw["funding_source"] = "CONSERVATIVE_ESTIMATE_PENDING_BINANCE_HISTORY"
                     raw["funding_estimate_at_exit"] = max(0.0, costs - (
@@ -2532,15 +2659,17 @@ async def scan_paper_opportunities(limit: int = 100, allow_entry_creation: bool 
     async with opportunity_lock:
         return await _api_opportunities_locked(limit, allow_entry_creation)
 
-async def _api_opportunities_locked(limit: int = 100, allow_entry_creation: bool = False):
-    limit = max(1, min(limit, 200))
+
+async def _api_opportunities_locked(limit: int = 2000, allow_entry_creation: bool = False):
+    limit = max(1, min(limit, 2000))
     with SessionLocal() as db:
         latest_ids = select(func.max(PositionSnapshot.id).label("id")).group_by(PositionSnapshot.trader_id).subquery()
         latest_snapshots = db.scalars(select(PositionSnapshot).join(latest_ids, PositionSnapshot.id == latest_ids.c.id)).all()
         visible = {snap.id: snap for snap in latest_snapshots if not snap.hidden}
-        observations = db.scalars(select(PositionObservation).where(
-            PositionObservation.snapshot_id.in_(list(visible.keys()))
-        ).order_by(desc(PositionObservation.id)).limit(500)).all() if visible else []
+        observations = db.scalars(
+            select(PositionObservation).where(PositionObservation.snapshot_id.in_(list(visible.keys())))
+            .order_by(desc(PositionObservation.id))
+        ).all() if visible else []
         traders = {t.trader_id: t.name for t in db.scalars(select(Trader)).all()}
     latest = {}
     for obs in observations:
@@ -2551,11 +2680,10 @@ async def _api_opportunities_locked(limit: int = 100, allow_entry_creation: bool
     result = []
     for obs in list(latest.values())[:limit]:
         snapshot = visible.get(obs.snapshot_id)
-        result.append(await build_opportunity(
-            obs, snapshot.observed_at.isoformat() if snapshot else None,
-            traders.get(obs.trader_id), news, allow_entry_creation=allow_entry_creation
-        ))
-    return sorted(result, key=lambda x: (x["qualified"], x["adverse_pct"] or 0), reverse=True)
+        observed = snapshot.observed_at.isoformat() if snapshot else None
+        result.append(await build_opportunity(obs, observed, traders.get(obs.trader_id), news, allow_entry_creation=allow_entry_creation))
+        result.append(await build_momentum_opportunity(obs, observed, traders.get(obs.trader_id), news, allow_entry_creation=allow_entry_creation))
+    return sorted(result, key=lambda x: (x["qualified"], x.get("leader_profit_pct", x.get("adverse_pct", 0)) or 0), reverse=True)
 
 
 def paper_exit_reason_display(trade: PaperTrade, raw: dict) -> str:
@@ -2575,14 +2703,17 @@ def paper_exit_reason_display(trade: PaperTrade, raw: dict) -> str:
 
 
 @app.get("/api/paper")
-async def api_paper():
+async def api_paper(strategy: str = "RECOVERY"):
+    strategy = strategy.upper().strip() or "RECOVERY"
+    if strategy not in {"RECOVERY", "MOMENTUM"}:
+        raise HTTPException(400, "strategy must be RECOVERY or MOMENTUM")
     cfg = paper_config()
     with SessionLocal() as db:
-        trades = db.scalars(select(PaperTrade).order_by(desc(PaperTrade.opened_at)).limit(1000)).all()
+        trades = db.scalars(select(PaperTrade).where(PaperTrade.strategy == strategy).order_by(desc(PaperTrade.opened_at)).limit(1000)).all()
         # Portfolio totals and risk clusters must use the complete ledger, not only
         # the newest 300 rows rendered in the table.
         shadow_trades = db.scalars(
-            select(PaperTrade).order_by(PaperTrade.opened_at, PaperTrade.id)
+            select(PaperTrade).where(PaperTrade.strategy == strategy).order_by(PaperTrade.opened_at, PaperTrade.id)
         ).all()
         gap_rows = db.execute(
             select(PaperTradePath.paper_trade_id, func.max(PaperTradePath.data_gap_seconds))
@@ -2776,7 +2907,7 @@ async def api_paper():
             closed_dt = closed_dt.replace(tzinfo=timezone.utc)
         hold_seconds = max(0.0, (closed_dt - opened_dt).total_seconds())
         trade_rows.append({
-            "id": trade.id, "trader_id": trade.trader_id, "trader_name": trade.trader_name,
+            "id": trade.id, "strategy": trade.strategy, "trader_id": trade.trader_id, "trader_name": trade.trader_name,
             "leader_position_key": (trade.source_key.split("|", 1)[1] if "|" in trade.source_key else trade.source_key),
             "symbol": trade.symbol, "side": trade.side, "status": trade.status,
             "entry_price": trade.entry_price, "mark_price": trade.mark_price, "exit_price": trade.exit_price,
@@ -2799,6 +2930,11 @@ async def api_paper():
             "mfe_net_pnl": safe_float(raw.get("mfe_net_pnl")),
             "mae_net_pnl": safe_float(raw.get("mae_net_pnl")),
             "mfe_pct": safe_float(raw.get("mfe_pct")), "mae_pct": safe_float(raw.get("mae_pct")),
+            "entry_timing_improvement_pct": safe_float(raw.get("entry_timing_improvement_pct")),
+            "entry_timing_best_price": safe_float(raw.get("entry_timing_best_price")),
+            "entry_timing_best_at": raw.get("entry_timing_best_at"),
+            "entry_timing_potential_gross_pnl": safe_float(raw.get("entry_timing_potential_gross_pnl")),
+            "entry_timing_verdict": raw.get("entry_timing_verdict"),
             "data_quality_status": raw.get("data_quality_status", "LEGACY_UNCLASSIFIED"),
             "monitoring_status": raw.get("monitoring_status", "NOT_RECORDED"),
             "max_data_gap_seconds": round(max_gap, 3),
@@ -2845,7 +2981,7 @@ async def api_paper():
         "open_count": len(open_trades), "closed_count": len(closed_trades),
         "correlated_exposure_groups": correlated_groups,
         "recovery_audit": {
-            "complete": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version") == 7),
+            "complete": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version") == 8),
             "pending": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version") != 7),
             "version6_or_older": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version", 0) < 7),
             "blocked": bool(binance_rest_status().get("blocked")),
@@ -2958,6 +3094,9 @@ def build_new_exit_policy_replay(trades: list[PaperTrade], cfg: dict) -> dict:
         checkpoints = []
         checkpoint_hours = (3, 6, 12, 24, 48, 72)
         next_checkpoint = 0
+        replay_mfe = None
+        replay_min_harvest_margin_pct = float(cfg.get("profit_harvest_min_margin_pct", 0.70))
+        replay_giveback_pct = float(cfg.get("profit_giveback_pct", 35.0))
         for candle in sorted(candles, key=lambda c: int(c[0]) if isinstance(c, (list, tuple)) and c else 0):
             if not isinstance(candle, (list, tuple)) or len(candle) < 4:
                 continue
@@ -3004,9 +3143,14 @@ def build_new_exit_policy_replay(trades: list[PaperTrade], cfg: dict) -> dict:
                     "leader_state": state, "pnl": stop_pnl}
                 break
             if p["net_estimate"] is not None and p["net_estimate"] > 0:
-                exit_result = {"at_ms": at_ms, "price": close, "reason": "PROFIT_HARVEST_NET_POSITIVE",
-                    "quality": "BINANCE_MARK_PRICE_1M_CLOSE", "leader_state": "NOT_REQUIRED_FOR_PROFIT_HARVEST", "pnl": p}
-                break
+                replay_mfe = max(float(replay_mfe or p["net_estimate"]), float(p["net_estimate"]))
+                margin_pct = float(p["net_estimate"]) / max(float(trade.margin_used or 0.0), 1e-9) * 100.0
+                giveback = max(0.0, (replay_mfe - float(p["net_estimate"])) / replay_mfe * 100.0) if replay_mfe > 0 else 0.0
+                target_hit = (trade.side.upper() == "LONG" and close >= float(trade.target_price)) or (trade.side.upper() == "SHORT" and close <= float(trade.target_price))
+                if target_hit or margin_pct >= replay_min_harvest_margin_pct or giveback >= replay_giveback_pct:
+                    exit_result = {"at_ms": at_ms, "price": close, "reason": "PROFIT_HARVEST_TARGET_OR_PROFIT_LOCK",
+                        "quality": "BINANCE_MARK_PRICE_1M_CLOSE", "leader_state": "NOT_REQUIRED_FOR_PROFIT_HARVEST", "pnl": p}
+                    break
         if exit_result:
             p = exit_result["pnl"]
             rows.append({**common, "replay_status": "POLICY_EXIT_SIMULATED",
@@ -3048,7 +3192,7 @@ def build_new_exit_policy_replay(trades: list[PaperTrade], cfg: dict) -> dict:
         "no_valid_candle_trades": sum(1 for x in rows if x.get("replay_status") == "NO_VALID_POST_EXIT_CANDLE"),
         "leader_open_evidence_at_old_exit": sum(1 for x in rows if x.get("baseline_leader_open_confirmed")),
         "price_source": "Persisted Binance USD-M mark-price 1m OHLC candles",
-        "exit_policy": "Harvest first candle close with estimated net above zero; defer protective stop only while exact leader position is observed open; omissions do not prove closure.",
+        "exit_policy": "Harvest only after configured target/min-margin or MFE giveback lock; defer protective stop only while exact leader position is observed open; omissions do not prove closure.",
         "cost_assumption": "Configured taker fee and slippage; historical per-trade settings were not persisted.",
         "funding_assumption": "Absolute entry funding rate and 8-hour schedule estimate; not verified historical settlement records.",
         "execution_caveat": "Counterfactual mark-price simulation only, not actual exchange fills or realized PnL.",

@@ -8,7 +8,7 @@ window.addEventListener("unhandledrejection", e => {
 const bind=(id,event,fn)=>{const el=$(id);if(!el){console.warn("LAES missing DOM hook:",id);return false;}el.addEventListener(event,fn);return true;};
 const click=(id,fn)=>{const el=$(id);if(!el){console.warn("LAES missing DOM hook:",id);return false;}el.onclick=fn;return true;};
 const $=id=>document.getElementById(id);
-const state={page:"overview",paperTab:null,closedFilter:"all",paperData:null,researchReplay:null};
+const state={page:"overview",paperTab:null,closedFilter:"all",paperData:null,researchReplay:null,momentumData:null};
 let paperDetailTimer=null;
 let paperLoadInFlight=false;
 const fmt=(v,d=2)=>v===null||v===undefined||v===""||Number.isNaN(Number(v))?"—":Number(v).toLocaleString(undefined,{maximumFractionDigits:d});
@@ -25,7 +25,7 @@ function setPage(name, options={}) {
  state.page=name;
  document.querySelectorAll(".page").forEach(x=>x.classList.toggle("active",x===page));
  document.querySelectorAll(".nav-item").forEach(x=>x.classList.toggle("active",x.dataset.page===name));
- const titles={overview:"Overview",traders:"Trader universe",positions:"Live positions",opportunities:"Opportunity scanner",paper:"Paper trading desk",market:"Market & news",database:"Database & system"};
+ const titles={overview:"Overview",traders:"Trader universe",positions:"Live positions",opportunities:"Opportunity scanner",paper:"Paper trading desk",market:"Market & news",database:"Database & system",momentum:"Momentum paper"};
  $("pageTitle").textContent=titles[name]||"Overview";
  if(options.scroll!==false)window.scrollTo({top:0,behavior:"auto"});
  if(name==="overview")refreshOverview();
@@ -33,6 +33,7 @@ function setPage(name, options={}) {
  else if(name==="positions")loadPositions();
  else if(name==="opportunities")loadOpportunities();
  else if(name==="paper"){loadPaper();loadResearchReplay();}
+ else if(name==="momentum"){loadMomentumPaper();}
  else if(name==="market"){loadMarket(false);loadMarketUniverse();}
  else if(name==="database")loadSystem();
  return true;
@@ -130,6 +131,26 @@ async function loadOpportunities(){
  }catch(e){$("opportunityList").innerHTML='<div class="empty-state">'+esc(e.message)+'</div>';}
 }
 click("refreshOpps",loadOpportunities);
+async function loadMomentumPaper(){
+ try{
+  const d=await api("/api/paper?strategy=MOMENTUM"); state.momentumData=d;
+  const open=d.trades.filter(t=>t.status==="OPEN"),closed=d.trades.filter(t=>t.status==="CLOSED");
+  $("momentumRealized").textContent=money(d.realized_pnl);
+  $("momentumUnrealized").textContent=money(d.unrealized_pnl);
+  $("momentumCounts").textContent=open.length+" / "+closed.length;
+  $("navMomentumCount").textContent=open.length;
+  const audit=d.recovery_audit||{};
+  $("momentumAudit").textContent=fmt(audit.complete||0,0)+" / "+fmt((audit.complete||0)+(audit.pending||0),0);
+  const pnl=v=>'<span class="'+(Number(v||0)>=0?"positive":"negative")+'">'+money(v)+'</span>';
+  $("momentumTrades").innerHTML=d.trades.length?d.trades.map(t=>{
+    const timing=t.entry_timing_improvement_pct===null||t.entry_timing_improvement_pct===undefined?"Pending":fmt(t.entry_timing_improvement_pct,3)+"% hindsight";
+    return '<tr class="clickable-row" onclick="openPaperTrade('+t.id+')"><td><span class="status-tag '+(t.status==="OPEN"?"positive":"neutral")+'">'+esc(t.status)+'</span></td><td><b>'+esc(t.trader_name||t.trader_id)+'</b><br><small>'+esc(t.leader_position_key||"")+'</small></td><td><b>'+esc(t.symbol)+'</b><br>'+esc(t.side)+'</td><td><b>'+fmt(t.entry_price,8)+'</b><br><small>'+date(t.opened_at)+'</small>'+(t.status==="CLOSED"?'<br><b>'+fmt(t.exit_price,8)+'</b><br><small>'+date(t.closed_at)+'</small>':'')+'</td><td>'+pnl(t.net_pnl)+'<br><small>MFE '+pnl(t.mfe_net_pnl)+' · MAE '+pnl(t.mae_net_pnl)+'</small></td><td>'+esc(timing)+'<br><small>'+esc(t.entry_timing_verdict||"Not audited")+'</small></td><td>'+esc(t.exit_reason_display||"Open")+'<br><small>'+esc(t.post_exit_recovery_label||"Recovery audit pending")+'</small></td><td><button class="btn btn-subtle" type="button" onclick="event.stopPropagation();openPaperTrade('+t.id+')">Forensics</button></td></tr>';
+  }).join(""):'<tr><td colspan="8" class="empty-cell">No profitable-leader momentum paper trades have qualified yet.</td></tr>';
+  const audited=closed.filter(t=>t.entry_timing_improvement_pct!==null&&t.entry_timing_improvement_pct!==undefined);
+  const material=audited.filter(t=>Number(t.entry_timing_improvement_pct)>0.05);
+  $("momentumEntryAudit").innerHTML='<div class="analysis-line"><span>Closed momentum trades</span><b>'+fmt(closed.length,0)+'</b></div><div class="analysis-line"><span>Trades with verified pre-entry candle window</span><b>'+fmt(audited.length,0)+'</b></div><div class="analysis-line"><span>Material hindsight better-entry signals (&gt;0.05%)</span><b>'+fmt(material.length,0)+'</b></div><div class="sample-warning">This is hindsight-only. It cannot prove the scanner could have known the future low/high or obtained that exact fill.</div>';
+ }catch(e){notice("Momentum paper ledger: "+e.message,"error");}
+}
 async function loadPaper(){
  if(paperLoadInFlight)return;paperLoadInFlight=true;
  try{
@@ -388,6 +409,7 @@ async function openPaperTrade(id){
 }
 window.openPaperTrade=openPaperTrade;
 click("reloadPaper",loadPaper);
+click("reloadMomentum",loadMomentumPaper);
 click("runRecoveryAudit",runRecoveryAudit);
 click("loadResearchReplay",loadResearchReplay);
 bind("paperSettings","submit",async e=>{e.preventDefault();const f=new FormData(e.currentTarget),body={};for(const [k,v] of f.entries())body[k]=Number(v);body.auto_enabled=e.currentTarget.elements.auto_enabled.checked;try{await api("/api/paper/settings",{method:"POST",body:JSON.stringify(body)});$("paperSaveStatus").textContent="Saved · paper settings active";await loadPaper();}catch(err){$("paperSaveStatus").textContent=err.message;}});

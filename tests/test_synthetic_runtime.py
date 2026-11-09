@@ -95,7 +95,7 @@ class SyntheticRuntimeAuditTests(unittest.TestCase):
         with app.SessionLocal() as db:
             trade = db.get(app.PaperTrade, trade_id)
             self.assertEqual(trade.status, "CLOSED")
-            self.assertEqual(trade.exit_reason, "PROFIT_HARVEST_NET_POSITIVE")
+            self.assertEqual(trade.exit_reason, "PROFIT_HARVEST_TARGET_OR_PROFIT_LOCK")
             self.assertGreater(trade.net_pnl, 0)
 
     def _open_trade(self, trader_id):
@@ -144,7 +144,7 @@ class SyntheticRuntimeAuditTests(unittest.TestCase):
             trade.raw_json = json.dumps({
                 "funding_rate_at_entry": 0.0,
                 "next_funding_time": 1794168000000,
-                "post_exit_recovery_audit_version": 7,
+                "post_exit_recovery_audit_version": 8,
                 "post_exit_mark_candles": [
                     [1794139260000, 100.0, 98.0, 99.0],
                     [1794139320000, 101.2, 100.5, 101.0]
@@ -162,7 +162,7 @@ class SyntheticRuntimeAuditTests(unittest.TestCase):
             replay = app.build_new_exit_policy_replay([trade], app.paper_config())
         row = replay["trades"][0]
         self.assertEqual(row["replay_status"], "POLICY_EXIT_SIMULATED")
-        self.assertEqual(row["new_exit_reason"], "PROFIT_HARVEST_NET_POSITIVE")
+        self.assertEqual(row["new_exit_reason"], "PROFIT_HARVEST_TARGET_OR_PROFIT_LOCK")
         self.assertGreater(row["new_policy_net_pnl_estimate"], 0)
 
     def test_missing_candle_path_is_not_replaced_with_synthetic_prices(self):

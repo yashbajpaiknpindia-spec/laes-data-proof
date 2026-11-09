@@ -17,6 +17,7 @@
       <button class="nav-item" data-page="positions"><span>⌁</span> Live positions <em id="navPositionCount">0</em></button>
       <button class="nav-item" data-page="opportunities"><span>⌖</span> Opportunity scanner <em id="navOppCount">0</em></button>
       <button class="nav-item" data-page="paper"><span>▣</span> Paper trading <em id="navPaperCount">0</em></button>
+      <button class="nav-item" data-page="momentum"><span>↗</span> Momentum paper <em id="navMomentumCount">0</em></button>
       <button class="nav-item" data-page="market"><span>◷</span> Market & news</button>
       <button class="nav-item" data-page="database"><span>▤</span> Database & system</button>
     </nav>
@@ -172,6 +173,22 @@
         <div class="muted-note" id="researchReplayAssumptions"></div>
       </article>
       <article class="panel" style="margin-top:16px"><div class="panel-heading"><div><div class="section-kicker">CAPITAL-CONSTRAINED SHADOW REPLAY</div><h3>What a limited portfolio would have selected</h3><p>Replays the recorded research entries and exits in time order, using a separate margin cap and a same-coin/same-direction overlap limit. Research trades remain untouched.</p></div><span class="status-tag neutral">COUNTERFACTUAL</span></div><div id="paperShadowPortfolio"><div class="empty-state">Waiting for shadow portfolio calculation…</div></div></article>
+    </section>
+
+    <section class="page" id="page-momentum">
+      <div class="page-intro"><div><div class="section-kicker">SEPARATE STRATEGY · PROFITABLE LEADER MOMENTUM</div><h2>Momentum paper desk</h2><p>Completely separate paper ledger for profitable leader positions with confirmed directional Binance momentum. These trades never mix with the underwater-recovery ledger.</p></div><span class="paper-state">● MOMENTUM PAPER ONLY</span></div>
+      <div class="top-live-strip"><div class="top-live-title">MOMENTUM PAPER</div><button class="btn btn-subtle" id="reloadMomentum">Refresh momentum ledger</button><button class="btn btn-subtle" data-goto="opportunities">View all scanner candidates →</button></div>
+      <div class="paper-metrics">
+        <article class="metric-card"><div class="metric-label">MOMENTUM REALIZED NET PNL</div><div class="metric-value green" id="momentumRealized">—</div><div class="metric-foot">Only MOMENTUM strategy trades</div></article>
+        <article class="metric-card"><div class="metric-label">MOMENTUM UNREALIZED PNL</div><div class="metric-value violet" id="momentumUnrealized">—</div><div class="metric-foot">Current Binance mark-based simulation</div></article>
+        <article class="metric-card"><div class="metric-label">OPEN / CLOSED</div><div class="metric-value" id="momentumCounts">—</div><div class="metric-foot">Separate paper ledger</div></article>
+        <article class="metric-card"><div class="metric-label">AUDITED RECOVERY</div><div class="metric-value" id="momentumAudit">—</div><div class="metric-foot">Historical Binance candle audit</div></article>
+      </div>
+      <article class="panel trades-panel">
+        <div class="panel-heading"><div><div class="section-kicker">MOMENTUM PAPER LEDGER</div><h3>Profitable-leader executions</h3><p>Entry, exit, MFE, MAE, costs and entry-timing forensic evidence. This page intentionally excludes recovery-strategy trades.</p></div></div>
+        <div class="table-scroll"><table><thead><tr><th>STATUS</th><th>LEADER</th><th>SYMBOL / SIDE</th><th>ENTRY → EXIT</th><th>NET / MFE / MAE</th><th>ENTRY TIMING AUDIT</th><th>EXIT / RECOVERY</th><th>DETAILS</th></tr></thead><tbody id="momentumTrades"><tr><td colspan="8" class="empty-cell">Loading momentum paper ledger…</td></tr></tbody></table></div>
+      </article>
+      <article class="panel" style="margin-top:16px"><div class="panel-heading"><div><div class="section-kicker">ENTRY FORENSICS</div><h3>Could the system have entered earlier?</h3><p>Historical 1-minute Binance mark candles are used only as hindsight evidence. They do not imply that a better fill was actually available to the system.</p></div></div><div id="momentumEntryAudit" class="analysis-box"><div class="empty-state">Waiting for audited entry-timing evidence.</div></div></article>
     </section>
 
     <section class="page" id="page-market">

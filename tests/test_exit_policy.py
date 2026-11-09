@@ -6,6 +6,7 @@ APP = (ROOT / "app.py").read_text()
 HTML = (ROOT / "templates" / "index.html").read_text()
 
 class ExitPolicyRegressionTests(unittest.TestCase):
+    # V8: historical recovery audit + target/MFE profit-lock policy.
     def test_fixed_continuation_timeout_is_removed(self):
         self.assertNotIn("LEADER_CONTINUATION_TIMEOUT", APP)
         self.assertNotIn("continuation_timed_out", APP)
@@ -32,7 +33,7 @@ class ExitPolicyRegressionTests(unittest.TestCase):
     def test_post_exit_recovery_requires_1m_close_for_realized_recovery(self):
         self.assertIn("post_exit_recovery_audit_version", APP)
         self.assertIn("post_exit_mark_candles", APP)
-        self.assertIn('"post_exit_recovery_audit_version": 7', APP)
+        self.assertIn('"post_exit_recovery_audit_version": 8', APP)
         self.assertIn("RECOVERED_TO_NET_PROFIT_CLOSE_CONFIRMED", APP)
         self.assertIn("INTRABAR_NET_PROFIT_ONLY", APP)
         self.assertIn("post_exit_intrabar_potential_profit_usdt", APP)
