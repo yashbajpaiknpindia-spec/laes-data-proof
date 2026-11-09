@@ -2354,9 +2354,13 @@ async def evaluate_open_paper_trades(
                 if funding_schedule_known and (funding_events_est == 0 or funding_rate_known):
                     current_mfe = max(float(raw.get("mfe_net_pnl", net)), net)
                     giveback_pct = max(0.0, (current_mfe - net) / current_mfe * 100.0) if current_mfe > 0 else 0.0
-                    target_or_min_profit = bool(hit_target or pnl_pct >= float(cfg.get("profit_harvest_min_margin_pct", 0.70)))
-                    profit_lock = current_mfe > 0 and giveback_pct >= float(cfg.get("profit_giveback_pct", 35.0)) and net > 0
-                    if target_or_min_profit or profit_lock:
+                    # No fixed 0.70% profit gate. Profit protection is adaptive to
+                    # actual round-trip trading cost and observed MFE, while the leader
+                    # exit/reversal remains a separate exit signal.
+                    cost_floor = max(float(costs or 0.0) * 1.5, 0.02)
+                    target_or_meaningful_profit = bool(hit_target or (net >= cost_floor and current_mfe >= cost_floor * 1.5))
+                    profit_lock = current_mfe >= cost_floor * 1.5 and giveback_pct >= float(cfg.get("profit_giveback_pct", 35.0)) and net > 0
+                    if target_or_meaningful_profit or profit_lock:
                         exit_reason = "PROFIT_HARVEST_TARGET_OR_PROFIT_LOCK_FUNDING_ESTIMATED"
                     else:
                         exit_reason = None
@@ -2369,37 +2373,14 @@ async def evaluate_open_paper_trades(
                     raw["funding_estimate_settlement_count"] = funding_events_est
                     raw["realized_pnl_is_estimate"] = True
             elif net <= 0 and not gap_guard and hit_stop:
-                # Evidence-led exit policy: an exact, currently visible leader position
-                # is not force-closed by an arbitrary timer or adverse-price percentage.
-                # Close only when the source confirms closure/reversal. If leader state
-                # is unknown/stale, retain the independent protective stop as fallback.
+                # Protective stop is an independent capital-protection gate. Leader
+                # continuation evidence may prevent arbitrary timeouts, but it may NOT
+                # disable the stop once the verified mark-price stop has actually been hit.
+                # Leader closure/reversal is still recorded when it happens before the stop.
                 if leader_state == "REVERSED" and bool(cfg.get("leader_reversal_exit_enabled", True)):
                     exit_reason = "LEADER_POSITION_REVERSED"
                 elif leader_state == "CLOSED_CONFIRMED":
                     exit_reason = "LEADER_POSITION_CLOSED"
-                elif leader_state == "OPEN_OBSERVED" and bool(cfg.get("leader_continuation_enabled", True)):
-                    directional = 1.0 if trade.side == "LONG" else -1.0
-                    adverse_from_entry_pct = directional * (trade.entry_price - mark) / max(trade.entry_price, 1e-12) * 100.0
-                    raw["leader_continuation_active"] = True
-                    raw["leader_continuation_started_at"] = raw.get("leader_continuation_started_at") or ts.isoformat()
-                    raw["leader_continuation_last_checked_at"] = ts.isoformat()
-                    raw["leader_continuation_adverse_pct"] = adverse_from_entry_pct
-                    raw["leader_continuation_policy"] = "LEADER_STATE_EVIDENCE_NO_FIXED_TIMEOUT_OR_PRICE_CEILING"
-                    if not raw.get("leader_continuation_hold_logged"):
-                        db.add(PaperTradeEvent(
-                            paper_trade_id=trade.id,
-                            event_type="LEADER_CONTINUATION_EVIDENCE_HOLD",
-                            observed_at=ts,
-                            value=net,
-                            detail=(
-                                "The exact leader position is still visibly OPEN. The paper stop is deferred; "
-                                "no fixed continuation timer or adverse-price ceiling is applied. "
-                                "The position remains subject to confirmed leader closure/reversal, "
-                                "net-positive profit harvest, data-integrity guards and emergency controls."
-                            )
-                        ))
-                        raw["leader_continuation_hold_logged"] = True
-                    exit_reason = None
                 else:
                     reason_base = "STOP_LOSS"
                     if funding_verified:
