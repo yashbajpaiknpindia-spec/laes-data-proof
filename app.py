@@ -417,6 +417,7 @@ def run_local_forensic_audit_all_closed() -> None:
             opened = _shadow_dt(trade.opened_at) or now()
             position_key = trade.source_key.split("|", 1)[1] if "|" in trade.source_key else ""
             leader_timeline = leader_by_key.get((str(trade.trader_id), position_key), [])
+            leader_entry = safe_float(raw.get("leader_entry"))
             pre_entry_leader_points = [
                 item for item in leader_timeline
                 if item[0] < opened - timedelta(seconds=5) and item[1] is not None and item[1] > 0
@@ -551,16 +552,16 @@ def run_local_forensic_audit_all_closed() -> None:
                 "LEADER_SNAPSHOT_PATH_ONLY_BINANCE_CANDLES_PENDING" if post_points else
                 "BINANCE_CANDLES_PENDING_NO_LOCAL_POST_EXIT_PATH"
             )
-            raw["forensic_entry_timing_status"] = (
+            raw["forensic_binance_entry_timing_status"] = (
                 "PRE_ENTRY_BINANCE_CANDLE_AUDIT_COMPLETE"
                 if raw.get("entry_timing_verdict") else
                 "PRE_ENTRY_BINANCE_CANDLE_AUDIT_PENDING"
             )
             raw["forensic_note"] = (
-                "Saved-path MFE/MAE and threshold entries use sampled paper marks. "
-                "The 2.5/3.5/5% alternatives hold to the actual exit and exclude funding; "
-                "leader post-exit recovery uses exact-key Kopyon snapshots only. "
-                "None of these counterfactuals is an executable fill or realized PnL."
+                "Best-before-entry price is the most favourable exact-key Kopyon leader mark "
+                "sample observed before our paper entry. The same historical exit is used to "
+                "estimate the entry-price effect before funding. Saved-path MAE/MFE and leader "
+                "post-exit recovery are sampled evidence, not guaranteed fills or realized PnL."
             )
             trade.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
             changed += 1
