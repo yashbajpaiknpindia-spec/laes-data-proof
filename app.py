@@ -208,6 +208,7 @@ opportunity_lock = asyncio.Lock()
 recovery_audit_lock = asyncio.Lock()
 last_manual_sync = 0.0
 news_cache: dict[str, Any] = {"fetched_at": 0.0, "items": [], "error": None}
+OPPORTUNITY_SCAN_CACHE: dict[str, Any] = {"items": [], "scanned_at": 0.0}
 
 # Binance public market data is WebSocket-first. A circuit breaker prevents repeated
 # REST fallback calls from extending exchange-side HTTP 418/429 bans.
@@ -323,45 +324,220 @@ def paper_config() -> dict:
     return merged
 
 def run_local_forensic_audit_all_closed() -> None:
-    """Fast local forensic pass over every closed trade using persisted paper paths."""
+    """
+    Versioned local forensic audit of every closed paper trade.
+
+    Uses only persisted paper-price paths and exact-key Kopyon snapshots already in
+    PostgreSQL. The result is deliberately labelled as sampled/counterfactual:
+    it is not a Binance candle audit or an executable fill simulation.
+    """
+    cfg = paper_config()
     with SessionLocal() as db:
-        trades = db.scalars(select(PaperTrade).where(PaperTrade.status == "CLOSED")).all()
-        rows = db.execute(
-            select(PaperTradePath.paper_trade_id, func.count(PaperTradePath.id),
-                   func.max(PaperTradePath.net_pnl), func.min(PaperTradePath.net_pnl))
-            .group_by(PaperTradePath.paper_trade_id)
+        trades = db.scalars(
+            select(PaperTrade).where(PaperTrade.status == "CLOSED")
+            .order_by(PaperTrade.closed_at, PaperTrade.id)
         ).all()
-        agg = {int(tid): (int(n or 0), safe_float(mfe), safe_float(mae))
-               for tid, n, mfe, mae in rows}
+        if not trades:
+            return
+        trade_ids = [int(t.id) for t in trades]
+        trader_ids = sorted({str(t.trader_id) for t in trades})
+        path_rows = db.scalars(
+            select(PaperTradePath)
+            .where(PaperTradePath.paper_trade_id.in_(trade_ids))
+            .order_by(PaperTradePath.paper_trade_id, PaperTradePath.observed_at)
+        ).all()
+        earliest_close = min((_shadow_dt(t.closed_at) or _shadow_dt(t.opened_at) or now()) for t in trades)
+        latest_close = max((_shadow_dt(t.closed_at) or now()) for t in trades)
+        leader_rows = db.execute(
+            select(PositionObservation, PositionSnapshot)
+            .join(PositionSnapshot, PositionSnapshot.id == PositionObservation.snapshot_id)
+            .where(
+                PositionObservation.trader_id.in_(trader_ids),
+                PositionSnapshot.hidden.is_(False),
+                PositionSnapshot.observed_at >= earliest_close,
+                PositionSnapshot.observed_at <= latest_close + timedelta(hours=72)
+            )
+            .order_by(PositionSnapshot.observed_at)
+        ).all()
+
+        paths_by_trade: dict[int, list[PaperTradePath]] = {}
+        for point in path_rows:
+            paths_by_trade.setdefault(int(point.paper_trade_id), []).append(point)
+        leader_by_key: dict[tuple[str, str], list[tuple[datetime, float | None, float | None]]] = {}
+        for observation, snapshot in leader_rows:
+            leader_by_key.setdefault(
+                (str(observation.trader_id), str(observation.position_key)), []
+            ).append((
+                _shadow_dt(snapshot.observed_at) or now(),
+                safe_float(observation.mark_price),
+                safe_float(observation.entry_price)
+            ))
+
         changed = 0
         for trade in trades:
             raw = parse_json(trade.raw_json)
-            if int(raw.get("forensic_audit_version", 0) or 0) >= 1:
+            if int(raw.get("forensic_audit_version", 0) or 0) >= 2:
                 continue
-            n, mfe, mae = agg.get(int(trade.id), (0, None, None))
-            raw["forensic_audit_version"] = 1
-            raw["forensic_audit_status"] = "LOCAL_PATH_AUDIT_COMPLETE" if n else "NO_LOCAL_PATH_DATA"
-            raw["forensic_path_count"] = n
-            raw["forensic_path_mfe_net_pnl"] = mfe
-            raw["forensic_path_mae_net_pnl"] = mae
-            raw["forensic_exit_capture_pct"] = round(float(trade.net_pnl) / mfe * 100.0, 2) if mfe and mfe > 0 else None
+
+            points = paths_by_trade.get(int(trade.id), [])
+            path_count = len(points)
+            path_mfe = max((safe_float(p.net_pnl) for p in points if safe_float(p.net_pnl) is not None), default=None)
+            path_mae = min((safe_float(p.net_pnl) for p in points if safe_float(p.net_pnl) is not None), default=None)
+            max_gap = max((safe_float(p.data_gap_seconds) or 0.0 for p in points), default=0.0)
+            max_leader_adverse = max(
+                (safe_float(p.leader_adverse_pct) for p in points if safe_float(p.leader_adverse_pct) is not None),
+                default=None
+            )
+            realized = float(trade.net_pnl or 0.0)
+            raw["forensic_audit_version"] = 2
+            raw["forensic_audit_status"] = "LOCAL_PATH_AUDIT_COMPLETE" if path_count else "NO_LOCAL_PATH_DATA"
+            raw["forensic_path_count"] = path_count
+            raw["forensic_path_max_gap_seconds"] = round(max_gap, 3)
+            raw["forensic_path_mfe_net_pnl"] = round(path_mfe, 8) if path_mfe is not None else None
+            raw["forensic_path_mae_net_pnl"] = round(path_mae, 8) if path_mae is not None else None
+            raw["forensic_path_max_leader_adverse_pct"] = round(max_leader_adverse, 6) if max_leader_adverse is not None else None
+            raw["forensic_exit_capture_pct"] = (
+                round(realized / path_mfe * 100.0, 2)
+                if path_mfe is not None and path_mfe > 0 else None
+            )
+            raw["forensic_mae_magnitude_exceeded_mfe"] = bool(
+                path_mae is not None and path_mfe is not None and abs(path_mae) > abs(path_mfe)
+            )
             raw["forensic_mfe_vs_realized"] = (
-                "NO_PATH" if mfe is None else
-                "FAVORABLE_EXCURSION_LEFT_ON_TABLE" if mfe > float(trade.net_pnl or 0) + 0.05 else
-                "SOME_FAVORABLE_EXCURSION_LEFT" if mfe > float(trade.net_pnl or 0) else
+                "NO_PATH" if path_mfe is None else
+                "FAVORABLE_EXCURSION_LEFT_ON_TABLE" if path_mfe > realized + 0.05 else
+                "SOME_FAVORABLE_EXCURSION_LEFT" if path_mfe > realized else
                 "NO_MATERIAL_MFE_GAP"
             )
-            raw["forensic_post_exit_status"] = (
-                "POST_EXIT_CANDLE_PATH_PRESENT"
-                if len(parse_json(raw.get("post_exit_mark_candles"), [])) > 0
-                else "POST_EXIT_CANDLE_AUDIT_PENDING_EXTERNAL_CANDLE_PATH"
+
+            # Counterfactual delayed-entry checks. A threshold already exceeded at
+            # the original entry is NOT counted as a later-entry opportunity.
+            opened = _shadow_dt(trade.opened_at) or now()
+            initial_adverse = safe_float(raw.get("adverse_pct"))
+            threshold_audit = {}
+            for threshold in (2.5, 3.5, 5.0):
+                key = str(threshold)
+                if initial_adverse is not None and initial_adverse >= threshold:
+                    threshold_audit[key] = {
+                        "status": "ALREADY_AT_OR_BEYOND_THRESHOLD_AT_ACTUAL_ENTRY",
+                        "initial_leader_adverse_pct": round(initial_adverse, 6)
+                    }
+                    continue
+                candidate = next((
+                    p for p in points
+                    if (_shadow_dt(p.observed_at) or opened) > opened + timedelta(seconds=5)
+                    and safe_float(p.leader_adverse_pct) is not None
+                    and float(p.leader_adverse_pct) >= threshold
+                    and safe_float(p.paper_price) is not None
+                    and float(p.paper_price) > 0
+                ), None)
+                if candidate is None:
+                    threshold_audit[key] = {
+                        "status": "THRESHOLD_NOT_REACHED_IN_SAVED_PATH",
+                        "initial_leader_adverse_pct": round(initial_adverse, 6) if initial_adverse is not None else None
+                    }
+                    continue
+                candidate_entry = float(candidate.paper_price)
+                candidate_exit = safe_float(trade.exit_price)
+                if candidate_exit is None or candidate_exit <= 0 or not trade.quantity:
+                    threshold_audit[key] = {
+                        "status": "THRESHOLD_REACHED_BUT_EXIT_PRICE_UNAVAILABLE",
+                        "entry_at": candidate.observed_at.isoformat(),
+                        "entry_mark_sampled": candidate_entry
+                    }
+                    continue
+                direction = 1.0 if trade.side.upper() == "LONG" else -1.0
+                gross = direction * (candidate_exit - candidate_entry) * float(trade.quantity)
+                fees_slippage = (
+                    (candidate_entry + candidate_exit) * float(trade.quantity)
+                    * (float(cfg.get("taker_fee_pct", 0.05)) + float(cfg.get("slippage_pct", 0.02))) / 100.0
+                )
+                entry_at = _shadow_dt(candidate.observed_at) or opened
+                threshold_audit[key] = {
+                    "status": "HYPOTHETICAL_HOLD_TO_OLD_EXIT",
+                    "entry_at": entry_at.isoformat(),
+                    "entry_mark_sampled": round(candidate_entry, 12),
+                    "leader_adverse_pct_at_entry": round(float(candidate.leader_adverse_pct), 6),
+                    "minutes_waited_from_actual_entry": round((entry_at - opened).total_seconds() / 60.0, 3),
+                    "actual_exit_at": _shadow_dt(trade.closed_at).isoformat() if trade.closed_at else None,
+                    "actual_exit_mark": round(candidate_exit, 12),
+                    "gross_pnl_estimate": round(gross, 8),
+                    "fee_slippage_estimate": round(fees_slippage, 8),
+                    "net_before_funding_estimate": round(gross - fees_slippage, 8),
+                    "funding_included": False,
+                    "path_gap_seconds": round(max_gap, 3),
+                    "fill_quality": "SAMPLED_PAPER_MARK_NOT_EXECUTABLE_FILL"
+                }
+            raw["forensic_entry_thresholds"] = threshold_audit
+            five = threshold_audit.get("5.0", {})
+            raw["forensic_entry_5pct_status"] = five.get("status", "NOT_AUDITED")
+            raw["forensic_entry_5pct_net_before_funding"] = five.get("net_before_funding_estimate")
+
+            # Exact-position leader snapshots after our exit. This can establish
+            # that the leader mark later returned to its own entry, but is not a
+            # follower fill, Binance candle path, or realized profit.
+            position_key = trade.source_key.split("|", 1)[1] if "|" in trade.source_key else ""
+            leader_entry = safe_float(raw.get("leader_entry"))
+            if leader_entry is None:
+                leader_entry = safe_float(trade.entry_price)
+            closed = _shadow_dt(trade.closed_at)
+            post_points = []
+            if closed and position_key:
+                post_points = [
+                    item for item in leader_by_key.get((str(trade.trader_id), position_key), [])
+                    if closed < item[0] <= closed + timedelta(hours=72) and item[1] is not None
+                ]
+            recovered_point = None
+            max_favorable_pct = None
+            if leader_entry and leader_entry > 0:
+                for at, mark, observed_entry in post_points:
+                    favorable_pct = (
+                        (mark - leader_entry) / leader_entry * 100.0
+                        if trade.side.upper() == "LONG"
+                        else (leader_entry - mark) / leader_entry * 100.0
+                    )
+                    max_favorable_pct = max(max_favorable_pct if max_favorable_pct is not None else favorable_pct, favorable_pct)
+                    crossed = mark >= leader_entry if trade.side.upper() == "LONG" else mark <= leader_entry
+                    if crossed and recovered_point is None:
+                        recovered_point = (at, mark, favorable_pct)
+            raw["forensic_post_exit_leader_snapshot_count"] = len(post_points)
+            raw["forensic_post_exit_leader_first_at"] = post_points[0][0].isoformat() if post_points else None
+            raw["forensic_post_exit_leader_last_at"] = post_points[-1][0].isoformat() if post_points else None
+            raw["forensic_post_exit_leader_max_favorable_pct"] = round(max_favorable_pct, 6) if max_favorable_pct is not None else None
+            raw["forensic_post_exit_leader_returned_to_entry"] = bool(recovered_point)
+            raw["forensic_post_exit_leader_minutes_to_entry"] = (
+                round((recovered_point[0] - closed).total_seconds() / 60.0, 3)
+                if recovered_point and closed else None
             )
-            raw["forensic_entry_timing_status"] = "PRE_ENTRY_BINANCE_CANDLE_AUDIT_REQUIRED"
-            raw["forensic_note"] = "Local path audit only; no better fill or post-exit recovery is claimed without verified Binance candles."
-            trade.raw_json = json.dumps(raw)
+            raw["forensic_post_exit_leader_return_at"] = recovered_point[0].isoformat() if recovered_point else None
+            raw["forensic_post_exit_leader_return_mark"] = recovered_point[1] if recovered_point else None
+            raw["forensic_post_exit_leader_status"] = (
+                "LEADER_MARK_RETURNED_TO_ENTRY_AFTER_OUR_EXIT" if recovered_point else
+                "LEADER_REMAINED_BELOW_ENTRY_IN_OBSERVED_SNAPSHOTS" if post_points else
+                "NO_EXACT_LEADER_SNAPSHOT_AFTER_EXIT"
+            )
+            has_binance_path = bool(parse_json(raw.get("post_exit_mark_candles"), []))
+            raw["forensic_post_exit_status"] = (
+                "BINANCE_MARK_CANDLES_AVAILABLE" if has_binance_path else
+                "LEADER_SNAPSHOT_PATH_ONLY_BINANCE_CANDLES_PENDING" if post_points else
+                "BINANCE_CANDLES_PENDING_NO_LOCAL_POST_EXIT_PATH"
+            )
+            raw["forensic_entry_timing_status"] = (
+                "PRE_ENTRY_BINANCE_CANDLE_AUDIT_COMPLETE"
+                if raw.get("entry_timing_verdict") else
+                "PRE_ENTRY_BINANCE_CANDLE_AUDIT_PENDING"
+            )
+            raw["forensic_note"] = (
+                "Saved-path MFE/MAE and threshold entries use sampled paper marks. "
+                "The 2.5/3.5/5% alternatives hold to the actual exit and exclude funding; "
+                "leader post-exit recovery uses exact-key Kopyon snapshots only. "
+                "None of these counterfactuals is an executable fill or realized PnL."
+            )
+            trade.raw_json = json.dumps(raw, separators=(",", ":"), default=str)
             changed += 1
         if changed:
             db.commit()
+
 
 def migrate_paper_audit_metadata() -> None:
     """
@@ -2510,13 +2686,25 @@ async def _ws_send_symbol_action(ws, action: str, symbols: set[str], request_id:
     return request_id
 
 
+def _binance_mark_price_rows(payload: Any) -> list[dict]:
+    """Normalize raw, combined, and all-market mark-price WebSocket packets."""
+    data = payload.get("data", payload) if isinstance(payload, dict) else payload
+    if isinstance(data, dict):
+        return [data] if data.get("s") else []
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict) and item.get("s")]
+    return []
+
+
 async def paper_price_worker() -> None:
     """
-    Persistent USD-M mark-price subscriber:
-    - /ws + per-symbol SUBSCRIBE prevents one invalid futures symbol poisoning a combined URL.
-    - Price frames are batched and evaluated together, not one blocking DB transaction per tick.
-    - New open symbols are subscribed within five seconds.
-    - REST backup is one bulk request/minute and is disabled during a Binance 418/429 cooldown.
+    Subscribe once to Binance's USD-M all-market mark-price stream.
+
+    The previous implementation sent one SUBSCRIBE request per leader symbol,
+    then repeatedly lost the socket to ping timeouts. Momentum consequently saw
+    almost no 5-minute histories. The all-market array stream provides every
+    symbol through one subscription; we retain only currently observed leader
+    symbols and open paper-trade symbols in memory.
     """
     reconnect_delay = 2.0
     last_rest_backup_at = 0.0
@@ -2525,177 +2713,156 @@ async def paper_price_worker() -> None:
 
     while True:
         try:
-            symbols = set(await _open_paper_symbols())
-            if not symbols:
+            watched_symbols = set(await _open_paper_symbols())
+            if not watched_symbols:
                 PAPER_PRICE_STREAM_STATE.update({
-                    "status": "idle_no_open_trades", "connected": False,
-                    "subscribed_symbols": [], "last_error": None
+                    "status": "idle_no_watched_symbols", "connected": False,
+                    "subscribed_symbols": [], "active_symbols": 0, "last_error": None
                 })
                 await asyncio.sleep(2.0)
                 continue
 
+            with SessionLocal() as db:
+                open_symbols = {
+                    str(t.symbol).upper() for t in db.scalars(
+                        select(PaperTrade).where(PaperTrade.status == "OPEN")
+                    ).all() if t.symbol
+                }
+
             PAPER_PRICE_STREAM_STATE.update({
                 "status": "connecting", "connected": False,
-                "subscribed_symbols": sorted(symbols), "last_error": None
+                "subscribed_symbols": sorted(watched_symbols),
+                "active_symbols": 0, "last_error": None
             })
-            pending_requests: dict[int, dict] = {}
-            requested_symbols: set[str] = set()
-            active_symbols: set[str] = set()
-            unsupported_symbols: set[str] = set()
             pending_prices: dict[str, float] = {}
             pending_event_times: dict[str, datetime] = {}
-            connection_started = time.monotonic()
-            last_price_message_at = 0.0
             last_flush_at = time.monotonic()
             last_symbol_refresh_at = time.monotonic()
+            last_payload_at = 0.0
             connection_id = int(PAPER_PRICE_STREAM_STATE.get("reconnect_count", 0)) + 1
 
-            # Current USDⓈ-M API requires the market stream control endpoint
-            # for dynamic SUBSCRIBE/UNSUBSCRIBE requests. The legacy /ws base can
-            # accept a socket but does not serve this control-subscription channel.
             async with websockets.connect(
                 "wss://fstream.binance.com/market/stream",
-                ping_interval=20, ping_timeout=20, close_timeout=5,
-                open_timeout=12, max_size=1048576, max_queue=4096
+                ping_interval=20, ping_timeout=60, close_timeout=5,
+                open_timeout=12, max_size=4 * 1024 * 1024, max_queue=4096
             ) as ws:
+                request_id += 1
+                subscription_id = request_id
+                await ws.send(json.dumps({
+                    "method": "SUBSCRIBE",
+                    "params": ["!markPrice@arr@1s"],
+                    "id": subscription_id
+                }))
                 PAPER_PRICE_STREAM_STATE.update({
                     "status": "subscribing", "connected": True,
                     "connected_at": now().isoformat(), "reconnect_count": connection_id,
-                    "last_error": None
+                    "feed_mode": "BINANCE_USDM_ALL_MARK_PRICE_ARRAY_1S"
                 })
-                request_id = await _ws_send_symbol_action(
-                    ws, "SUBSCRIBE", symbols, request_id, pending_requests
-                )
-                requested_symbols.update(symbols)
 
-                while time.monotonic() - connection_started < 23 * 3600:
-                    message = None
+                while time.monotonic() - last_symbol_refresh_at < 0.0:
+                    await asyncio.sleep(0.01)
+
+                while time.monotonic() - (last_payload_at or time.monotonic()) < 23 * 3600:
                     try:
-                        message = await asyncio.wait_for(ws.recv(), timeout=0.25)
+                        message = await asyncio.wait_for(ws.recv(), timeout=5.0)
                     except asyncio.TimeoutError:
-                        pass
+                        if last_payload_at and time.monotonic() - last_payload_at > 25:
+                            raise RuntimeError("No Binance all-market mark-price payload for 25 seconds")
+                        continue
 
-                    if message is not None:
-                        packet = json.loads(message)
-                        if isinstance(packet, dict):
-                            PAPER_PRICE_STREAM_STATE["messages_received"] = int(
-                                PAPER_PRICE_STREAM_STATE.get("messages_received", 0)
-                            ) + 1
-                            PAPER_PRICE_STREAM_STATE["last_message_at"] = now().isoformat()
-                            ack_id = packet.get("id")
-                            try:
-                                ack_id = int(ack_id) if ack_id is not None else None
-                            except (TypeError, ValueError):
-                                ack_id = None
-                            if ack_id is not None and ack_id in pending_requests:
-                                request = pending_requests.pop(ack_id)
-                                symbol = request["symbol"]
-                                if packet.get("code") is not None or packet.get("error"):
-                                    unsupported_symbols.add(symbol)
-                                    requested_symbols.discard(symbol)
-                                    PAPER_PRICE_STREAM_STATE["last_error"] = (
-                                        f"{symbol} {request['action']} rejected: "
-                                        f"{packet.get('msg') or packet.get('error') or packet.get('code')}"
-                                    )
-                                elif request["action"] == "SUBSCRIBE":
-                                    active_symbols.add(symbol)
-                                    if not last_price_message_at:
-                                        last_price_message_at = time.monotonic()
-                                    PAPER_PRICE_STREAM_STATE["status"] = "live"
-                                else:
-                                    active_symbols.discard(symbol)
-                                PAPER_PRICE_STREAM_STATE["subscribed_symbols"] = sorted(active_symbols)
-                                PAPER_PRICE_STREAM_STATE["unsupported_symbols"] = sorted(unsupported_symbols)
+                    packet = json.loads(message)
+                    PAPER_PRICE_STREAM_STATE["messages_received"] = int(
+                        PAPER_PRICE_STREAM_STATE.get("messages_received", 0)
+                    ) + 1
+                    PAPER_PRICE_STREAM_STATE["last_message_at"] = now().isoformat()
+                    if isinstance(packet, dict) and str(packet.get("id")) == str(subscription_id):
+                        if packet.get("code") is not None or packet.get("error"):
+                            raise RuntimeError(
+                                f"Binance rejected all-market mark-price subscription: {packet.get('msg') or packet.get('error') or packet.get('code')}"
+                            )
+                        PAPER_PRICE_STREAM_STATE["status"] = "live"
+                        last_payload_at = time.monotonic()
+                        continue
+
+                    rows = _binance_mark_price_rows(packet)
+                    if rows:
+                        last_payload_at = time.monotonic()
+                        event_epoch_now = time.time()
+                        for data in rows:
+                            symbol = str(data.get("s") or "").upper()
+                            if symbol not in watched_symbols:
                                 continue
-
-                            data = packet.get("data", packet)
-                            if isinstance(data, dict):
-                                symbol = str(data.get("s") or "").upper()
-                                price = safe_float(data.get("p"))
-                                if symbol and price is not None and price > 0 and symbol in requested_symbols:
-                                    event_ms = safe_float(data.get("E"))
-                                    event_at = (
-                                        datetime.fromtimestamp(event_ms / 1000.0, timezone.utc)
-                                        if event_ms else now()
-                                    )
-                                    pending_prices[symbol] = price
-                                    pending_event_times[symbol] = event_at
-                                    event_epoch = event_at.timestamp()
-                                    PAPER_SYMBOL_LAST_PRICE[symbol] = price
-                                    PAPER_SYMBOL_LAST_PRICE_AT[symbol] = event_epoch
-                                    funding_value = safe_float(data.get("r"))
-                                    index_value = safe_float(data.get("i"))
-                                    if funding_value is not None:
-                                        PAPER_SYMBOL_FUNDING_RATE[symbol] = funding_value
-                                    if index_value is not None:
-                                        PAPER_SYMBOL_INDEX_PRICE[symbol] = index_value
-                                    history = PAPER_SYMBOL_PRICE_HISTORY.setdefault(symbol, [])
-                                    history.append((event_epoch, price))
-                                    cutoff_epoch = event_epoch - 600
-                                    while history and history[0][0] < cutoff_epoch:
-                                        history.pop(0)
-                                    last_price_message_at = time.monotonic()
-                                    PAPER_SYMBOL_LAST_UPDATE[symbol] = event_at.isoformat()
-                                    PAPER_PRICE_STREAM_STATE["price_updates_received"] = int(
-                                        PAPER_PRICE_STREAM_STATE.get("price_updates_received", 0)
-                                    ) + 1
-                                    PAPER_PRICE_STREAM_STATE["last_price_at"] = event_at.isoformat()
-                                    PAPER_PRICE_STREAM_STATE["status"] = "live"
+                            price = safe_float(data.get("p"))
+                            if price is None or price <= 0:
+                                continue
+                            event_ms = safe_float(data.get("E"))
+                            event_at = (
+                                datetime.fromtimestamp(event_ms / 1000.0, timezone.utc)
+                                if event_ms else now()
+                            )
+                            event_epoch = event_at.timestamp()
+                            PAPER_SYMBOL_LAST_PRICE[symbol] = price
+                            PAPER_SYMBOL_LAST_PRICE_AT[symbol] = event_epoch
+                            PAPER_SYMBOL_LAST_UPDATE[symbol] = event_at.isoformat()
+                            funding_value = safe_float(data.get("r"))
+                            index_value = safe_float(data.get("i"))
+                            if funding_value is not None:
+                                PAPER_SYMBOL_FUNDING_RATE[symbol] = funding_value
+                            if index_value is not None:
+                                PAPER_SYMBOL_INDEX_PRICE[symbol] = index_value
+                            history = PAPER_SYMBOL_PRICE_HISTORY.setdefault(symbol, [])
+                            history.append((event_epoch, price))
+                            cutoff_epoch = event_epoch - 600
+                            while history and history[0][0] < cutoff_epoch:
+                                history.pop(0)
+                            if symbol in open_symbols:
+                                pending_prices[symbol] = price
+                                pending_event_times[symbol] = event_at
+                            PAPER_PRICE_STREAM_STATE["price_updates_received"] = int(
+                                PAPER_PRICE_STREAM_STATE.get("price_updates_received", 0)
+                            ) + 1
+                            PAPER_PRICE_STREAM_STATE["last_price_at"] = event_at.isoformat()
+                        PAPER_PRICE_STREAM_STATE["status"] = "live"
 
                     mono = time.monotonic()
                     if pending_prices and mono - last_flush_at >= 0.5:
-                        batch_prices = dict(pending_prices)
-                        batch_times = dict(pending_event_times)
+                        await evaluate_open_paper_trades(
+                            dict(pending_prices), "BINANCE_WS_ALL_MARK_PRICE_1S",
+                            dict(pending_event_times)
+                        )
                         pending_prices.clear()
                         pending_event_times.clear()
-                        await evaluate_open_paper_trades(
-                            batch_prices, "BINANCE_WS_MARK_PRICE_1S", batch_times
-                        )
                         last_flush_at = mono
                         PAPER_PRICE_STREAM_STATE["last_flush_at"] = now().isoformat()
 
                     if mono - last_symbol_refresh_at >= 5.0:
-                        current_symbols = set(await _open_paper_symbols())
-                        removed = requested_symbols - current_symbols
-                        added = current_symbols - requested_symbols - unsupported_symbols
-                        if removed:
-                            request_id = await _ws_send_symbol_action(
-                                ws, "UNSUBSCRIBE", removed, request_id, pending_requests
-                            )
-                            requested_symbols -= removed
-                            active_symbols -= removed
-                        if added:
-                            request_id = await _ws_send_symbol_action(
-                                ws, "SUBSCRIBE", added, request_id, pending_requests
-                            )
-                            requested_symbols.update(added)
+                        watched_symbols = set(await _open_paper_symbols())
+                        with SessionLocal() as db:
+                            open_symbols = {
+                                str(t.symbol).upper() for t in db.scalars(
+                                    select(PaperTrade).where(PaperTrade.status == "OPEN")
+                                ).all() if t.symbol
+                            }
+                        PAPER_PRICE_STREAM_STATE["subscribed_symbols"] = sorted(watched_symbols)
                         last_symbol_refresh_at = time.monotonic()
-                        PAPER_PRICE_STREAM_STATE["subscribed_symbols"] = sorted(active_symbols)
 
-                    if active_symbols and last_price_message_at and mono - last_price_message_at > 12:
-                        PAPER_PRICE_STREAM_STATE.update({
-                            "status": "stale_no_mark_messages",
-                            "last_error": "No mark-price event received for more than 12 seconds; reconnecting."
-                        })
-                        break
-                    if not active_symbols and mono - connection_started > 12:
-                        PAPER_PRICE_STREAM_STATE.update({
-                            "status": "no_valid_subscriptions",
-                            "last_error": "No active USD-M mark-price subscriptions were acknowledged."
-                        })
-                        break
-
+                    fresh_count = sum(
+                        1 for symbol in watched_symbols
+                        if time.time() - PAPER_SYMBOL_LAST_PRICE_AT.get(symbol, 0.0) <= 10
+                    )
+                    PAPER_PRICE_STREAM_STATE["active_symbols"] = fresh_count
                     if mono - last_health_log_at >= 60:
                         last_health_log_at = mono
                         log_check(
                             "paper_price_stream", True, None, None,
-                            f"connected={bool(active_symbols)} active_symbols={len(active_symbols)} "
-                            f"price_updates={PAPER_PRICE_STREAM_STATE.get('price_updates_received', 0)}"
+                            f"connected=True feed=ALL_MARK_PRICE_ARRAY_1S watched={len(watched_symbols)} "
+                            f"fresh={fresh_count} price_updates={PAPER_PRICE_STREAM_STATE.get('price_updates_received', 0)}"
                         )
 
                 if pending_prices:
                     await evaluate_open_paper_trades(
-                        dict(pending_prices), "BINANCE_WS_MARK_PRICE_1S", dict(pending_event_times)
+                        dict(pending_prices), "BINANCE_WS_ALL_MARK_PRICE_1S",
+                        dict(pending_event_times)
                     )
             reconnect_delay = 2.0
             PAPER_PRICE_STREAM_STATE["connected"] = False
@@ -2713,8 +2880,8 @@ async def paper_price_worker() -> None:
                 last_health_log_at = time.monotonic()
                 log_check("paper_price_stream", False, None, None, str(exc)[:850])
 
-        # Backup only when the WebSocket is unavailable: a single bulk REST read
-        # at most once per minute, and never while Binance has an active 418/429 ban.
+        # Keep the REST fallback bounded and subject to Binance's existing circuit
+        # breaker. The WebSocket stream is the primary path for Momentum warming.
         if time.monotonic() - last_rest_backup_at >= 60:
             last_rest_backup_at = time.monotonic()
             current_symbols = await _open_paper_symbols()
@@ -2730,12 +2897,21 @@ async def paper_price_worker() -> None:
 
 @app.get("/api/opportunities")
 async def api_opportunities(limit: int = 100):
-    # Read-only scanner endpoint: opening/refreshing a page must never create a trade.
+    # Prefer the latest worker scan. The old page endpoint queued behind the same
+    # 2,000-position lock as the background scanner, then repeated its own expensive
+    # market/DB queries just to render the same page.
+    limit = max(1, min(int(limit), 2000))
+    age = max(0.0, time.time() - float(OPPORTUNITY_SCAN_CACHE.get("scanned_at", 0.0) or 0.0))
+    cache_items = OPPORTUNITY_SCAN_CACHE.get("items") or []
+    if cache_items and (age <= 90 or last_scan.get("state") == "running"):
+        return [dict(item, scan_age_seconds=round(age, 1)) for item in cache_items[:limit * 2]]
     return await scan_paper_opportunities(limit=limit, allow_entry_creation=False)
 
 async def scan_paper_opportunities(limit: int = 100, allow_entry_creation: bool = True):
     async with opportunity_lock:
-        return await _api_opportunities_locked(limit, allow_entry_creation)
+        result = await _api_opportunities_locked(limit, allow_entry_creation)
+        OPPORTUNITY_SCAN_CACHE.update({"items": result, "scanned_at": time.time()})
+        return result
 
 
 async def _api_opportunities_locked(limit: int = 2000, allow_entry_creation: bool = False):
