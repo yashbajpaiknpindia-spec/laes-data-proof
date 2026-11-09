@@ -1200,7 +1200,7 @@ async def api_overview():
         "price_feed": {
             "status": PAPER_PRICE_STREAM_STATE.get("status"),
             "connected": bool(PAPER_PRICE_STREAM_STATE.get("connected")),
-            "active_symbols": len(PAPER_PRICE_STREAM_STATE.get("subscribed_symbols") or []),
+            "active_symbols": int(PAPER_PRICE_STREAM_STATE.get("active_symbols", 0) or 0), "watched_symbols": len(PAPER_PRICE_STREAM_STATE.get("subscribed_symbols") or []), "feed_mode": PAPER_PRICE_STREAM_STATE.get("feed_mode", "LEGACY_PER_SYMBOL_SUBSCRIPTIONS"),
             "last_price_at": PAPER_PRICE_STREAM_STATE.get("last_price_at"),
             "last_error": PAPER_PRICE_STREAM_STATE.get("last_error"),
             "binance_rest": binance_rest_status()
@@ -1725,6 +1725,7 @@ async def build_opportunity(
     if qualified and cfg.get("auto_enabled") and allow_entry_creation:
         create_paper_trade(obs, trader_name, mark or entry or 0, cfg, market, "RECOVERY")
     return {
+        "strategy": "RECOVERY",
         "trader_id": obs.trader_id, "trader_name": trader_name or obs.trader_id,
         "position_key": obs.position_key, "symbol": obs.symbol, "side": obs.side,
         "entry_price": entry, "mark_price": mark, "adverse_pct": round(adverse, 3) if adverse is not None else None,
@@ -3290,7 +3291,7 @@ async def api_paper(strategy: str = "RECOVERY"):
             "connected": bool(PAPER_PRICE_STREAM_STATE.get("connected")),
             "last_price_at": PAPER_PRICE_STREAM_STATE.get("last_price_at"),
             "last_error": PAPER_PRICE_STREAM_STATE.get("last_error"),
-            "active_symbols": len(PAPER_PRICE_STREAM_STATE.get("subscribed_symbols") or []),
+            "active_symbols": int(PAPER_PRICE_STREAM_STATE.get("active_symbols", 0) or 0), "watched_symbols": len(PAPER_PRICE_STREAM_STATE.get("subscribed_symbols") or []), "feed_mode": PAPER_PRICE_STREAM_STATE.get("feed_mode", "LEGACY_PER_SYMBOL_SUBSCRIPTIONS"),
             "binance_rest": binance_rest_status()
         },
         "risk_summary": {
