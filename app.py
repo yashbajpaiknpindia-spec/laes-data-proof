@@ -173,6 +173,7 @@ class PaperTrade(Base):
     trader_name: Mapped[str | None] = mapped_column(String(240))
     symbol: Mapped[str] = mapped_column(String(80), index=True)
     side: Mapped[str] = mapped_column(String(12))
+    strategy: Mapped[str] = mapped_column(String(24), default="RECOVERY", index=True)
     status: Mapped[str] = mapped_column(String(20), default="OPEN", index=True)
     entry_price: Mapped[float] = mapped_column(Float)
     mark_price: Mapped[float] = mapped_column(Float)
@@ -198,6 +199,7 @@ if engine.dialect.name == "postgresql":
     with engine.begin() as migration:
         migration.execute(text("ALTER TABLE history_positions ALTER COLUMN opened_at_ms TYPE BIGINT"))
         migration.execute(text("ALTER TABLE history_positions ALTER COLUMN closed_at_ms TYPE BIGINT"))
+        migration.execute(text("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS strategy VARCHAR(24) NOT NULL DEFAULT 'RECOVERY'"))
 
 last_scan: dict[str, Any] = {"state": "starting", "started_at": None, "finished_at": None, "last_error": None, "traders_found": 0, "positions_checked": 0, "observations_saved": 0}
 worker_alive = False
@@ -295,6 +297,12 @@ def paper_config() -> dict:
         "meaningful_profit_steps": [0.10, 0.20, 0.30, 0.50, 0.70, 1.00],
         "target_pct": 0.70,
         "stop_pct": 0.45,
+        "profit_harvest_min_margin_pct": 0.70,
+        "profit_giveback_pct": 35.0,
+        "momentum_min_leader_profit_pct": 0.05,
+        "momentum_min_5m_pct": 0.02,
+        "entry_timing_audit_window_minutes": 30.0,
+        "post_exit_recovery_audit_version": 8,
         "taker_fee_pct": 0.05,
         "slippage_pct": 0.02,
         "max_leverage": 3.0,
@@ -728,7 +736,7 @@ async def run_monitor_cycle(force: bool = False) -> dict:
             trader_count, discovered_ids = await discover_traders()
             with SessionLocal() as db:
                 traders = db.scalars(
-                    select(Trader).order_by(desc(Trader.copier_pnl), desc(Trader.last_seen_at)).limit(100)
+                    select(Trader).order_by(desc(Trader.copier_pnl), desc(Trader.last_seen_at))
                 ).all()
                 ids = [t.trader_id for t in traders]
                 cursor = int(setting("position_rotation_cursor", 0) or 0)
@@ -755,7 +763,7 @@ async def run_monitor_cycle(force: bool = False) -> dict:
                 except Exception as exc:
                     log_check("trader_profile", False, None, None, f"{trader_id}: {str(exc)[:700]}")
             try:
-                opportunities = await scan_paper_opportunities(limit=100, allow_entry_creation=True)
+                opportunities = await scan_paper_opportunities(limit=2000, allow_entry_creation=True)
                 qualified_count = sum(1 for item in opportunities if item.get("qualified"))
                 market_blocked = sum(1 for item in opportunities if any("live Binance" in reason for reason in item.get("dead_market_reasons", [])))
                 log_check("paper_analysis", True, 200, None, f"observed={len(opportunities)} qualified={qualified_count} live_market_warmup_or_blocked={market_blocked}")
@@ -1487,7 +1495,7 @@ async def build_opportunity(
     recovery = recovery_statistics(obs.trader_id, obs.position_key, obs.symbol, obs.side, entry)
     hold = holding_time(obs.trader_id, obs.position_key, raw, snapshot_time)
     if qualified and cfg.get("auto_enabled") and allow_entry_creation:
-        create_paper_trade(obs, trader_name, mark or entry or 0, cfg, market)
+        create_paper_trade(obs, trader_name, mark or entry or 0, cfg, market, "RECOVERY")
     return {
         "trader_id": obs.trader_id, "trader_name": trader_name or obs.trader_id,
         "position_key": obs.position_key, "symbol": obs.symbol, "side": obs.side,
@@ -1505,7 +1513,7 @@ async def build_opportunity(
         "recovery_warning": "Market trend/news are contextual risk factors, not a deterministic cause or guarantee of recovery."
     }
 
-def create_paper_trade(obs: PositionObservation, trader_name: str | None, mark: float, cfg: dict, market: dict) -> None:
+def create_paper_trade(obs: PositionObservation, trader_name: str | None, mark: float, cfg: dict, market: dict, strategy: str = "RECOVERY") -> None:
     if mark <= 0 or not obs.entry_price or obs.entry_price <= 0:
         return
     source_key = f"{obs.trader_id}|{obs.position_key}"
@@ -1517,10 +1525,10 @@ def create_paper_trade(obs: PositionObservation, trader_name: str | None, mark: 
         ).order_by(desc(PositionSnapshot.id)).limit(1))
         if latest_snapshot is None or latest_snapshot.hidden or latest_snapshot.id != obs.snapshot_id:
             return
-        existing = db.scalar(select(PaperTrade.id).where(PaperTrade.source_key == source_key, PaperTrade.status == "OPEN").limit(1))
+        existing = db.scalar(select(PaperTrade.id).where(PaperTrade.source_key == source_key, PaperTrade.strategy == strategy, PaperTrade.status == "OPEN").limit(1))
         if existing:
             return
-        prior = db.scalars(select(PaperTrade).where(PaperTrade.source_key == source_key).order_by(desc(PaperTrade.opened_at))).all()
+        prior = db.scalars(select(PaperTrade).where(PaperTrade.source_key == source_key, PaperTrade.strategy == strategy).order_by(desc(PaperTrade.opened_at))).all()
         if len(prior) >= 5:
             return
         if prior:
@@ -1563,10 +1571,11 @@ def create_paper_trade(obs: PositionObservation, trader_name: str | None, mark: 
             target = mark * (1 - target_frac)
         db.add(PaperTrade(
             source_key=source_key, trader_id=obs.trader_id, trader_name=trader_name,
-            symbol=obs.symbol, side=obs.side, status="OPEN",
+            symbol=obs.symbol, side=obs.side, strategy=strategy, status="OPEN",
             entry_price=mark, mark_price=mark, quantity=quantity, notional=notional,
             margin_used=margin, leverage=leverage, stop_price=stop, target_price=target,
             raw_json=json.dumps({
+                "strategy": strategy,
                 "leader_entry": obs.entry_price,
                 "leader_mark": obs.mark_price,
                 "adverse_pct": ((obs.entry_price-mark)/obs.entry_price*100 if obs.side=="LONG" else (mark-obs.entry_price)/obs.entry_price*100),
@@ -1757,7 +1766,7 @@ async def run_post_exit_recovery_audit(max_trades: int = 5) -> dict:
         horizon_hours = max(1.0, min(72.0, float(cfg.get("post_exit_recovery_audit_hours", 24.0))))
         with SessionLocal() as db:
             closed = db.scalars(select(PaperTrade).where(PaperTrade.status == "CLOSED").order_by(PaperTrade.closed_at)).all()
-        pending = [t for t in closed if parse_json(t.raw_json).get("post_exit_recovery_audit_version", 0) != 7]
+        pending = [t for t in closed if parse_json(t.raw_json).get("post_exit_recovery_audit_version", 0) != 8]
         cooldown = binance_rest_status()
         if cooldown.get("blocked"):
             return {"audited": 0, "attempted": 0, "recovered_to_profit": 0, "failures": 0,
@@ -1854,7 +1863,7 @@ async def run_post_exit_recovery_audit(max_trades: int = 5) -> dict:
                           "INTRABAR_NET_PROFIT_ONLY" if intrabar_only else
                           "RECOVERED_TO_ENTRY_CLOSE_CONFIRMED" if recovered_entry else "NO_ENTRY_RECOVERY")
                 raw.update({
-                    "post_exit_recovery_audit_version": 7,
+                    "post_exit_recovery_audit_version": 8,
                     "post_exit_recovery_audit_status": "COMPLETE",
                     "post_exit_mark_candles": [
                         [int(row[0]), round(float(row[2]), 12), round(float(row[3]), 12), round(float(row[4]), 12)]
@@ -2540,7 +2549,7 @@ async def _api_opportunities_locked(limit: int = 100, allow_entry_creation: bool
         visible = {snap.id: snap for snap in latest_snapshots if not snap.hidden}
         observations = db.scalars(select(PositionObservation).where(
             PositionObservation.snapshot_id.in_(list(visible.keys()))
-        ).order_by(desc(PositionObservation.id)).limit(500)).all() if visible else []
+        ).order_by(desc(PositionObservation.id))).all() if visible else []
         traders = {t.trader_id: t.name for t in db.scalars(select(Trader)).all()}
     latest = {}
     for obs in observations:
@@ -2575,14 +2584,17 @@ def paper_exit_reason_display(trade: PaperTrade, raw: dict) -> str:
 
 
 @app.get("/api/paper")
-async def api_paper():
+async def api_paper(strategy: str = "RECOVERY"):
+    strategy = strategy.upper().strip() or "RECOVERY"
+    if strategy not in {"RECOVERY", "MOMENTUM"}:
+        raise HTTPException(400, "strategy must be RECOVERY or MOMENTUM")
     cfg = paper_config()
     with SessionLocal() as db:
-        trades = db.scalars(select(PaperTrade).order_by(desc(PaperTrade.opened_at)).limit(1000)).all()
+        trades = db.scalars(select(PaperTrade).where(PaperTrade.strategy == strategy).order_by(desc(PaperTrade.opened_at)).limit(1000)).all()
         # Portfolio totals and risk clusters must use the complete ledger, not only
         # the newest 300 rows rendered in the table.
         shadow_trades = db.scalars(
-            select(PaperTrade).order_by(PaperTrade.opened_at, PaperTrade.id)
+            select(PaperTrade).where(PaperTrade.strategy == strategy).order_by(PaperTrade.opened_at, PaperTrade.id)
         ).all()
         gap_rows = db.execute(
             select(PaperTradePath.paper_trade_id, func.max(PaperTradePath.data_gap_seconds))
