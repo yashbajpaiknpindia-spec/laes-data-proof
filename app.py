@@ -516,7 +516,8 @@ def run_local_forensic_audit_all_closed() -> None:
                 "LEADER_REMAINED_BELOW_ENTRY_IN_OBSERVED_SNAPSHOTS" if post_points else
                 "NO_EXACT_LEADER_SNAPSHOT_AFTER_EXIT"
             )
-            has_binance_path = bool(parse_json(raw.get("post_exit_mark_candles"), []))
+            post_exit_candles = raw.get("post_exit_mark_candles")
+            has_binance_path = isinstance(post_exit_candles, list) and bool(post_exit_candles)
             raw["forensic_post_exit_status"] = (
                 "BINANCE_MARK_CANDLES_AVAILABLE" if has_binance_path else
                 "LEADER_SNAPSHOT_PATH_ONLY_BINANCE_CANDLES_PENDING" if post_points else
@@ -1031,6 +1032,7 @@ async def monitor_worker() -> None:
             await asyncio.sleep(60)
             if time.monotonic() - last_recovery_audit >= 300:
                 try:
+                    await asyncio.to_thread(run_local_forensic_audit_all_closed)
                     audit = await run_post_exit_recovery_audit(max_trades=20)
                     audit_ok = audit.get("failures", 0) == 0 and not audit.get("blocked", False)
                     log_check("post_exit_recovery_audit", audit_ok, 429 if audit.get("blocked") else 200 if audit_ok else 207, None, f"attempted={audit.get('attempted', 0)} audited={audit.get('audited', 0)} recovered_to_profit={audit.get('recovered_to_profit', 0)} failures={audit.get('failures', 0)} pending={audit.get('pending', 0)} status={audit.get('status')}")
@@ -2738,6 +2740,7 @@ async def paper_price_worker() -> None:
             pending_event_times: dict[str, datetime] = {}
             last_flush_at = time.monotonic()
             last_symbol_refresh_at = time.monotonic()
+            connection_started = time.monotonic()
             last_payload_at = 0.0
             connection_id = int(PAPER_PRICE_STREAM_STATE.get("reconnect_count", 0)) + 1
 
@@ -2759,14 +2762,12 @@ async def paper_price_worker() -> None:
                     "feed_mode": "BINANCE_USDM_ALL_MARK_PRICE_ARRAY_1S"
                 })
 
-                while time.monotonic() - last_symbol_refresh_at < 0.0:
-                    await asyncio.sleep(0.01)
-
-                while time.monotonic() - (last_payload_at or time.monotonic()) < 23 * 3600:
+                while time.monotonic() - connection_started < 23 * 3600:
                     try:
                         message = await asyncio.wait_for(ws.recv(), timeout=5.0)
                     except asyncio.TimeoutError:
-                        if last_payload_at and time.monotonic() - last_payload_at > 25:
+                        last_data_at = last_payload_at or connection_started
+                        if time.monotonic() - last_data_at > 25:
                             raise RuntimeError("No Binance all-market mark-price payload for 25 seconds")
                         continue
 
@@ -3189,6 +3190,25 @@ async def api_paper(strategy: str = "RECOVERY"):
             "entry_timing_best_at": raw.get("entry_timing_best_at"),
             "entry_timing_potential_gross_pnl": safe_float(raw.get("entry_timing_potential_gross_pnl")),
             "entry_timing_verdict": raw.get("entry_timing_verdict"),
+            "forensic_audit_version": safe_float(raw.get("forensic_audit_version")),
+            "forensic_audit_status": raw.get("forensic_audit_status", "PENDING"),
+            "forensic_path_count": safe_float(raw.get("forensic_path_count")),
+            "forensic_path_mfe_net_pnl": safe_float(raw.get("forensic_path_mfe_net_pnl")),
+            "forensic_path_mae_net_pnl": safe_float(raw.get("forensic_path_mae_net_pnl")),
+            "forensic_path_max_gap_seconds": safe_float(raw.get("forensic_path_max_gap_seconds")),
+            "forensic_exit_capture_pct": safe_float(raw.get("forensic_exit_capture_pct")),
+            "forensic_mfe_vs_realized": raw.get("forensic_mfe_vs_realized"),
+            "forensic_mae_magnitude_exceeded_mfe": raw.get("forensic_mae_magnitude_exceeded_mfe"),
+            "forensic_post_exit_status": raw.get("forensic_post_exit_status", "PENDING"),
+            "forensic_post_exit_leader_status": raw.get("forensic_post_exit_leader_status", "PENDING"),
+            "forensic_post_exit_leader_snapshot_count": safe_float(raw.get("forensic_post_exit_leader_snapshot_count")),
+            "forensic_post_exit_leader_returned_to_entry": raw.get("forensic_post_exit_leader_returned_to_entry"),
+            "forensic_post_exit_leader_minutes_to_entry": safe_float(raw.get("forensic_post_exit_leader_minutes_to_entry")),
+            "forensic_post_exit_leader_return_at": raw.get("forensic_post_exit_leader_return_at"),
+            "forensic_entry_thresholds": raw.get("forensic_entry_thresholds", {}),
+            "forensic_entry_5pct_status": raw.get("forensic_entry_5pct_status", "PENDING"),
+            "forensic_entry_5pct_net_before_funding": safe_float(raw.get("forensic_entry_5pct_net_before_funding")),
+            "forensic_note": raw.get("forensic_note"),
             "data_quality_status": raw.get("data_quality_status", "LEGACY_UNCLASSIFIED"),
             "monitoring_status": raw.get("monitoring_status", "NOT_RECORDED"),
             "max_data_gap_seconds": round(max_gap, 3),
@@ -3236,11 +3256,33 @@ async def api_paper(strategy: str = "RECOVERY"):
         "correlated_exposure_groups": correlated_groups,
         "recovery_audit": {
             "complete": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version") == 8),
-            "pending": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version") != 7),
+            "pending": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version") != 8),
             "version6_or_older": sum(1 for t in closed_trades if parse_json(t.raw_json).get("post_exit_recovery_audit_version", 0) < 7),
             "blocked": bool(binance_rest_status().get("blocked")),
             "remaining_seconds": binance_rest_status().get("remaining_seconds"),
             "blocked_until": binance_rest_status().get("blocked_until")
+        },
+        "local_forensic_audit": {
+            "version": 2,
+            "complete": sum(1 for t in closed_trades if int(parse_json(t.raw_json).get("forensic_audit_version", 0) or 0) >= 2),
+            "pending": sum(1 for t in closed_trades if int(parse_json(t.raw_json).get("forensic_audit_version", 0) or 0) < 2),
+            "with_saved_paths": sum(1 for t in closed_trades if int(parse_json(t.raw_json).get("forensic_path_count", 0) or 0) > 0),
+            "no_saved_path": sum(1 for t in closed_trades if int(parse_json(t.raw_json).get("forensic_path_count", 0) or 0) == 0),
+            "mfe_left_on_table": sum(1 for t in closed_trades if parse_json(t.raw_json).get("forensic_mfe_vs_realized") == "FAVORABLE_EXCURSION_LEFT_ON_TABLE"),
+            "leader_returned_to_entry_after_exit": sum(1 for t in closed_trades if parse_json(t.raw_json).get("forensic_post_exit_leader_returned_to_entry") is True),
+            "leader_post_exit_snapshots": sum(1 for t in closed_trades if int(parse_json(t.raw_json).get("forensic_post_exit_leader_snapshot_count", 0) or 0) > 0),
+            "five_pct_delayed_entry_tested": sum(1 for t in closed_trades if parse_json(t.raw_json).get("forensic_entry_5pct_status") in {"HYPOTHETICAL_HOLD_TO_OLD_EXIT", "ALREADY_AT_OR_BEYOND_THRESHOLD_AT_ACTUAL_ENTRY", "THRESHOLD_NOT_REACHED_IN_SAVED_PATH"})
+        },
+        "scanner": {
+            "last_scan_finished_at": last_scan.get("finished_at"),
+            "scan_state": last_scan.get("state"),
+            "scan_age_seconds": round(max(0.0, time.time() - float(OPPORTUNITY_SCAN_CACHE.get("scanned_at", 0.0))), 1) if OPPORTUNITY_SCAN_CACHE.get("scanned_at") else None,
+            "candidate_rows": len(OPPORTUNITY_SCAN_CACHE.get("items") or []),
+            "momentum_rows": sum(1 for x in (OPPORTUNITY_SCAN_CACHE.get("items") or []) if x.get("strategy") == "MOMENTUM"),
+            "momentum_qualified": sum(1 for x in (OPPORTUNITY_SCAN_CACHE.get("items") or []) if x.get("strategy") == "MOMENTUM" and x.get("qualified")),
+            "price_feed_status": PAPER_PRICE_STREAM_STATE.get("status"),
+            "price_feed_active_symbols": int(PAPER_PRICE_STREAM_STATE.get("active_symbols", 0) or 0),
+            "price_feed_error": PAPER_PRICE_STREAM_STATE.get("last_error")
         },
         "shadow_portfolio": shadow_portfolio,
         "price_feed": {
@@ -3507,7 +3549,7 @@ async def api_paper_trade_detail(trade_id: int):
                     PositionObservation.trader_id == leader_trader_id,
                     PositionObservation.position_key == leader_position_key
                 )
-                .order_by(PositionSnapshot.observed_at)
+                .order_by(desc(PositionSnapshot.observed_at))
                 .limit(500)
             ).all()
             leader_path = [{
@@ -3516,7 +3558,7 @@ async def api_paper_trade_detail(trade_id: int):
                 "entry_price": observation.entry_price,
                 "unrealized_pnl": observation.unrealized_pnl,
                 "snapshot_id": snapshot.id
-            } for observation, snapshot in leader_observations if not snapshot.hidden]
+            } for observation, snapshot in sorted(leader_observations, key=lambda pair: pair[1].observed_at) if not snapshot.hidden]
         if leader_obs:
             leader_snapshot = db.get(PositionSnapshot, leader_obs.snapshot_id)
 
@@ -3699,7 +3741,7 @@ async def api_paper_trade_detail(trade_id: int):
             candle_interval = "1h"
         cache_key = f"{trade.symbol}:{candle_interval}"
         cached = PAPER_CANDLE_CACHE.get(cache_key)
-        if cached and time.monotonic() - float(cached.get("fetched_at", 0.0)) < 20:
+        if cached and time.monotonic() - float(cached.get("fetched_at", 0.0)) < 60:
             candles = list(cached.get("candles") or [])
             candle_error = cached.get("error")
         else:
@@ -3731,6 +3773,12 @@ async def api_paper_trade_detail(trade_id: int):
 
     single_replay = build_new_exit_policy_replay([trade], paper_config())
     replay_trade = (single_replay.get("trades") or [None])[0]
+    chart_path = path
+    if len(chart_path) > 600:
+        stride = max(1, (len(chart_path) + 599) // 600)
+        chart_path = chart_path[::stride]
+        if chart_path and chart_path[-1].id != path[-1].id:
+            chart_path.append(path[-1])
     return {
         "new_system_replay": replay_trade,
         "trade": {
@@ -3773,6 +3821,25 @@ async def api_paper_trade_detail(trade_id: int):
             "mfe_net_pnl": safe_float(raw.get("mfe_net_pnl")),
             "mae_net_pnl": safe_float(raw.get("mae_net_pnl")),
             "mfe_pct": safe_float(raw.get("mfe_pct")), "mae_pct": safe_float(raw.get("mae_pct")),
+            "forensic_audit_version": safe_float(raw.get("forensic_audit_version")),
+            "forensic_audit_status": raw.get("forensic_audit_status", "PENDING"),
+            "forensic_path_count": safe_float(raw.get("forensic_path_count")),
+            "forensic_path_mfe_net_pnl": safe_float(raw.get("forensic_path_mfe_net_pnl")),
+            "forensic_path_mae_net_pnl": safe_float(raw.get("forensic_path_mae_net_pnl")),
+            "forensic_path_max_gap_seconds": safe_float(raw.get("forensic_path_max_gap_seconds")),
+            "forensic_exit_capture_pct": safe_float(raw.get("forensic_exit_capture_pct")),
+            "forensic_mfe_vs_realized": raw.get("forensic_mfe_vs_realized"),
+            "forensic_mae_magnitude_exceeded_mfe": raw.get("forensic_mae_magnitude_exceeded_mfe"),
+            "forensic_post_exit_status": raw.get("forensic_post_exit_status", "PENDING"),
+            "forensic_post_exit_leader_status": raw.get("forensic_post_exit_leader_status", "PENDING"),
+            "forensic_post_exit_leader_snapshot_count": safe_float(raw.get("forensic_post_exit_leader_snapshot_count")),
+            "forensic_post_exit_leader_returned_to_entry": raw.get("forensic_post_exit_leader_returned_to_entry"),
+            "forensic_post_exit_leader_minutes_to_entry": safe_float(raw.get("forensic_post_exit_leader_minutes_to_entry")),
+            "forensic_post_exit_leader_return_at": raw.get("forensic_post_exit_leader_return_at"),
+            "forensic_entry_thresholds": raw.get("forensic_entry_thresholds", {}),
+            "forensic_entry_5pct_status": raw.get("forensic_entry_5pct_status", "PENDING"),
+            "forensic_entry_5pct_net_before_funding": safe_float(raw.get("forensic_entry_5pct_net_before_funding")),
+            "forensic_note": raw.get("forensic_note"),
             "last_binance_price_at": raw.get("last_binance_price_at"),
             "last_leader_check_at": raw.get("last_leader_check_at"),
             "data_gap_seconds": safe_float(raw.get("last_data_gap_seconds")),
@@ -3786,6 +3853,7 @@ async def api_paper_trade_detail(trade_id: int):
         "trader": {"id": trade.trader_id, "name": trader.name if trader else trade.trader_name},
         "campaign": campaign, "leader": leader, "leader_path": leader_path,
         "recovery": recovery, "potential_ladder": ladder,
+        "path_total_points": len(path),
         "path": [{
             "at": point.observed_at.isoformat(), "paper_price": point.paper_price,
             "leader_mark": point.leader_mark, "leader_pnl": point.leader_unrealized_pnl,
@@ -3793,7 +3861,7 @@ async def api_paper_trade_detail(trade_id: int):
             "net_pnl": round(float(point.net_pnl or 0.0), 8),
             "pnl_pct": point.pnl_pct, "source": point.source,
             "gap": point.data_gap_seconds
-        } for point in path],
+        } for point in chart_path],
         "events": [{
             "at": event.observed_at.isoformat(), "type": event.event_type,
             "value": event.value, "detail": event.detail
