@@ -1513,7 +1513,7 @@ async def build_opportunity(
         "recovery_warning": "Market trend/news are contextual risk factors, not a deterministic cause or guarantee of recovery."
     }
 
-def build_momentum_opportunity(
+async def build_momentum_opportunity(
     obs: PositionObservation, snapshot_time: str | None, trader_name: str | None,
     news: list[dict], allow_entry_creation: bool = False
 ) -> dict:
