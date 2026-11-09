@@ -2243,10 +2243,20 @@ async def evaluate_open_paper_trades(
                             detail="Funding history is temporarily unavailable. Live PnL includes a conservative debit estimate for settlements since entry; positive exits are allowed only when that estimated net remains positive."
                         ))
                         raw["funding_pending_event_at"] = ts.isoformat()
-            if net > 0 and funding_verified:
-                # No minimum profit threshold: every observed positive net amount,
-                # after round-trip costs and verified funding, is realized immediately.
-                exit_reason = "PROFIT_HARVEST_NET_POSITIVE"
+            current_mfe = max(float(raw.get("mfe_net_pnl", net)), net)
+            giveback_pct = 0.0
+            if current_mfe > 0:
+                giveback_pct = max(0.0, (current_mfe - net) / current_mfe * 100.0)
+            min_harvest_margin_pct = float(cfg.get("profit_harvest_min_margin_pct", 0.70))
+            profit_lock = current_mfe > 0 and giveback_pct >= float(cfg.get("profit_giveback_pct", 35.0)) and net > 0
+            target_or_min_profit = bool(hit_target or pnl_pct >= min_harvest_margin_pct)
+            raw["profit_management"] = {
+                "mfe_net_pnl": current_mfe, "giveback_pct": giveback_pct,
+                "min_harvest_margin_pct": min_harvest_margin_pct,
+                "target_hit": hit_target, "profit_lock_triggered": profit_lock
+            }
+            if net > 0 and funding_verified and (target_or_min_profit or profit_lock):
+                exit_reason = "PROFIT_HARVEST_TARGET_OR_PROFIT_LOCK"
             elif net > 0 and not funding_verified:
                 # Funding REST may be blocked. _paper_pnl has already deducted
                 # round-trip fees/slippage and a conservative funding debit for every
@@ -2259,7 +2269,14 @@ async def evaluate_open_paper_trades(
                 )
                 funding_schedule_known = bool(safe_float(raw.get("next_funding_time")))
                 if funding_schedule_known and (funding_events_est == 0 or funding_rate_known):
-                    exit_reason = "PROFIT_HARVEST_NET_POSITIVE_FUNDING_ESTIMATED"
+                    current_mfe = max(float(raw.get("mfe_net_pnl", net)), net)
+                    giveback_pct = max(0.0, (current_mfe - net) / current_mfe * 100.0) if current_mfe > 0 else 0.0
+                    target_or_min_profit = bool(hit_target or pnl_pct >= float(cfg.get("profit_harvest_min_margin_pct", 0.70)))
+                    profit_lock = current_mfe > 0 and giveback_pct >= float(cfg.get("profit_giveback_pct", 35.0)) and net > 0
+                    if target_or_min_profit or profit_lock:
+                        exit_reason = "PROFIT_HARVEST_TARGET_OR_PROFIT_LOCK_FUNDING_ESTIMATED"
+                    else:
+                        exit_reason = None
                     raw["funding_audit_status"] = "PENDING_POST_CLOSE_RECONCILIATION"
                     raw["funding_source"] = "CONSERVATIVE_ESTIMATE_PENDING_BINANCE_HISTORY"
                     raw["funding_estimate_at_exit"] = max(0.0, costs - (
