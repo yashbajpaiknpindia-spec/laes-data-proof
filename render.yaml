@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: laes-data-proof-python
+    runtime: python
+    plan: free
+    region: frankfurt  # Binance Futures blocks US IPs (HTTP 451); keep DB in the same region
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: KOPYON_API_KEY
+        sync: false
+      - key: KOPYON_BASE_URL
+        value: https://api.kopyon.com/v5
+      - key: KOPYON_DISCOVERY_INTERVAL_SECONDS
+        value: "7200"
+      - key: KOPYON_POSITION_REFRESH_INTERVAL_SECONDS
+        value: "600"
+      - key: KOPYON_POSITION_BATCH
+        value: "20"
+      - key: KOPYON_DISCOVERY_PAGES
+        value: "6"
+      - key: BINANCE_BASE_URL
+        value: https://fapi.binance.com
+      - key: DATABASE_URL
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: APP_ENV
+        value: production
+      - key: LAES_MODE
+        value: paper
+      - key: LAES_DISCOVERY_INTERVAL_SECONDS
+        value: "1800"
+      - key: LAES_POSITION_BATCH
+        value: "20"

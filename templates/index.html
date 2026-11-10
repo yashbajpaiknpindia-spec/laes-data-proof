@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#0a1018">
+  <title>LAES · Intelligence Terminal</title>
+  <link rel="stylesheet" href="/static/style.css?v=9">
+</head>
+<body>
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand"><div class="brand-mark">L</div><div><strong>LAES</strong><small>INTELLIGENCE TERMINAL</small></div></div>
+    <div class="side-status"><span class="pulse" id="sidePulse"></span><span id="sideStatus">Connecting monitor</span></div>
+    <nav class="nav">
+      <button class="nav-item active" data-page="overview"><span>◈</span> Overview</button>
+      <button class="nav-item" data-page="traders"><span>◎</span> Trader universe <em id="navTraderCount">0</em></button>
+      <button class="nav-item" data-page="positions"><span>⌁</span> Live positions <em id="navPositionCount">0</em></button>
+      <button class="nav-item" data-page="opportunities"><span>⌖</span> Opportunity scanner <em id="navOppCount">0</em></button>
+      <button class="nav-item" data-page="paper"><span>▣</span> Paper trading <em id="navPaperCount">0</em></button>
+      <button class="nav-item" data-page="momentum"><span>↗</span> Momentum paper <em id="navMomentumCount">0</em></button>
+      <button class="nav-item" data-page="market"><span>◷</span> Market & news</button>
+      <button class="nav-item" data-page="database"><span>▤</span> Database & system</button>
+    </nav>
+    <div class="sidebar-bottom">
+      <div class="execution-lock"><span>●</span><div><b>READ-ONLY SOURCES</b><small>Paper simulation only</small></div></div>
+      <small class="build-label">LAES ENGINE · V1.0</small>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div><div class="eyebrow">LEADER-ANCHORED ADVERSE EXCURSION SCALPING</div><h1 id="pageTitle">Overview</h1></div>
+      <div class="top-actions">
+        <div class="source-chip"><span class="source-dot" id="copyTradingDot"></span><span>Binance Copy Trading</span><b id="copyTradingState">Checking</b></div>
+        <div class="source-chip" id="kopyonCallsChip" hidden><span>Kopyon API calls</span><b id="kopyonCalls">—</b></div>
+        <div class="source-chip"><span class="source-dot" id="binanceDot"></span><span>Binance</span><b id="binanceState">Checking</b></div>
+        <button class="btn btn-primary" id="scanNow">↻ Scan now</button>
+      </div>
+    </header>
+
+    <div id="notice" class="notice hidden"></div>
+
+    <section class="page active" id="page-overview">
+      <div class="hero">
+        <div><div class="hero-kicker">LIVE RESEARCH SYSTEM <span class="live-badge"><i></i> MONITOR</span></div>
+          <h2>Find leaders under pressure.<br><span>Measure the path back.</span></h2>
+          <p>Publicly exposed Binance copy portfolios · independent market confirmation · paper-only execution model.</p>
+        </div>
+        <div class="hero-meta"><div class="meta-label">LAST MONITOR CYCLE</div><strong id="lastScan">Waiting for first scan</strong><small id="nextScan">Automatic discovery starts at service boot</small></div>
+      </div>
+
+      <div class="metric-grid">
+        <article class="metric-card"><div class="metric-label">QUALIFIED PUBLIC LEADERS</div><div class="metric-value" id="mTraders">—</div><div class="metric-foot" id="mTradersFoot">Binance public listing + verified position disclosure</div></article>
+        <article class="metric-card"><div class="metric-label">OPEN POSITION OBSERVATIONS</div><div class="metric-value" id="mPositions">—</div><div class="metric-foot" id="mPositionsFoot">Fresh visible leader snapshots · 15-minute freshness</div></article>
+        <article class="metric-card"><div class="metric-label">UNDERWATER POSITIONS</div><div class="metric-value red" id="mUnderwater">—</div><div class="metric-foot">Negative unrealized PnL or adverse entry-to-mark move</div></article>
+        <article class="metric-card"><div class="metric-label">QUALIFIED RECOVERY SIGNALS</div><div class="metric-value violet" id="mOpportunities">—</div><div class="metric-foot">Recovery-only view · momentum is separate</div></article>
+        <article class="metric-card"><div class="metric-label">PAPER TRADES OPEN</div><div class="metric-value green" id="mPaperOpen">—</div><div class="metric-foot">Simulated positions, no exchange orders</div></article>
+        <article class="metric-card"><div class="metric-label">SHARED WALLET EQUITY</div><div class="metric-value" id="mPaperEquity">—</div><div class="metric-foot" id="mPaperPnl">USDT · includes unrealized simulation PnL</div></article>
+      </div>
+
+      <div class="content-grid">
+        <article class="panel wide">
+          <div class="panel-heading"><div><div class="section-kicker">AUTOMATION</div><h3>Monitor activity</h3><p>Discovery and position rotation run server-side; no browser token required.</p></div><span class="pill" id="monitorBadge">INITIALIZING</span></div>
+          <div class="monitor-steps">
+            <div class="monitor-step"><span class="step-icon">01</span><div><b>Discover public leaders</b><small id="stepDiscover">Waiting for provider response</small></div><span class="step-state" id="stepDiscoverState">—</span></div>
+            <div class="monitor-step"><span class="step-icon">02</span><div><b>Rotate open-position checks</b><small id="stepPositions">Up to five leaders per cycle</small></div><span class="step-state" id="stepPositionsState">—</span></div>
+            <div class="monitor-step"><span class="step-icon">03</span><div><b>Analyze market context</b><small>7-day candles, 24-hour trend, volatility and headline context</small></div><span class="step-state" id="stepMarketState">READY</span></div>
+            <div class="monitor-step"><span class="step-icon">04</span><div><b>Paper execution engine</b><small id="stepPaper">Automatic signals are simulated only</small></div><span class="step-state" id="stepPaperState">PAPER</span></div>
+          </div>
+        </article>
+        <article class="panel">
+          <div class="panel-heading"><div><div class="section-kicker">SOURCE HEALTH</div><h3>Data connections</h3><p>Credentials stay on the server.</p></div></div>
+          <div class="connection-row"><div class="connection-icon">C</div><div><b>Binance · Public Copy Trading</b><small>Public leaderboard, visible positions and on-demand history</small></div><span class="connection-state" id="healthCopyTrading">Checking</span></div>
+          <div class="connection-row"><div class="connection-icon">B</div><div><b>Binance · Futures data</b><small>Mark price, funding and historical candles</small></div><span class="connection-state" id="healthBinance">Checking</span></div>
+          <div class="connection-row"><div class="connection-icon">P</div><div><b>PostgreSQL / database</b><small id="healthDatabaseDesc">Persistent research ledger</small></div><span class="connection-state" id="healthDatabase">Checking</span></div>
+        </article>
+      </div>
+
+      <div class="content-grid lower-grid">
+        <article class="panel wide">
+          <div class="panel-heading"><div><div class="section-kicker">LATEST SIGNALS</div><h3>Positions under pressure</h3><p>Only live observed positions are shown. Hidden portfolios are never fabricated.</p></div><button class="btn btn-subtle" data-goto="opportunities">Open scanner →</button></div>
+          <div id="overviewOpps" class="mini-opportunities"><div class="empty-state">Waiting for the first real public position snapshots.</div></div>
+        </article>
+        <article class="panel">
+          <div class="panel-heading"><div><div class="section-kicker">STORAGE</div><h3>Research database</h3><p>Actual database usage, not estimated record counts.</p></div><button class="btn btn-subtle" data-goto="database">Details →</button></div>
+          <div class="storage-usage"><div class="storage-value" id="dbUsed">—</div><div class="storage-caption">Database currently used</div></div>
+          <div class="storage-bar"><span id="dbBar" style="width:0%"></span></div>
+          <div class="inline-foot" id="dbCapacityNote">Checking storage telemetry</div>
+        </article>
+      </div>
+    </section>
+
+    <section class="page" id="page-traders">
+      <div class="page-intro"><div><div class="section-kicker">SOURCE: BINANCE PUBLIC COPY-TRADING PAGES</div><h2>Trader universe</h2><p>Qualified public portfolios with a verified visible-positions response; performance metrics are screening signals, not guarantees.</p></div><div class="page-actions"><input id="traderSearch" class="search-input" placeholder="Search trader name or ID"><button class="btn btn-subtle" id="reloadTraders">Refresh list</button></div></div>
+      <div class="filter-row"><span id="traderListCount">Loading actual provider records…</span><span class="muted-note">No demo profiles · no synthetic PnL</span></div>
+      <div class="trader-grid" id="traderGrid"><div class="empty-state">Trader universe will populate when public Binance discovery and position verification succeed.</div></div>
+    </section>
+
+    <section class="page" id="page-positions">
+      <div class="page-intro"><div><div class="section-kicker">OBSERVED POSITION SNAPSHOTS</div><h2>Live positions</h2><p>Current reported position state, observation timestamp, unrealized loss and margin details.</p></div><button class="btn btn-subtle" id="reloadPositions">Refresh positions</button></div>
+      <div class="table-panel"><div class="table-scroll"><table><thead><tr><th>LEADER</th><th>SYMBOL</th><th>DIR.</th><th>ENTRY</th><th>MARK</th><th>UNREALIZED PNL</th><th>ADVERSE %</th><th>LEVERAGE</th><th>VISIBILITY / SEEN</th></tr></thead><tbody id="positionTable"><tr><td colspan="9" class="empty-cell">No real position observations stored yet.</td></tr></tbody></table></div></div>
+      <div class="footnote">An empty public position response is not proof that a prior position closed. Hidden, unavailable, or failed responses preserve prior observations and never authorize a new entry.</div>
+    </section>
+
+    <section class="page" id="page-opportunities">
+      <div class="page-intro"><div><div class="section-kicker">INDEPENDENT STRATEGY SCANS</div><h2>Opportunity scanner</h2><p>Recovery and Momentum are qualified, cached, and displayed as separate strategies. Opening this page is read-only and does not run historical audits.</p><div class="page-actions"><label for="opportunityStrategy">Strategy</label><select id="opportunityStrategy" class="search-input"><option value="RECOVERY">Recovery</option><option value="MOMENTUM">Momentum</option></select></div></div><button class="btn btn-primary" id="refreshOpps">↻ Analyze positions</button></div>
+      <div class="scanner-legend"><span class="legend-item"><i class="dot red-dot"></i> Underwater leader</span><span class="legend-item"><i class="dot violet-dot"></i> 5m reversal confirmation</span><span class="legend-item"><i class="dot green-dot"></i> Paper trade qualified</span></div>
+      <div id="scannerSummary" class="muted-note"></div>
+      <div id="opportunityList" class="opportunity-list"><div class="empty-state">The scanner needs observed public positions before it can calculate adverse excursions.</div></div>
+      <article class="panel" style="margin-top:16px"><div class="panel-heading"><div><div class="section-kicker">PERSISTED QUALIFICATION PIPELINE</div><h3>Why each candidate qualified or was rejected</h3><p>The log is filtered to the selected strategy. Live monitoring records decisions; page reads do not write them.</p></div><button class="btn btn-subtle" id="reloadPipelineDecisions">Refresh pipeline log</button></div><div class="table-scroll"><table><thead><tr><th>TIME</th><th>STRATEGY</th><th>SYMBOL / SIDE</th><th>QUALIFICATION</th><th>EXECUTION</th><th>REASONS / CHECKS</th></tr></thead><tbody id="opportunityDecisionTable"><tr><td colspan="6" class="empty-cell">Waiting for candidate decisions…</td></tr></tbody></table></div></article>
+    </section>
+
+    <section class="page" id="page-paper">
+      <div class="page-intro"><div><div class="section-kicker">SIMULATED EXECUTION · NO REAL ORDERS</div><h2>Paper trading desk</h2><p>Broad opportunity discovery with a finite $200 shared paper wallet across both strategies. No exchange orders are placed.</p></div><span class="paper-state">● PAPER ENGINE ACTIVE</span></div>
+    <div class="top-live-strip"><div class="top-live-title">LIVE PAPER</div><button class="top-live-btn active" data-paper-tab="open">OPEN POSITIONS <em id="topOpenCount">0</em></button><button class="top-live-btn" data-paper-tab="closed">CLOSED POSITIONS <em id="topClosedCount">0</em></button><button class="top-live-btn" data-goto="positions">LEADER POSITIONS <em id="topLeaderCount">0</em></button><button class="top-live-btn" data-goto="opportunities">OPPORTUNITIES <em id="topOppCount">0</em></button></div>
+      <div class="paper-metrics">
+        <article class="metric-card"><div class="metric-label">SHARED WALLET CAPITAL</div><div class="metric-value" id="paperCapital">—</div><div class="metric-foot">One wallet across RECOVERY + MOMENTUM · USDT</div></article>
+        <article class="metric-card"><div class="metric-label">SHARED WALLET MARGIN IN USE</div><div class="metric-value violet" id="paperMargin">—</div><div class="metric-foot" id="paperMarginFoot">Current open paper positions</div></article>
+        <article class="metric-card"><div class="metric-label">SHARED WALLET REALIZED NET PNL</div><div class="metric-value" id="paperRealized">—</div><div class="metric-foot">After estimated fees and slippage</div></article>
+        <article class="metric-card"><div class="metric-label">SHARED WALLET UNREALIZED NET PNL</div><div class="metric-value" id="paperUnrealized">—</div><div class="metric-foot">Marked to Binance public mark price</div></article>
+        <article class="metric-card"><div class="metric-label">SHARED WALLET FREE CAPITAL</div><div class="metric-value" id="paperFree">—</div><div class="metric-foot">Capital available for new simulations</div></article>
+        <article class="metric-card"><div class="metric-label">SHARED WALLET EQUITY</div><div class="metric-value green" id="paperEquity">—</div><div class="metric-foot">Capital + realized + unrealized PnL</div></article>
+      </div>
+      <div class="content-grid">
+        <article class="panel">
+          <div class="panel-heading"><div><div class="section-kicker">PORTFOLIO CONTROLS</div><h3>Paper capital & risk</h3><p>These parameters affect simulation only.</p></div></div>
+          <form id="paperSettings" class="settings-form">
+            <label>Shared paper wallet <span>USDT · both strategies</span><input name="capital_usdt" type="number" min="0" step="10" value="200"></label>
+            <div class="form-grid">
+              <label>Risk per trade <span>% equity</span><input name="risk_pct" type="number" min="0.01" max="5" step="0.05" value="0.5"></label>
+              <label>Max margin per trade <span>% equity</span><input name="max_margin_pct" type="number" min="1" max="10" step="1" value="10"></label>
+              <label>Total shared margin cap <span>% of $200 wallet</span><input name="max_total_margin_pct" type="number" min="5" max="40" step="5" value="40"></label>
+              <label>Maximum notional per trade <span>USDT · before leverage</span><input name="max_notional_usdt" type="number" min="5" max="50" step="5" value="50"></label>
+              <label>Max same-symbol / same-side positions <span>Shared across both strategies</span><input name="max_positions_per_symbol_direction" type="number" min="1" max="1" step="1" value="1"></label>
+              <label>Shadow portfolio margin cap <span>% of capital · legacy comparison</span><input name="shadow_max_total_margin_pct" type="number" min="5" max="100" step="5" value="40"></label>
+              <label>Shadow max same-symbol / same-side positions <span>1 = only one ETH LONG at a time</span><input name="shadow_max_positions_per_symbol_direction" type="number" min="1" max="5" step="1" value="1"></label>
+              <label>Target <span>% from entry</span><input name="target_pct" type="number" min="0.05" step="0.05" value="0.7"></label>
+              <label>Risk-sizing reference <span>% from entry · not an exit trigger</span><input name="stop_pct" type="number" min="0.05" step="0.05" value="0.45"></label>
+              <label>Recovery maximum hold <span>hours · default 72</span><input name="recovery_max_hold_hours" type="number" min="1" max="720" step="1" value="72"></label>
+              <label>Momentum maximum hold <span>hours · default 24</span><input name="momentum_max_hold_hours" type="number" min="1" max="240" step="1" value="24"></label>
+              <label>Structure lookback <span>minutes</span><input name="structure_lookback_minutes" type="number" min="15" max="240" step="5" value="60"></label>
+              <label>Structure-break buffer <span>% beyond prior range</span><input name="structure_break_buffer_pct" type="number" min="0.05" max="2" step="0.05" value="0.2"></label>
+              <label>Taker fee <span>% per side</span><input name="taker_fee_pct" type="number" min="0" step="0.005" value="0.05"></label>
+              <label>Slippage <span>% per side</span><input name="slippage_pct" type="number" min="0" step="0.005" value="0.02"></label>
+              <label>Leverage ceiling <span>×</span><input name="max_leverage" type="number" min="1" max="3" step="0.5" value="3"></label>
+              <label>Leader adverse threshold <span>% before entry can qualify</span><input name="min_adverse_pct" type="number" min="0.05" step="0.05" value="0.3"></label>
+            </div>
+            <label class="toggle-row"><span><b>Automatic paper entries</b><small>Enter only when an observed underwater leader also has same-direction 5m price confirmation.</small></span><input name="auto_enabled" type="checkbox" checked></label>
+            <button class="btn btn-primary" type="submit">Save paper settings</button><span id="paperSaveStatus" class="muted-note"></span>
+          </form>
+        </article>
+        <article class="panel">
+          <div class="panel-heading"><div><div class="section-kicker">EXECUTION LOGIC</div><h3>How paper entries trigger</h3></div></div>
+          <div class="logic-item"><b>01 · Leader already underwater</b><p>Observed unrealized PnL below zero or current mark adverse to entry.</p></div>
+          <div class="logic-item"><b>02 · Better price than leader entry</b><p>Same-side simulation enters at current Binance mark after the leader has absorbed an adverse move.</p></div>
+          <div class="logic-item"><b>03 · Micro confirmation</b><p>Latest 5-minute candle moves in the leader's direction. No confirmation means watchlist only.</p></div>
+          <div class="logic-item"><b>04 · MFE capture, not MAE panic</b><p>MAE is diagnostic only. Capture net-positive meaningful MFE, then allow a fresh qualified re-entry while the exact leader position remains open.</p></div>
+          <div class="logic-item"><b>05 · Thesis-based final exits</b><p>Exit on confirmed leader close/reversal, a sustained close-confirmed support/resistance break, or the strategy-specific maximum hold—not a fixed adverse-price stop.</p></div>
+          <div class="warning-note">A paper trade is not a recommendation or guarantee. Recovery probabilities are hidden until a sufficient matched sample exists.</div>
+        </article>
+      </div>
+      <article class="panel trades-panel"><div class="panel-heading"><div><div class="section-kicker">SIMULATED ORDERS</div><h3>Paper trade ledger</h3><p>Open and completed simulated positions.</p></div><button class="btn btn-subtle" id="reloadPaper">Refresh ledger</button></div>
+        <div class="paper-tab-buttons">
+          <button class="btn btn-primary paper-table-tab active" data-paper-tab="open">Open positions <span id="paperOpenTableCount">0</span></button>
+          <button class="btn btn-subtle paper-table-tab" data-paper-tab="closed">Closed trades <span id="paperClosedTableCount">0</span></button>
+          <button class="btn btn-subtle paper-table-tab" data-paper-tab="latest" id="latestTradesBtn">Latest trades</button>
+          <button class="btn btn-subtle" id="runRecoveryAudit">Run next historical audit batch</button>
+          <span class="audit-status" id="recoveryAuditStatus">Historical audit status not loaded</span>
+        </div>
+        <div id="closedTradeFilters" class="closed-trade-filters" style="display:none">
+          <button class="closed-filter active" data-closed-filter="all">All closed <span id="closedAllCount">0</span></button>
+          <button class="closed-filter" data-closed-filter="profitable">Profitable <span id="closedProfitCount">0</span></button>
+          <button class="closed-filter" data-closed-filter="loss">Losses <span id="closedLossCount">0</span></button>
+        </div>
+        <div id="paperOpenTable" class="table-scroll"><table><thead><tr><th>STATUS</th><th>LEADER / POSITION</th><th>SYMBOL</th><th>SIDE</th><th>ENTRY / LIVE MARK</th><th>NET PNL / MFE / MAE</th><th>HOLD</th><th>LEADER CHECK</th><th>QUALITY</th><th>DETAILS</th></tr></thead><tbody id="paperOpenTrades"><tr><td colspan="10" class="empty-cell">No open paper positions.</td></tr></tbody></table></div>
+        <div id="paperClosedTable" class="table-scroll" style="display:none"><table><thead><tr><th>STATUS</th><th>LEADER / POSITION</th><th>SYMBOL</th><th>SIDE</th><th>ENTRY → EXIT</th><th>NET PNL / MFE / MAE</th><th>HOLD</th><th>EXIT TRIGGER</th><th>AFTER-EXIT RECOVERY</th><th>DETAILS</th></tr></thead><tbody id="paperClosedTrades"><tr><td colspan="10" class="empty-cell">No closed paper positions.</td></tr></tbody></table></div>
+        <div id="paperLatestTable" class="table-scroll" style="display:none"><table><thead><tr><th>STATUS</th><th>LEADER / POSITION</th><th>SYMBOL</th><th>SIDE</th><th>ENTRY → EXIT / LIVE MARK</th><th>NET PNL / MFE / MAE</th><th>HOLD</th><th>EXIT TRIGGER / LEADER CHECK</th><th>RECOVERY / DATA QUALITY</th><th>DETAILS</th></tr></thead><tbody id="paperLatestTrades"><tr><td colspan="10" class="empty-cell">Loading latest trades…</td></tr></tbody></table></div>
+      </article>
+      <article class="panel" style="margin-top:16px"><div class="panel-heading"><div><div class="section-kicker">CORRELATED FUTURES EXPOSURE</div><h3>Same-symbol loss concentration</h3><p>Leaders holding the same coin and direction can lose together. These estimates expose shared risk without suppressing research signals.</p></div></div><div id="paperRiskClusters"><div class="empty-state">Waiting for portfolio exposure analysis…</div></div></article>
+      <article class="panel research-replay-panel" style="margin-top:16px">
+        <div class="panel-heading"><div><div class="section-kicker">LEGACY SINGLE-TRADE COMPARISON</div><h3>Recorded exits vs legacy exit-engine replay</h3><p>This comparison retains the earlier one-cycle exit model for reference; use the revised multi-cycle replay below for the new leader-following rules.</p></div><button class="btn btn-subtle" id="loadResearchReplay">Refresh legacy replay</button></div>
+        <div id="researchReplaySummary"><div class="empty-state">Load the historical replay to compare recorded old-system PnL with the new exit policy.</div></div>
+        <div class="muted-note" id="researchReplayAssumptions"></div>
+      </article>
+      <article class="panel research-replay-panel" style="margin-top:16px">
+        <div class="panel-heading"><div><div class="section-kicker">REVISED STRATEGY · MULTI-CYCLE REPLAY</div><h3>Meaningful MFE capture, valid re-entry, thesis-based final exit</h3><p>Replays available closed trades under the revised RECOVERY and MOMENTUM rules. Re-entry requires fresh exact leader evidence and a still-qualified setup; MAE alone never exits.</p></div><button class="btn btn-primary" id="loadStrategyReplay">Replay existing trades</button></div>
+        <div id="strategyReplaySummary"><div class="empty-state">Replay existing audited trades under the revised strategy rules.</div></div>
+        <div class="muted-note" id="strategyReplayAssumptions"></div>
+      </article>
+      <article class="panel" style="margin-top:16px"><div class="panel-heading"><div><div class="section-kicker">CAPITAL-CONSTRAINED SHADOW REPLAY</div><h3>What a limited portfolio would have selected</h3><p>Replays the recorded research entries and exits in time order, using a separate margin cap and a same-coin/same-direction overlap limit. Research trades remain untouched.</p></div><span class="status-tag neutral">COUNTERFACTUAL</span></div><div id="paperShadowPortfolio"><div class="empty-state">Waiting for shadow portfolio calculation…</div></div></article>
+      <article class="panel" style="margin-top:16px"><div class="panel-heading"><div><div class="section-kicker">LEGACY $200 SHARED-WALLET · SINGLE-CYCLE POLICY</div><h3>Legacy chronological capital replay</h3><p>Uses the retained legacy single-cycle exit replay, recalculates position sizes, and resolves overlapping positions against one shared wallet. Revised re-entry cycles are shown in the replay panel above but are not yet allocated here.</p></div><button class="btn btn-subtle" id="loadCapitalReplay">Recalculate legacy $200 wallet</button></div><div id="capitalReplaySummary"><div class="empty-state">Waiting for verified candle audits and shared-wallet replay…</div></div></article>
+    </section>
+
+    <section class="page" id="page-momentum">
+      <div class="page-intro"><div><div class="section-kicker">SEPARATE STRATEGY · PROFITABLE LEADER MOMENTUM</div><h2>Momentum paper desk</h2><p>Completely separate paper ledger for profitable leader positions with confirmed directional Binance momentum. These trades never mix with the underwater-recovery ledger.</p></div><span class="paper-state">● MOMENTUM PAPER ONLY</span></div>
+      <div class="top-live-strip"><div class="top-live-title">MOMENTUM PAPER</div><button class="btn btn-subtle" id="reloadMomentum">Refresh momentum ledger</button><button class="btn btn-subtle" data-goto="opportunities">View all scanner candidates →</button></div>
+      <div class="paper-metrics">
+        <article class="metric-card"><div class="metric-label">MOMENTUM REALIZED NET PNL</div><div class="metric-value green" id="momentumRealized">—</div><div class="metric-foot">Only MOMENTUM strategy trades</div></article>
+        <article class="metric-card"><div class="metric-label">MOMENTUM UNREALIZED PNL</div><div class="metric-value violet" id="momentumUnrealized">—</div><div class="metric-foot">Current Binance mark-based simulation</div></article>
+        <article class="metric-card"><div class="metric-label">OPEN / CLOSED</div><div class="metric-value" id="momentumCounts">—</div><div class="metric-foot">Separate paper ledger</div></article>
+        <article class="metric-card"><div class="metric-label">AUDITED RECOVERY</div><div class="metric-value" id="momentumAudit">—</div><div class="metric-foot">Historical Binance candle audit</div></article>
+      </div>
+      <article class="panel trades-panel">
+        <div class="panel-heading"><div><div class="section-kicker">MOMENTUM PAPER LEDGER</div><h3>Profitable-leader executions</h3><p>Entry, exit, MFE, MAE, costs and entry-timing forensic evidence. This page intentionally excludes recovery-strategy trades.</p></div></div>
+        <div class="table-scroll"><table><thead><tr><th>STATUS</th><th>LEADER</th><th>SYMBOL / SIDE</th><th>ENTRY → EXIT</th><th>NET / MFE / MAE</th><th>ENTRY TIMING AUDIT</th><th>EXIT / RECOVERY</th><th>DETAILS</th></tr></thead><tbody id="momentumTrades"><tr><td colspan="8" class="empty-cell">Loading momentum paper ledger…</td></tr></tbody></table></div>
+      </article>
+      <article class="panel" style="margin-top:16px"><div class="panel-heading"><div><div class="section-kicker">ENTRY FORENSICS</div><h3>Could the system have entered earlier?</h3><p>Historical 1-minute Binance mark candles are used only as hindsight evidence. They do not imply that a better fill was actually available to the system.</p></div></div><div id="momentumEntryAudit" class="analysis-box"><div class="empty-state">Waiting for audited entry-timing evidence.</div></div></article>
+    </section>
+
+    <section class="page" id="page-market">
+      <div class="page-intro"><div><div class="section-kicker">BINANCE PUBLIC FUTURES DATA</div><h2>Market & news context</h2><p>Pull the last seven days of candles, mark price, funding, volatility and contemporaneous headlines.</p></div></div>
+      <div class="market-search"><input id="marketSymbol" value="BTCUSDT" placeholder="BTCUSDT"><button class="btn btn-primary" id="loadMarket">Analyze symbol</button></div><article class="panel market-universe-panel"><div class="panel-heading"><div><div class="section-kicker">MARKET UNIVERSE</div><h3>Important USDⓈ-M coins</h3><p>Live mark/funding where subscribed; cached liquidity/volatility remains visible during Binance REST rate limits.</p></div><button class="btn btn-subtle" id="reloadMarketUniverse">Refresh universe</button></div><div class="table-scroll"><table><thead><tr><th>SYMBOL</th><th>MARK</th><th>5M</th><th>FUNDING</th><th>24H VOLUME</th><th>LIQUIDITY / STATUS</th></tr></thead><tbody id="marketUniverseTable"><tr><td colspan="6" class="empty-cell">Loading market universe…</td></tr></tbody></table></div></article>
+      <div id="marketResult" class="market-result"><div class="empty-state">Choose a symbol to load current public market context.</div></div>
+      <article class="panel news-panel"><div class="panel-heading"><div><div class="section-kicker">HEADLINE CONTEXT</div><h3>Related crypto headlines</h3><p>Potential context only. Timing is not proof of causation.</p></div></div><div id="newsList" class="news-list"><div class="empty-state">Loading headlines automatically…</div></div></article>
+    </section>
+
+    <section class="page" id="page-database">
+      <div class="page-intro"><div><div class="section-kicker">PERSISTENCE & INFRASTRUCTURE</div><h2>Database & system</h2><p>Live database connection, actual storage usage, row counts and monitoring runtime.</p></div><button class="btn btn-subtle" id="reloadSystem">Refresh telemetry</button></div>
+      <div class="system-grid">
+        <article class="panel"><div class="section-kicker">DATABASE ENGINE</div><h3 id="dbEngine">—</h3><div class="big-storage" id="dbUsedLarge">—</div><p id="dbConnection">Checking connection</p><div class="storage-bar large"><span id="dbBarLarge"></span></div><div class="muted-note" id="dbCapacityLarge">Capacity telemetry pending</div></article>
+        <article class="panel"><div class="section-kicker">MONITOR WORKER</div><h3 id="workerState">—</h3><div class="system-rows"><div><span>Discovery interval</span><b id="workerInterval">—</b></div><div><span>Position batch</span><b id="workerBatch">—</b></div><div><span>Last scan state</span><b id="workerLastState">—</b></div><div><span>Last error</span><b id="workerError">None</b></div></div></article>
+      </div>
+      <article class="panel"><div class="panel-heading"><div><div class="section-kicker">DATABASE TABLES</div><h3>Storage footprint & records</h3></div></div><div id="tableMetrics" class="table-metrics"></div><div id="rowCounts" class="row-count-grid"></div></article>
+      <article class="panel"><div class="panel-heading"><div><div class="section-kicker">SOURCE BOUNDARIES</div><h3>What each feed can expose</h3></div></div>
+        <div class="source-boundary"><b>Binance · Public Copy Trading pages</b><p>Public leaderboards, visible current positions, profile metrics, and position history when Binance exposes them. Website JSON routes are undocumented and may change; LAES fails closed on missing or malformed data.</p></div>
+        <div class="source-boundary"><b>Binance official USDⓈ-M Futures</b><p>Independent mark prices, funding rates, klines and market context. It does not provide arbitrary public individual copy-leader position histories.</p></div>
+        <div class="source-boundary"><b>Persistence and runtime caveat</b><p id="runtimeCaveat">Checking database and Render service mode.</p></div>
+      </article>
+    </section>
+  </main>
+</div>
+
+<dialog id="traderDialog" class="trader-dialog"><div class="dialog-head"><div><div class="section-kicker">TRADER FORENSICS</div><h2 id="dialogName">Trader</h2><p id="dialogSub"></p></div><button class="icon-btn" id="closeDialog">×</button></div><div id="dialogBody"></div></dialog>
+<script src="/static/app.js?v=16"></script>
+</body></html>
